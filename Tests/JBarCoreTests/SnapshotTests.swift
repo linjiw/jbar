@@ -324,12 +324,18 @@ final class SnapshotTests: XCTestCase {
     }
 
     func testDeepApplicationCatalogParentRoundTripsWithinSharedDirectoryBudget() throws {
-        let components = (0..<300).map { String(format: "level-%03d", $0) }
+        // Keep the synthetic URL below the older Foundation file-URL conversion ceiling while
+        // still exercising a topology deeper than the 257-root snapshot allowance. Xcode 16.4's
+        // Foundation truncates an otherwise non-existent ~3 KiB file URL near byte 1,024 before
+        // AppScanner receives it; real filesystem paths cannot use that synthetic representation.
+        let components = Array(repeating: "d", count: 300)
         let parent = "/" + components.joined(separator: "/")
         XCTAssertLessThanOrEqual(parent.utf8.count, SafetyLimits.maxPathUTF8Bytes)
-        let app = ScannedApp(url: URL(fileURLWithPath: parent + "/Deep.app"),
+        let rawPath = parent + "/Deep.app"
+        let app = ScannedApp(url: URL(fileURLWithPath: rawPath),
                              displayName: "Deep", bundleID: "test.deep",
                              aliases: [], mtime: nil)
+        XCTAssertEqual(app.url.path, rawPath, "the portable fixture must survive URL conversion")
         let builder = IndexBuilder()
         XCTAssertFalse(AppScanner.add([app], to: builder))
         let store = builder.build(generation: 1)
