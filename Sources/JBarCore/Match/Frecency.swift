@@ -25,8 +25,11 @@ public final class FrecencyStore: @unchecked Sendable {
     public let fileURL: URL
     /// Decay half-life in seconds. Non-positive → no decay (never expected; guarded for safety).
     public let halfLife: TimeInterval
-    /// Maximum number of tracked paths (≥ 1; smaller values are clamped).
+    /// Maximum number of tracked paths (clamped to the process-wide safe range).
     public let maxEntries: Int
+    /// Tighten the parent directory to 0700. Product state enables this; arbitrary test/custom URLs
+    /// default to false so the store never chmods a caller-owned shared directory.
+    public let enforcePrivateDirectory: Bool
 
     /// Maximum number of remembered `query → path` picks (LRU-ish eviction).
     public static let maxQueryPicks = 200
@@ -62,17 +65,22 @@ public final class FrecencyStore: @unchecked Sendable {
         var queryPicks: [String: String]
     }
 
-    public init(fileURL: URL, halfLife: TimeInterval = 7 * 86400, maxEntries: Int = 500) {
+    public init(fileURL: URL, halfLife: TimeInterval = 7 * 86400, maxEntries: Int = 500,
+                enforcePrivateDirectory: Bool = false) {
         self.fileURL = fileURL
         self.halfLife = halfLife
-        self.maxEntries = max(1, maxEntries)
+        self.maxEntries = min(max(1, maxEntries), SafetyLimits.maxHistoryEntries)
+        self.enforcePrivateDirectory = enforcePrivateDirectory
     }
 
     // MARK: Decay
 
     /// `f · 2^(−Δt/halfLife)` with Δt clamped to ≥ 0 (a `last` in the future never inflates f).
     private func decayed(_ e: Entry, now: Date) -> Double {
-        guard halfLife > 0 else { return e.f }
+        guard e.f.isFinite, e.f >= 0,
+              e.last.timeIntervalSinceReferenceDate.isFinite,
+              now.timeIntervalSinceReferenceDate.isFinite else { return 0 }
+        guard halfLife.isFinite, halfLife > 0 else { return e.f }
         let dt = max(0, now.timeIntervalSince(e.last))
         return e.f * pow(2.0, -dt / halfLife)
     }
@@ -92,7 +100,8 @@ public final class FrecencyStore: @unchecked Sendable {
         do {
             file = try decoder.decode(FileFormat.self, from: data)
         } catch {
-            Self.logger.error("history.json is corrupt, starting empty: \(error.localizedDescription, privacy: .public)")
+            let ns = error as NSError
+            Self.logger.error("history.json is corrupt, starting empty: domain=\(ns.domain, privacy: .public) code=\(ns.code)")
             lock.lock(); entries = [:]; queryPicks = [:]; queryPickOrder = []; lock.unlock()
             return
         }
@@ -111,23 +120,26 @@ public final class FrecencyStore: @unchecked Sendable {
 
     /// Reads the file's bytes; nil if it does not exist or cannot be read (logged unless simply missing).
     private func readFile() -> Data? {
-        if !FileManager.default.fileExists(atPath: fileURL.path) {
-            Self.logger.debug("no history file at \(self.fileURL.path, privacy: .public); starting empty")
-            return nil
-        }
         do {
-            return try Data(contentsOf: fileURL)
+            guard let data = try SecureFileIO.readRegularFile(at: fileURL,
+                                                              maxBytes: SafetyLimits.maxHistoryFileBytes) else {
+                Self.logger.debug("no history file; starting empty")
+                return nil
+            }
+            return data
         } catch {
-            Self.logger.error("cannot read history.json: \(error.localizedDescription, privacy: .public)")
+            let ns = error as NSError
+            Self.logger.error("cannot read history.json: domain=\(ns.domain, privacy: .public) code=\(ns.code)")
             return nil
         }
     }
 
-    /// Drop invalid entries (non-finite / negative f, empty path), merge duplicates (keep larger f),
+    /// Drop invalid entries (non-finite / negative f, invalid path), merge duplicates (keep larger f),
     /// clamp to `maxEntries` (largest raw f kept) and `maxQueryPicks`.
     private static func sanitize(_ file: FileFormat, maxEntries: Int) -> ([String: Entry], [String: String], [String]) {
         var entries: [String: Entry] = [:]
-        for fe in file.entries where !fe.path.isEmpty && fe.f.isFinite && fe.f >= 0 {
+        for fe in file.entries where validPath(fe.path) && fe.f.isFinite && fe.f >= 0
+            && fe.last.timeIntervalSinceReferenceDate.isFinite {
             if let existing = entries[fe.path], existing.f >= fe.f { continue }
             entries[fe.path] = Entry(f: fe.f, last: fe.last)
         }
@@ -136,18 +148,51 @@ public final class FrecencyStore: @unchecked Sendable {
             entries = Dictionary(uniqueKeysWithValues: keep.map { ($0.key, $0.value) })
         }
         // Dictionary order is arbitrary; sort keys so eviction after load is deterministic.
-        let picks = file.queryPicks.filter { !$0.key.isEmpty && !$0.value.isEmpty }
-        var order = picks.keys.sorted()
-        var kept = picks
-        while order.count > maxQueryPicks {
-            kept.removeValue(forKey: order.removeFirst())
-        }
+        let picks = file.queryPicks.filter { validFoldedQuery($0.key) && validPath($0.value) }
+        // Keep the same deterministic lexicographically-largest subset as the old removeFirst loop,
+        // without its quadratic Array shifting on an adversarial 8 MiB file.
+        let order = Array(picks.keys.sorted().suffix(maxQueryPicks))
+        let kept = Dictionary(uniqueKeysWithValues: order.compactMap { key in
+            picks[key].map { (key, $0) }
+        })
         return (entries, kept, order)
     }
 
+    private static func validPath(_ path: String) -> Bool {
+        SafetyLimits.isSafeAbsolutePath(path)
+    }
+
+    private static func validFoldedQuery(_ query: String) -> Bool {
+        SafetyLimits.utf8Fits(query, maxBytes: SafetyLimits.maxQueryUTF8Bytes)
+            && !query.isEmpty && !SafetyLimits.containsNULByte(query)
+    }
+
+    private static func estimatedEncodedUpperBound(_ file: FileFormat) -> Int {
+        func adding(_ lhs: Int, _ rhs: Int) -> Int {
+            let (value, overflow) = lhs.addingReportingOverflow(rhs)
+            return overflow ? Int.max : value
+        }
+        func escapedStringBytes(_ value: String) -> Int {
+            SafetyLimits.jsonEscapedStringByteUpperBound(value)
+        }
+        var total = 4_096
+        for entry in file.entries {
+            total = adding(total, adding(192, escapedStringBytes(entry.path)))
+        }
+        for (query, path) in file.queryPicks {
+            total = adding(total, 64)
+            total = adding(total, escapedStringBytes(query))
+            total = adding(total, escapedStringBytes(path))
+        }
+        return total
+    }
+
     /// Save atomically. Safe to call often; coalesce if you like.
-    /// Creates the parent directory if needed. Errors are logged, never thrown.
-    public func save() {
+    /// Creates the parent directory if needed. Errors are logged, never thrown. The return value is
+    /// important for explicit privacy operations: callers must not tell the user that persisted
+    /// history was cleared when replacing `history.json` actually failed.
+    @discardableResult
+    public func save() -> Bool {
         lock.lock()
         let snapshot = FileFormat(version: Self.formatVersion,
                                   entries: entries.map { FileEntry(path: $0.key, f: $0.value.f, last: $0.value.last) }
@@ -157,12 +202,22 @@ public final class FrecencyStore: @unchecked Sendable {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .secondsSince1970
         do {
+            guard Self.estimatedEncodedUpperBound(snapshot) <= SafetyLimits.maxHistoryFileBytes else {
+                Self.logger.error("history.json may exceed the safe persistence limit; refusing before encoding")
+                return false
+            }
             let data = try encoder.encode(snapshot)
-            let dir = fileURL.deletingLastPathComponent()
-            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-            try data.write(to: fileURL, options: .atomic)
+            guard data.count <= SafetyLimits.maxHistoryFileBytes else {
+                Self.logger.error("history.json exceeds the safe persistence limit; refusing to write")
+                return false
+            }
+            try SecureFileIO.writeAtomicallyOwnerOnly(data, to: fileURL,
+                                                      enforcePrivateDirectory: enforcePrivateDirectory)
+            return true
         } catch {
-            Self.logger.error("cannot save history.json: \(error.localizedDescription, privacy: .public)")
+            let ns = error as NSError
+            Self.logger.error("cannot save history.json: domain=\(ns.domain, privacy: .public) code=\(ns.code)")
+            return false
         }
     }
 
@@ -174,15 +229,21 @@ public final class FrecencyStore: @unchecked Sendable {
     /// query (trimmed, folded) is remembered as the last pick for `path`. When more than `maxEntries`
     /// paths are tracked, the one with the lowest decayed f is evicted.
     public func record(open path: String, query: String?, at now: Date = Date()) {
-        guard !path.isEmpty else { return }
-        let trimmed = (query ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard Self.validPath(path), now.timeIntervalSinceReferenceDate.isFinite else { return }
+        // SearchEngine and history must agree on the exact bounded query. Bound before trim/count/fold
+        // so a paste with millions of combining scalars cannot make the launch path do unbounded work.
+        let trimmed = QueryParser.boundedRaw(query ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
         let fromQuery = trimmed.count >= 2
         let w: Double = fromQuery ? 2 : 1
         lock.lock()
         defer { lock.unlock() }
         let existing = entries[path]
         let base = existing.map { decayed($0, now: now) } ?? 0
-        entries[path] = Entry(f: base + w, last: now)
+        let next = base.isFinite && base <= Double.greatestFiniteMagnitude - w
+            ? base + w
+            : Double.greatestFiniteMagnitude
+        entries[path] = Entry(f: next, last: now)
         if fromQuery { setQueryPick(TextAnalyzer.fold(trimmed), path: path) }
         evictIfNeeded(now: now)
     }
@@ -217,6 +278,7 @@ public final class FrecencyStore: @unchecked Sendable {
 
     /// Decayed frecency value `f'` of `path` at `now` (0 if unknown). Exposed for tests and status UI.
     public func score(for path: String, now: Date = Date()) -> Double {
+        guard Self.validPath(path), now.timeIntervalSinceReferenceDate.isFinite else { return 0 }
         lock.lock(); defer { lock.unlock() }
         guard let e = entries[path] else { return 0 }
         return decayed(e, now: now)
@@ -226,15 +288,21 @@ public final class FrecencyStore: @unchecked Sendable {
     public func boost(for path: String, now: Date = Date(), weights: RankingWeights = .default) -> Int {
         let f = score(for: path, now: now)
         guard f > 0 else { return 0 }
+        let cap = max(0, weights.frecencyCap)
+        guard cap > 0 else { return 0 }
         let raw = weights.frecencyScale * log2(1 + f)
-        guard raw.isFinite else { return weights.frecencyCap }
-        return min(weights.frecencyCap, Int(raw.rounded()))
+        guard !raw.isNaN, raw > 0 else { return 0 }
+        guard raw.isFinite else { return cap }
+        guard let converted = Int(exactly: raw.rounded()) else { return cap }
+        return min(cap, max(0, converted))
     }
 
     /// `weights.queryPick` if the exact (trimmed, folded) `query` last resulted in opening `path`, else 0.
     public func queryPickBoost(query: String, path: String, weights: RankingWeights = .default) -> Int {
-        let key = TextAnalyzer.fold(query.trimmingCharacters(in: .whitespacesAndNewlines))
-        guard !key.isEmpty else { return 0 }
+        guard Self.validPath(path) else { return 0 }
+        let bounded = QueryParser.boundedRaw(query).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !bounded.isEmpty else { return 0 }
+        let key = TextAnalyzer.fold(bounded)
         lock.lock(); defer { lock.unlock() }
         return queryPicks[key] == path ? weights.queryPick : 0
     }
@@ -251,19 +319,34 @@ public final class FrecencyStore: @unchecked Sendable {
 
     /// Remove entries for which `exists(path)` is false (and query picks pointing at them).
     /// `exists` is evaluated outside the lock so slow file-system checks do not block `record`/`boost`.
-    public func prune(exists: (String) -> Bool) {
+    @discardableResult
+    public func prune(exists: (String) -> Bool) -> Int {
         lock.lock()
         let paths = Array(entries.keys)
         lock.unlock()
         let dead = Set(paths.filter { !exists($0) })
-        guard !dead.isEmpty else { return }
+        guard !dead.isEmpty else { return 0 }
         lock.lock(); defer { lock.unlock() }
-        for p in dead { entries.removeValue(forKey: p) }
+        var removed = 0
+        for p in dead where entries.removeValue(forKey: p) != nil { removed += 1 }
         let deadKeys = queryPicks.filter { dead.contains($0.value) }.map { $0.key }
         for k in deadKeys {
             queryPicks.removeValue(forKey: k)
             if let i = queryPickOrder.firstIndex(of: k) { queryPickOrder.remove(at: i) }
         }
+        return removed
+    }
+
+    /// Remove all path frecency and query-to-path choices. Returns the number of path entries removed;
+    /// the caller decides when to persist (the app writes the empty owner-only file immediately).
+    @discardableResult
+    public func clear() -> Int {
+        lock.lock(); defer { lock.unlock() }
+        let removed = entries.count
+        entries.removeAll(keepingCapacity: false)
+        queryPicks.removeAll(keepingCapacity: false)
+        queryPickOrder.removeAll(keepingCapacity: false)
+        return removed
     }
 
     /// Number of tracked paths (for tests/status).

@@ -6,6 +6,7 @@ import JBarCore
 /// Pure UI logic — panel geometry, row modelling, badges, Tab autocomplete. Everything here runs
 /// headless (no window is created), which is what makes the AppKit layer testable at all: `JBarApp`
 /// is a library target precisely so these can be reached.
+@MainActor
 final class PanelGeometryTests: XCTestCase {
 
     private func row(_ name: String, path: String, kind: ItemKind) -> ResultRow {
@@ -44,6 +45,88 @@ final class PanelGeometryTests: XCTestCase {
         XCTAssertEqual(SearchPanel.rowsThatFit(in: 0), 0, "a zero-height screen fits no rows (and must not go negative)")
     }
 
+    /// Every supported configuration drives height, page movement and overflow from the same value.
+    func testLayoutMetricsForSupportedVisibleRowConfigurations() {
+        for configured in [1, 8, 12, 20] {
+            let full = PanelLayoutMetrics(configuredVisibleRows: configured, rowCount: configured)
+            XCTAssertEqual(full.configuredVisibleRows, configured)
+            XCTAssertEqual(full.effectiveVisibleRows, configured)
+            XCTAssertEqual(full.pageStride, configured)
+            XCTAssertEqual(full.visibleRowCount, configured)
+            XCTAssertFalse(full.hasOverflow)
+            XCTAssertFalse(full.showsPeek)
+            XCTAssertEqual(full.panelHeight, SearchPanel.height(forVisibleRows: configured))
+
+            let overflowing = PanelLayoutMetrics(configuredVisibleRows: configured,
+                                                 rowCount: configured + 5)
+            XCTAssertEqual(overflowing.effectiveVisibleRows, configured)
+            XCTAssertEqual(overflowing.pageStride, configured)
+            XCTAssertTrue(overflowing.hasOverflow)
+            XCTAssertTrue(overflowing.showsPeek)
+            XCTAssertEqual(overflowing.panelHeight,
+                           SearchPanel.height(forVisibleRows: configured, peeking: true))
+        }
+    }
+
+    /// A screen that can display 11 full rows plus the peek must override a configured 20 everywhere,
+    /// not merely clip the window while the table and Page Down continue believing 20 are visible.
+    func testShortScreenCapacityIsTheEffectiveVisibleRowSourceOfTruth() {
+        let shortScreenHeight = SearchPanel.height(forVisibleRows: 11, peeking: true)
+        let metrics = PanelLayoutMetrics(configuredVisibleRows: 20, rowCount: 40,
+                                         maximumPanelHeight: shortScreenHeight)
+        XCTAssertEqual(metrics.configuredVisibleRows, 20)
+        XCTAssertEqual(metrics.screenCapacity, 11)
+        XCTAssertEqual(metrics.effectiveVisibleRows, 11)
+        XCTAssertEqual(metrics.pageStride, 11)
+        XCTAssertEqual(metrics.visibleRowCount, 11)
+        XCTAssertTrue(metrics.hasOverflow)
+        XCTAssertTrue(metrics.showsPeek)
+        XCTAssertEqual(metrics.panelHeight, shortScreenHeight)
+    }
+
+    /// Exercise the real NSTableView selection/scroll path while changing the effective config live.
+    func testTablePageMovementAndConfigReflowUseEffectiveRows() {
+        _ = NSApplication.shared
+        let controller = ResultsController()
+        let rows = (0..<40).map { index in
+            PanelRow.result(row("item-\(index)", path: "/item-\(index)", kind: .document))
+        }
+        controller.setRows(rows)
+
+        let eight = PanelLayoutMetrics(configuredVisibleRows: 8, rowCount: rows.count)
+        controller.applyLayout(eight)
+        controller.scrollView.frame = NSRect(x: 0, y: 0, width: 500,
+                                             height: eight.panelHeight - SearchPanel.inputRowHeight
+                                                 - SearchPanel.bottomPadding)
+        controller.layout(width: 500)
+        controller.moveSelectionByPage(1)
+        XCTAssertEqual(controller.maxVisible, 8)
+        XCTAssertEqual(controller.pageStride, 8)
+        XCTAssertEqual(controller.table.selectedRow, 8)
+
+        let three = PanelLayoutMetrics(configuredVisibleRows: 3, rowCount: rows.count)
+        controller.applyLayout(three)
+        controller.scrollView.frame.size.height = three.panelHeight - SearchPanel.inputRowHeight
+            - SearchPanel.bottomPadding
+        controller.layout(width: 500)
+        XCTAssertEqual(controller.table.selectedRow, 8, "live reflow must preserve the valid selection")
+        XCTAssertEqual(controller.maxVisible, 3)
+        XCTAssertEqual(controller.pageStride, 3)
+
+        controller.moveSelectionByPage(1)
+        XCTAssertEqual(controller.table.selectedRow, 11, "Page Down must immediately adopt the new stride")
+        controller.scrollView.layoutSubtreeIfNeeded()
+        XCTAssertTrue(controller.table.visibleRect.intersects(controller.table.rect(ofRow: 11)),
+                      "the selected row must remain in the real table viewport after reflow")
+
+        for _ in 0..<20 { controller.moveSelectionByPage(1) }
+        XCTAssertEqual(controller.table.selectedRow, 39, "page movement clamps at the final row")
+        controller.moveSelectionByPage(1)
+        XCTAssertEqual(controller.table.selectedRow, 39)
+        controller.moveSelectionByPage(-1)
+        XCTAssertEqual(controller.table.selectedRow, 36)
+    }
+
     // MARK: Row model
 
     func testPanelRowsForResults() {
@@ -51,6 +134,36 @@ final class PanelGeometryTests: XCTestCase {
                                elapsed: 0, totalMatches: 1, mode: .search)
         XCTAssertEqual(SearchPanel.panelRows(for: r, hint: "hint").count, 1)
         XCTAssertNotNil(SearchPanel.panelRows(for: r, hint: nil).first?.result)
+    }
+
+    func testPathModeMakesBoundedResultCompletenessVisible() {
+        let kept = [row("A", path: "/A", kind: .document), row("B", path: "/B", kind: .document)]
+        let truncated = SearchResponse(query: "/", rows: kept, generation: 1, requestId: 1,
+                                       elapsed: 0, totalMatches: 19_999, mode: .path(base: "/", filter: ""))
+        XCTAssertEqual(SearchPanel.pathBadgeText(for: truncated), "PATH · 2/19999")
+        XCTAssertEqual(SearchPanel.pathBadgeAccessibilityLabel(for: truncated),
+                       "Path mode; showing 2 of 19999 matches")
+
+        let complete = SearchResponse(query: "/", rows: kept, generation: 1, requestId: 2,
+                                      elapsed: 0, totalMatches: 2, mode: .path(base: "/", filter: ""))
+        XCTAssertEqual(SearchPanel.pathBadgeText(for: complete), "PATH")
+        XCTAssertEqual(SearchPanel.pathBadgeAccessibilityLabel(for: complete),
+                       "Path mode; all 2 matches shown")
+        XCTAssertNil(SearchPanel.pathBadgeText(for: SearchResponse(query: "a", rows: kept,
+                                                                    generation: 1, requestId: 3, elapsed: 0,
+                                                                    totalMatches: 2, mode: .search)))
+    }
+
+    func testUnreadablePathDoesNotMasqueradeAsNoMatches() {
+        let unavailable = SearchResponse(query: "/private/locked", rows: [], generation: 1, requestId: 1,
+                                         elapsed: 0, totalMatches: 0,
+                                         mode: .path(base: "/private/locked", filter: ""),
+                                         totalMatchesIsComplete: false)
+        XCTAssertEqual(SearchPanel.pathBadgeText(for: unavailable), "PATH · ?")
+        XCTAssertEqual(SearchPanel.pathBadgeAccessibilityLabel(for: unavailable),
+                       "Path mode; result count unavailable")
+        XCTAssertEqual(SearchPanel.panelRows(for: unavailable, hint: nil),
+                       [.hint("Folder scan incomplete")])
     }
 
     /// A search that found nothing shows one dimmed, non-selectable "No matches" row.
@@ -80,6 +193,17 @@ final class PanelGeometryTests: XCTestCase {
         let t = SearchPanel.hintText(hotkeyDisplay: "⌃⌥Space")
         XCTAssertTrue(t.contains("⌃⌥Space"), "the hint must advertise the hotkey actually in use: \(t)")
         XCTAssertTrue(t.contains("↩"))
+    }
+
+    func testAppliedResultLogSummaryNeverContainsTheRawQuery() {
+        let secret = "Acquisition Target – confidential-token-123"
+        let response = SearchResponse(query: secret, rows: [row("A", path: "/A", kind: .document)],
+                                      generation: 1, requestId: 42, elapsed: 0.0129,
+                                      totalMatches: 1, mode: .search)
+        let summary = SearchPanel.appliedLogSummary(for: response)
+        XCTAssertEqual(summary, "applied 1 rows in 12 ms (id=42)")
+        XCTAssertFalse(summary.contains(secret))
+        XCTAssertFalse(summary.contains("confidential-token-123"))
     }
 
     // MARK: Badges
@@ -123,6 +247,8 @@ final class PanelGeometryTests: XCTestCase {
     func testAbbreviateHome() {
         XCTAssertEqual(SearchPanel.abbreviateHome("/Users/me", home: "/Users/me"), "~")
         XCTAssertEqual(SearchPanel.abbreviateHome("/Users/me/x/y", home: "/Users/me"), "~/x/y")
+        XCTAssertEqual(SearchPanel.abbreviateHome("/\u{301}目录", home: "/"), "~/\u{301}目录")
+        XCTAssertEqual(SearchPanel.abbreviateHome("/Users/Cafe\u{301}/文件", home: "/Users/Café"), "~/文件")
         XCTAssertEqual(SearchPanel.abbreviateHome("/opt/local", home: "/Users/me"), "/opt/local")
         // A different user's home must not be rewritten.
         XCTAssertEqual(SearchPanel.abbreviateHome("/Users/meredith/x", home: "/Users/me"), "/Users/meredith/x")
@@ -186,21 +312,225 @@ final class PanelGeometryTests: XCTestCase {
         XCTAssertEqual(field.stringValue, "")
     }
 
+    /// Delete is intentionally owned by AppKit's field editor, not by the panel. Exercise the real
+    /// `NSTextInputContext` command path with Latin, Chinese, Korean (NFC and decomposed Jamo), and an
+    /// extended emoji grapheme so a key-code regression cannot turn Delete into close/crash logic.
+    func testPhysicalDeleteUsesStandardFieldEditorAndRemovesOneGrapheme() throws {
+        _ = NSApplication.shared
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 80),
+                              styleMask: .borderless, backing: .buffered, defer: false)
+        let field = QueryField()
+        field.frame = window.contentView?.bounds ?? .zero
+        window.contentView?.addSubview(field)
+        XCTAssertTrue(window.makeFirstResponder(field))
+        let editor = try XCTUnwrap(field.currentEditor() as? NSTextView)
+        let delete = try XCTUnwrap(NSEvent.keyEvent(
+            with: .keyDown,
+            location: .zero,
+            modifierFlags: [],
+            timestamp: 0,
+            windowNumber: window.windowNumber,
+            context: nil,
+            characters: "\u{7f}",
+            charactersIgnoringModifiers: "\u{7f}",
+            isARepeat: false,
+            keyCode: UInt16(kVK_Delete)
+        ))
+
+        let cases: [(input: String, expected: String)] = [
+            ("abc", "ab"),
+            ("中文", "中"),
+            ("한글", "한"),
+            ("한", ""),
+            ("👨‍👩‍👧‍👦", ""),
+        ]
+        for sample in cases {
+            field.setText(sample.input)
+            editor.setSelectedRange(NSRange(location: (sample.input as NSString).length, length: 0))
+            editor.interpretKeyEvents([delete])
+            XCTAssertEqual(editor.string, sample.expected, "Delete must remove one grapheme from \(sample.input)")
+            XCTAssertFalse(editor.hasMarkedText())
+        }
+    }
+
+    func testDeleteDuringChineseMarkedTextStaysInsideInputContext() throws {
+        _ = NSApplication.shared
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 80),
+                              styleMask: .borderless, backing: .buffered, defer: false)
+        let field = QueryField()
+        field.frame = window.contentView?.bounds ?? .zero
+        window.contentView?.addSubview(field)
+        XCTAssertTrue(window.makeFirstResponder(field))
+        let editor = try XCTUnwrap(field.currentEditor() as? NSTextView)
+        editor.setMarkedText("拼", selectedRange: NSRange(location: 1, length: 0),
+                             replacementRange: NSRange(location: NSNotFound, length: 0))
+        XCTAssertTrue(editor.hasMarkedText())
+        let delete = try XCTUnwrap(NSEvent.keyEvent(
+            with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0,
+            windowNumber: window.windowNumber, context: nil, characters: "\u{7f}",
+            charactersIgnoringModifiers: "\u{7f}", isARepeat: false,
+            keyCode: UInt16(kVK_Delete)
+        ))
+
+        editor.interpretKeyEvents([delete])
+
+        XCTAssertFalse(SearchPanel.shouldCloseForKey(keyCode: delete.keyCode,
+                                                      hasMarkedText: editor.hasMarkedText()))
+        XCTAssertFalse(editor.hasMarkedText(), "the input context may cancel composition, but the panel must not own Delete")
+    }
+
     func testResignAndKeyPoliciesPreserveIMEInput() {
         XCTAssertTrue(SearchPanel.shouldHideAfterResign(isVisible: true, isKeyWindow: false,
-                                                        hasMarkedText: false, modifiers: []))
+                                                        hadMarkedText: false, hasMarkedText: false,
+                                                        modifiers: []))
         XCTAssertFalse(SearchPanel.shouldHideAfterResign(isVisible: true, isKeyWindow: false,
-                                                         hasMarkedText: true, modifiers: []))
+                                                         hadMarkedText: false, hasMarkedText: true,
+                                                         modifiers: []))
         XCTAssertFalse(SearchPanel.shouldHideAfterResign(isVisible: true, isKeyWindow: false,
-                                                         hasMarkedText: false, modifiers: [.control]))
+                                                         hadMarkedText: true, hasMarkedText: false,
+                                                         modifiers: []),
+                       "marked text observed synchronously must survive disappearing before the deferred check")
+        XCTAssertFalse(SearchPanel.shouldHideAfterResign(isVisible: true, isKeyWindow: false,
+                                                         hadMarkedText: false, hasMarkedText: false,
+                                                         modifiers: [.control]))
         XCTAssertFalse(SearchPanel.shouldHideAfterResign(isVisible: true, isKeyWindow: true,
-                                                         hasMarkedText: false, modifiers: []))
+                                                         hadMarkedText: false, hasMarkedText: false,
+                                                         modifiers: []))
 
         XCTAssertTrue(SearchPanel.shouldCloseForKey(keyCode: UInt16(kVK_Escape), hasMarkedText: false))
         XCTAssertFalse(SearchPanel.shouldCloseForKey(keyCode: UInt16(kVK_Escape), hasMarkedText: true))
         XCTAssertFalse(SearchPanel.shouldCloseForKey(keyCode: UInt16(kVK_Escape), hasMarkedText: false,
                                                      modifiers: [.control]))
         XCTAssertFalse(SearchPanel.shouldCloseForKey(keyCode: UInt16(kVK_Delete), hasMarkedText: false))
+    }
+
+    /// The number-row shortcut is based on hardware position, not the character emitted by the
+    /// current layout (for example, the physical 1 key can emit `&` on AZERTY).
+    func testCommandResultOrdinalsUsePhysicalANSIDigitKeys() {
+        let keys = [kVK_ANSI_1, kVK_ANSI_2, kVK_ANSI_3, kVK_ANSI_4,
+                    kVK_ANSI_5, kVK_ANSI_6, kVK_ANSI_7, kVK_ANSI_8]
+        for (ordinal, key) in keys.enumerated() {
+            XCTAssertEqual(SearchPanel.resultOrdinal(forCommandKeyCode: UInt16(key)), ordinal)
+        }
+        XCTAssertNil(SearchPanel.resultOrdinal(forCommandKeyCode: UInt16(kVK_ANSI_0)))
+        XCTAssertNil(SearchPanel.resultOrdinal(forCommandKeyCode: UInt16(kVK_ANSI_9)))
+        XCTAssertNil(SearchPanel.resultOrdinal(forCommandKeyCode: UInt16(kVK_ANSI_Keypad1)))
+    }
+
+    func testMarkedTextReturnsCommandShortcutsAndDelegateCommandsToAppKit() throws {
+        _ = NSApplication.shared
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 80),
+                              styleMask: .borderless, backing: .buffered, defer: false)
+        let field = QueryField()
+        field.frame = window.contentView?.bounds ?? .zero
+        window.contentView?.addSubview(field)
+        XCTAssertTrue(window.makeFirstResponder(field))
+        let editor = try XCTUnwrap(field.currentEditor() as? NSTextView)
+
+        editor.setMarkedText("拼", selectedRange: NSRange(location: 1, length: 0),
+                             replacementRange: NSRange(location: NSNotFound, length: 0))
+        XCTAssertTrue(editor.hasMarkedText(), "fixture must model a live Chinese IME composition")
+        XCTAssertFalse(SearchPanel.shouldInterceptCommandShortcut(hasMarkedText: editor.hasMarkedText(),
+                                                                  modifiers: [.command]))
+        XCTAssertFalse(SearchPanel.shouldHandleFieldEditorCommand(hasMarkedText: editor.hasMarkedText()))
+
+        let panel = SearchPanel(provider: DemoSearchProvider(), launcher: AppLauncher(),
+                                settings: SearchPanel.Settings())
+        let commands = [
+            #selector(NSResponder.insertNewline(_:)),
+            #selector(NSResponder.insertTab(_:)),
+            #selector(NSResponder.insertBacktab(_:)),
+            #selector(NSResponder.moveUp(_:)),
+            #selector(NSResponder.moveDown(_:)),
+            #selector(NSResponder.moveLeft(_:)),
+            #selector(NSResponder.moveRight(_:)),
+            #selector(NSResponder.scrollPageUp(_:)),
+            #selector(NSResponder.pageUp(_:)),
+            #selector(NSResponder.scrollPageDown(_:)),
+            #selector(NSResponder.pageDown(_:)),
+            #selector(NSResponder.cancelOperation(_:)),
+        ]
+        for command in commands {
+            XCTAssertFalse(panel.control(field, textView: editor, doCommandBy: command),
+                           "marked composition must retain \(NSStringFromSelector(command))")
+        }
+
+        editor.unmarkText()
+        XCTAssertTrue(SearchPanel.shouldInterceptCommandShortcut(hasMarkedText: editor.hasMarkedText(),
+                                                                 modifiers: [.command]))
+        XCTAssertTrue(SearchPanel.shouldHandleFieldEditorCommand(hasMarkedText: editor.hasMarkedText()))
+        XCTAssertFalse(SearchPanel.shouldInterceptCommandShortcut(hasMarkedText: false,
+                                                                  modifiers: [.command, .control]))
+        XCTAssertFalse(SearchPanel.shouldInterceptCommandShortcut(hasMarkedText: false,
+                                                                  modifiers: [.command, .option]))
+    }
+}
+
+final class CLISafetyTests: XCTestCase {
+    func testBenchmarkIterationBounds() {
+        XCTAssertEqual(CLI.benchmarkIterations(nil), 200)
+        XCTAssertEqual(CLI.benchmarkIterations("1"), 1)
+        XCTAssertEqual(CLI.benchmarkIterations(String(SafetyLimits.maxBenchmarkIterations)),
+                       SafetyLimits.maxBenchmarkIterations)
+        for invalid in ["", "0", "-1", "10001", "9223372036854775807", "not-a-number"] {
+            XCTAssertNil(CLI.benchmarkIterations(invalid), invalid)
+        }
+        XCTAssertEqual(Benchmark.boundedIterations(Int.min), 1)
+        XCTAssertEqual(Benchmark.boundedIterations(Int.max), SafetyLimits.maxBenchmarkIterations)
+    }
+}
+
+/// A provider whose non-empty response is released explicitly, so the panel's stale-response policy
+/// can be tested without timing sleeps.
+private actor GatedSearchProvider: SearchProviding {
+    private var started = false
+    private var startedWaiters: [CheckedContinuation<Void, Never>] = []
+    private var release: CheckedContinuation<Void, Never>?
+
+    func runSearch(_ raw: String, limit: Int, appsFirstCap: Int) async -> SearchResponse {
+        if raw.isEmpty {
+            return SearchResponse(query: raw, rows: [], generation: 1, requestId: 2,
+                                  elapsed: 0, totalMatches: 0, mode: .empty)
+        }
+        started = true
+        let waiters = startedWaiters
+        startedWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+        await withCheckedContinuation { release = $0 }
+        let stale = ResultRow(itemIndex: 0, name: "stale-secret", path: "/stale-secret",
+                              parentDisplay: "/", kind: .document, matchedByteOffsets: [],
+                              score: 1, tier: Tier.other)
+        return SearchResponse(query: raw, rows: [stale], generation: 1, requestId: 1,
+                              elapsed: 0, totalMatches: 1, mode: .search)
+    }
+
+    func waitUntilStarted() async {
+        if started { return }
+        await withCheckedContinuation { startedWaiters.append($0) }
+    }
+
+    func releaseStaleResponse() { release?.resume(); release = nil }
+}
+
+extension PanelGeometryTests {
+    @MainActor
+    func testDisablingRecentsCancelsAndRejectsAnOlderSearchResponse() async {
+        let provider = GatedSearchProvider()
+        var settings = SearchPanel.Settings()
+        settings.showRecentsOnEmpty = false
+        let panel = SearchPanel(provider: provider, launcher: AppLauncher(), settings: settings)
+
+        panel.setQuery("old secret")
+        await provider.waitUntilStarted()
+        panel.setQuery("")
+        XCTAssertEqual(panel.displayedRows, [.hint(SearchPanel.hintText(hotkeyDisplay: settings.hotkeyDisplay))])
+
+        await provider.releaseStaleResponse()
+        // Let the released provider task enqueue and execute its MainActor continuation.
+        await Task.yield()
+        await Task.yield()
+        XCTAssertEqual(panel.displayedRows, [.hint(SearchPanel.hintText(hotkeyDisplay: settings.hotkeyDisplay))],
+                       "a response superseded by the empty-query policy must never repaint stale results")
     }
 }
 

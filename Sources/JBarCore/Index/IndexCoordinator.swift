@@ -1,5 +1,27 @@
 import Foundation
 import CoreServices
+import Darwin
+
+/// Lock-isolated timestamp used by crawl callbacks, which may cross a worker-queue boundary.
+/// The lock is the complete synchronization invariant for `lastPublish`.
+private final class CrawlPublishThrottle: @unchecked Sendable {
+    private let lock = NSLock()
+    private let minimumInterval: TimeInterval
+    private var lastPublish: Date
+
+    init(minimumInterval: TimeInterval, now: Date = Date()) {
+        self.minimumInterval = minimumInterval
+        self.lastPublish = now
+    }
+
+    func shouldPublish(now: Date = Date()) -> Bool {
+        lock.withLock {
+            guard now.timeIntervalSince(lastPublish) >= minimumInterval else { return false }
+            lastPublish = now
+            return true
+        }
+    }
+}
 
 /// Observable status of the index, for the menu bar.
 public struct IndexStatus: Sendable, Equatable {
@@ -10,6 +32,9 @@ public struct IndexStatus: Sendable, Equatable {
     public var lastBuilt: Date? = nil
     public var deniedPaths: [String] = []
     public var cappedDirs: [String] = []
+    /// Entries/directories skipped because descriptor identity, symlink, or root-boundary safety checks failed.
+    /// This is a count only: unsafe paths are deliberately never retained or exposed.
+    public var unsafeEntriesSkipped: Int = 0
     public var hitItemCap: Bool = false
     public var watcherRunning: Bool = false
     public init() {}
@@ -49,6 +74,9 @@ public final class IndexCoordinator: @unchecked Sendable {
 
     /// Minimum interval between partial-store publishes during a crawl.
     public static let publishInterval: TimeInterval = 0.5
+    static let maximumSnapshotWriteInterval: TimeInterval = 86_400
+    static let maximumFSEventsLatency: TimeInterval = 60
+    static let maximumFullRecrawlInterval: TimeInterval = 366 * 86_400
 
     public private(set) var store: IndexStore {
         get { lock.withLock { _store } }
@@ -58,10 +86,16 @@ public final class IndexCoordinator: @unchecked Sendable {
         get { lock.withLock { _status } }
         set { lock.withLock { _status = newValue } }
     }
-    /// Called (on callbackQueue) whenever a new store generation is published.
-    public var onStoreChanged: ((IndexStore) -> Void)?
-    /// Called (on callbackQueue) whenever `status` changes.
-    public var onStatusChanged: ((IndexStatus) -> Void)?
+    /// Called (serially on callbackQueue) whenever a new store generation is published.
+    public var onStoreChanged: (@Sendable (IndexStore) -> Void)? {
+        get { lock.withLock { _onStoreChanged } }
+        set { lock.withLock { _onStoreChanged = newValue } }
+    }
+    /// Called (serially on callbackQueue) whenever `status` changes.
+    public var onStatusChanged: (@Sendable (IndexStatus) -> Void)? {
+        get { lock.withLock { _onStatusChanged } }
+        set { lock.withLock { _onStatusChanged = newValue } }
+    }
 
     // Queue-confined state.
     private var options: Options
@@ -69,6 +103,8 @@ public final class IndexCoordinator: @unchecked Sendable {
     private var stopped = false
     private var generation: UInt64 = 0
     private var apps: [ScannedApp] = []
+    /// Whether the latest application discovery hit its candidate/entry safety ceiling.
+    private var appScanTruncated = false
     private var watcher: FSEventsWatcher?
     private var timer: DispatchSourceTimer?
     private var dirty = false
@@ -82,14 +118,31 @@ public final class IndexCoordinator: @unchecked Sendable {
     private var _status = IndexStatus()
     private var cancelRequested = false
     private var statusCallbackPending = false
+    private var _onStoreChanged: (@Sendable (IndexStore) -> Void)?
+    private var _onStatusChanged: (@Sendable (IndexStatus) -> Void)?
 
     private let queue: DispatchQueue
     private let callbackQueue: DispatchQueue
     private let queueKey = DispatchSpecificKey<UInt8>()
+    private let snapshotRemover: @Sendable (URL) throws -> Void
+    private let appScanner: @Sendable ([String], [String], String) -> AppScanOutcome
 
-    public init(options: Options, callbackQueue: DispatchQueue = .main) {
-        self.options = options
-        self.callbackQueue = callbackQueue
+    public convenience init(options: Options, callbackQueue: DispatchQueue = .main) {
+        self.init(options: options, callbackQueue: callbackQueue,
+                  snapshotRemover: { try IndexCoordinator.removeSnapshotIfPresent($0) })
+    }
+
+    /// Internal dependency seam for deterministic deletion-failure tests.
+    init(options: Options, callbackQueue: DispatchQueue = .main,
+         snapshotRemover: @escaping @Sendable (URL) throws -> Void,
+         appScanner: @escaping @Sendable ([String], [String], String) -> AppScanOutcome = { roots, extraBundles, home in
+             AppScanner.scanOutcome(roots: roots, extraBundles: extraBundles, home: home)
+         }) {
+        self.options = IndexCoordinator.normalized(options)
+        // Preserve generation/status ordering even when an embedding client supplies a concurrent target.
+        self.callbackQueue = DispatchQueue(label: "com.linji.jbar.index.callbacks", target: callbackQueue)
+        self.snapshotRemover = snapshotRemover
+        self.appScanner = appScanner
         queue = DispatchQueue(label: "com.linji.jbar.index", qos: .utility)
         queue.setSpecific(key: queueKey, value: 1)
     }
@@ -104,11 +157,22 @@ public final class IndexCoordinator: @unchecked Sendable {
             guard !started, !stopped else { return }
             started = true
             scanAppsAndPublish()
-            if let snap = loadSnapshot() {
-                publish(IndexCoordinator.rebuildStore(apps: apps, filesFrom: snap, generation: nextGeneration(), fsEventId: snap.fsEventId), complete: true)
+            if let snap = loadSnapshot(),
+               let rebuilt = IndexCoordinator.rebuildStore(apps: apps, filesFrom: snap,
+                                                           generation: nextGeneration(), fsEventId: snap.fsEventId,
+                                                           maxItems: options.maxItems,
+                                                           rootAllowance: indexRootAllowance) {
+                publish(rebuilt.store, complete: true)
                 appliedEventId = snap.fsEventId
                 dirty = true
-                setStatus { $0.phase = .idle; $0.lastBuilt = snap.builtAt }
+                setStatus {
+                    $0.phase = .idle; $0.lastBuilt = snap.builtAt
+                    // Snapshot format does not persist crawl diagnostics; zero means no unsafe
+                    // entries were observed in this process/session's loaded-cache path.
+                    $0.unsafeEntriesSkipped = 0
+                    $0.hitItemCap = self.appScanTruncated || rebuilt.hitItemCap
+                        || (self.options.maxItems > 0 && snap.count == self.options.maxItems)
+                }
             } else {
                 fullCrawl()
             }
@@ -133,8 +197,8 @@ public final class IndexCoordinator: @unchecked Sendable {
         requestCancel()
         queue.async { [self] in
             guard started, !stopped else { return }
-            try? FileManager.default.removeItem(at: options.snapshotURL)
-            rescanAppsInternal(publishNow: false)
+            guard removeSnapshotForRebuild(at: options.snapshotURL) else { return }
+            _ = rescanAppsInternal(publishNow: false)
             fullCrawl()
             if watcher == nil { startWatcher() }
         }
@@ -144,21 +208,25 @@ public final class IndexCoordinator: @unchecked Sendable {
     public func rescanApps() {
         queue.async { [self] in
             guard !stopped else { return }
-            rescanAppsInternal(publishNow: true)
+            if !rescanAppsInternal(publishNow: true) { fullCrawl() }
         }
     }
 
     /// Apply new options (e.g. config hot reload). If roots/exclusions changed → rebuild, else just re-register the watcher.
     public func update(options new: Options) {
+        let normalizedNew = IndexCoordinator.normalized(new)
         let old = runOnQueue { options }
-        let indexChanged = IndexCoordinator.indexInputsDiffer(old, new)
+        let indexChanged = IndexCoordinator.indexInputsDiffer(old, normalizedNew)
         if indexChanged { requestCancel() }
         queue.async { [self] in
-            options = new
-            guard started, !stopped else { return }
+            guard started, !stopped else { options = normalizedNew; return }
             if indexChanged {
-                try? FileManager.default.removeItem(at: old.snapshotURL)
-                rescanAppsInternal(publishNow: false)
+                // Keep the current options/index/watchers intact unless the old cache is definitely gone.
+                guard removeSnapshotForRebuild(at: old.snapshotURL) else { return }
+            }
+            options = normalizedNew
+            if indexChanged {
+                _ = rescanAppsInternal(publishNow: false)
                 fullCrawl()
             }
             stopWatcher(); startWatcher()
@@ -175,44 +243,211 @@ public final class IndexCoordinator: @unchecked Sendable {
             || a.maxItems != b.maxItems || a.snapshotURL != b.snapshotURL
     }
 
+    /// Public options can also be constructed directly by embedding clients, bypassing config
+    /// validation. Normalize them before comparison, allocation, hashing, or crawling.
+    static func normalized(_ value: Options) -> Options {
+        var out = value
+        out.maxItems = IndexStoreLimits.normalizedMaxItems(value.maxItems)
+        if !SafetyLimits.isSafeAbsolutePath(value.home) {
+            out.home = NSHomeDirectory()
+        }
+        let appRootLimit = min(SafetyLimits.maxRootEntries,
+                               SafetyLimits.maxIndexRoots - AppScanner.extraBundles.count)
+        out.appRoots = boundedPaths(value.appRoots, home: out.home,
+                                    limit: appRootLimit, storeExpanded: true)
+        let remainingIndexRoots = max(0, SafetyLimits.maxIndexRoots
+            - AppScanner.extraBundles.count - out.appRoots.count)
+        out.fileRoots = boundedPaths(value.fileRoots, home: out.home,
+                                     limit: min(SafetyLimits.maxRootEntries, remainingIndexRoots),
+                                     storeExpanded: false)
+
+        let defaults = Exclusions.defaults(home: out.home)
+        var exclusions = value.exclusions
+        exclusions.excludeNames = boundedNames(value.exclusions.excludeNames,
+                                                limit: SafetyLimits.maxNameEntries,
+                                                fallback: defaults.excludeNames)
+        exclusions.downrankNames = boundedNames(value.exclusions.downrankNames,
+                                                 limit: SafetyLimits.maxNameEntries,
+                                                 fallback: defaults.downrankNames)
+        if value.exclusions.excludePaths.count > SafetyLimits.maxExcludedPathEntries {
+            exclusions.excludePaths = defaults.excludePaths
+        } else {
+            exclusions.excludePaths = boundedPaths(value.exclusions.excludePaths, home: out.home,
+                                                    limit: SafetyLimits.maxExcludedPathEntries,
+                                                    storeExpanded: true)
+        }
+        exclusions.maxDepth = min(max(value.exclusions.maxDepth, SafetyLimits.maxDepth.lowerBound),
+                                  SafetyLimits.maxDepth.upperBound)
+        exclusions.maxDirEntries = min(max(0, value.exclusions.maxDirEntries), Crawler.hardMaxDirectoryEntries)
+        exclusions.downrankDirEntries = min(max(0, value.exclusions.downrankDirEntries),
+                                            Crawler.hardMaxDirectoryEntries)
+        out.exclusions = exclusions
+
+        out.snapshotWriteInterval = boundedFinite(value.snapshotWriteInterval,
+                                                  fallback: 0,
+                                                  range: 0...maximumSnapshotWriteInterval)
+        out.fsLatency = boundedFinite(value.fsLatency, fallback: 1.0,
+                                      range: 0...maximumFSEventsLatency)
+        out.fullRecrawlInterval = boundedFinite(value.fullRecrawlInterval,
+                                                fallback: 7 * 86_400,
+                                                range: 0...maximumFullRecrawlInterval)
+        return out
+    }
+
+    private static func boundedFinite(_ value: TimeInterval, fallback: TimeInterval,
+                                      range: ClosedRange<TimeInterval>) -> TimeInterval {
+        guard value.isFinite else { return fallback }
+        return min(max(value, range.lowerBound), range.upperBound)
+    }
+
+    /// Inspect only the allowed prefix, validate bytes before tilde expansion, then validate the
+    /// expanded result again. Stable first-occurrence de-duplication preserves configured root order.
+    private static func boundedPaths(_ values: [String], home: String, limit: Int,
+                                     storeExpanded: Bool) -> [String] {
+        var result: [String] = []
+        result.reserveCapacity(min(values.count, limit))
+        var seen = Set<String>()
+        for raw in values.prefix(limit) {
+            guard SafetyLimits.isSafeAbsoluteOrTildePath(raw) else { continue }
+            let expanded = Exclusions.expandTilde(raw, home: home)
+            guard SafetyLimits.isSafeAbsolutePath(expanded) else { continue }
+            // Preserve the special file-root token "~": `fileRoots()` expands it to the curated
+            // default top-level roots rather than crawling the entire home as one root.
+            let stored = storeExpanded ? expanded : raw
+            guard seen.insert(stored).inserted else { continue }
+            result.append(stored)
+        }
+        return result
+    }
+
+    /// Set cardinality is O(1), so reject an oversized public set before sorting/folding it. Invalid
+    /// individual names are dropped after a bounded byte check; lowercasing is rechecked because
+    /// Unicode case mapping can expand.
+    private static func boundedNames(_ values: Set<String>, limit: Int,
+                                     fallback: Set<String>) -> Set<String> {
+        guard values.count <= limit else { return fallback }
+        var result = Set<String>()
+        result.reserveCapacity(values.count)
+        for raw in values where !raw.isEmpty
+            && SafetyLimits.utf8Fits(raw, maxBytes: SafetyLimits.maxNameUTF8Bytes) {
+            let normalized = raw.lowercased()
+            if SafetyLimits.utf8Fits(normalized, maxBytes: SafetyLimits.maxNameUTF8Bytes) {
+                result.insert(normalized)
+            }
+        }
+        return result
+    }
+
+    /// Remove exactly the snapshot filesystem entry without following symlinks or recursively deleting
+    /// an unexpected directory. A missing entry is already the desired state.
+    static func removeSnapshotIfPresent(_ url: URL) throws {
+        let result: Int32 = url.withUnsafeFileSystemRepresentation { path in
+            guard let path else { errno = EINVAL; return -1 }
+            return unlink(path)
+        }
+        guard result != 0 else { return }
+        let code = errno
+        guard code != ENOENT else { return }
+        throw NSError(domain: NSPOSIXErrorDomain, code: Int(code))
+    }
+
+    /// Queue-confined fail-closed deletion gate. The diagnostic intentionally contains no URL/path;
+    /// only the stable error domain/code is exposed for support and telemetry correlation.
+    private func removeSnapshotForRebuild(at url: URL) -> Bool {
+        do {
+            try snapshotRemover(url)
+            return true
+        } catch {
+            let ns = error as NSError
+            setStatus { $0.phase = .failed("snapshot removal failed (\(ns.domain):\(ns.code))") }
+            return false
+        }
+    }
+
+    /// A conservative allowance for all configured file/app roots plus AppScanner's explicit
+    /// bundles. Keeping this constant avoids rediscovering `~` roots on every partial publish.
+    private var indexRootAllowance: Int {
+        SafetyLimits.maxIndexRoots
+    }
+
     // MARK: Apps
 
     private func scanAppsAndPublish() {
         setStatus { $0.phase = .scanningApps }
-        apps = AppScanner.scan(roots: options.appRoots, extraBundles: AppScanner.extraBundles, home: options.home)
+        let outcome = appScanner(options.appRoots, AppScanner.extraBundles, options.home)
+        apps = outcome.apps
+        appScanTruncated = outcome.truncated
         let b = IndexBuilder()
-        AppScanner.add(apps, to: b)
-        publish(b.build(generation: nextGeneration()), complete: false)
-        setStatus { $0.appCount = self.apps.count }
+        let hitCap = appScanTruncated || AppScanner.add(apps, to: b, maxItems: options.maxItems)
+        let appStore = b.build(generation: nextGeneration())
+        publish(appStore, complete: false)
+        setStatus { $0.appCount = appStore.appItems.count; $0.hitItemCap = hitCap }
     }
 
-    private func rescanAppsInternal(publishNow: Bool) {
-        apps = AppScanner.scan(roots: options.appRoots, extraBundles: AppScanner.extraBundles, home: options.home)
-        setStatus { $0.appCount = self.apps.count }
-        guard publishNow else { return }
-        let merged = IndexCoordinator.rebuildStore(apps: apps, filesFrom: store, generation: nextGeneration(), fsEventId: store.fsEventId)
-        publish(merged, complete: storeComplete)
+    @discardableResult
+    private func rescanAppsInternal(publishNow: Bool) -> Bool {
+        let outcome = appScanner(options.appRoots, AppScanner.extraBundles, options.home)
+        apps = outcome.apps
+        appScanTruncated = outcome.truncated
+        guard publishNow else { return true }
+        guard let rebuilt = IndexCoordinator.rebuildStore(apps: apps, filesFrom: store,
+                                                          generation: nextGeneration(), fsEventId: store.fsEventId,
+                                                          maxItems: options.maxItems,
+                                                          rootAllowance: indexRootAllowance) else { return false }
+        let previouslyIncomplete = status.hitItemCap
+        guard publish(rebuilt.store, complete: storeComplete) else { return false }
+        setStatus {
+            $0.appCount = rebuilt.store.appItems.count
+            // An earlier capped full crawl may have omitted files; only another full crawl can
+            // prove completeness even if a later app rescan frees capacity.
+            $0.hitItemCap = previouslyIncomplete || self.appScanTruncated || rebuilt.hitItemCap
+        }
         if storeComplete { dirty = true }
+        return true
     }
 
-    /// Fresh app items + every non-app item of `base` (scanner apps removed, crawled files kept, dir ids stable).
-    static func rebuildStore(apps: [ScannedApp], filesFrom base: IndexStore?, generation: UInt64, fsEventId: UInt64) -> IndexStore {
+    /// Fresh app items + every non-catalog item of `base`. Directory ids may be compacted/remapped;
+    /// callers must treat the returned store as a complete immutable generation.
+    struct RebuildResult {
+        var store: IndexStore
+        var hitItemCap: Bool
+    }
+
+    static func rebuildStore(apps: [ScannedApp], filesFrom base: IndexStore?, generation: UInt64,
+                             fsEventId: UInt64, maxItems: Int, rootAllowance: Int) -> RebuildResult? {
+        let limit = IndexStoreLimits.normalizedMaxItems(maxItems)
         let b = IndexBuilder()
-        AppScanner.add(apps, to: b)
-        guard let base = base else { return b.build(generation: generation, fsEventId: fsEventId) }
-        let keep = (0..<base.count).filter { !StoreMerge.isScannerApp(base, $0) }
-        return StoreMerge.merge(base: base, keep: keep, extra: b.build(generation: 0), rootMap: [:], generation: generation, fsEventId: fsEventId)
+        var hitCap = AppScanner.add(apps, to: b, maxItems: limit)
+        guard let base else {
+            let result = b.build(generation: generation, fsEventId: fsEventId)
+            guard IndexStoreLimits.acceptsDirectoryMetadata(itemCount: result.count, dirCount: result.dirs.count,
+                                                            dirArenaBytes: result.dirArena.count,
+                                                            rootAllowance: rootAllowance) else { return nil }
+            return RebuildResult(store: result, hitItemCap: hitCap)
+        }
+        let remaining = limit - b.count
+        var keep: [Int] = []
+        keep.reserveCapacity(min(base.count, remaining))
+        for i in 0..<base.count where !StoreMerge.isScannerApp(base, i) {
+            if keep.count < remaining { keep.append(i) } else { hitCap = true }
+        }
+        guard let store = StoreMerge.merge(base: base, keep: keep, extra: b.build(generation: 0),
+                                           rootMap: [:], generation: generation, fsEventId: fsEventId,
+                                           maxItems: limit, rootAllowance: rootAllowance) else { return nil }
+        return RebuildResult(store: store, hitItemCap: hitCap)
     }
 
     // MARK: Snapshot
 
     private var headerHash: UInt64 {
-        Snapshot.headerHash(exclusions: options.exclusions, roots: fileRootPaths() + appRootPaths())
+        Snapshot.headerHash(exclusions: options.exclusions, fileRoots: fileRootPaths(),
+                            appRoots: appRootPaths(), maxItems: options.maxItems)
     }
 
     private func loadSnapshot() -> IndexStore? {
         setStatus { $0.phase = .loadingSnapshot }
-        guard let s = Snapshot.read(from: options.snapshotURL, expectedHeaderHash: headerHash) else { return nil }
+        guard let s = Snapshot.read(from: options.snapshotURL, expectedHeaderHash: headerHash,
+                                    maxItems: options.maxItems, rootAllowance: indexRootAllowance) else { return nil }
         if Date().timeIntervalSince(s.builtAt) > options.fullRecrawlInterval { return nil }
         if options.watchFileSystem && s.fsEventId == 0 { return nil }
         return s
@@ -246,9 +481,13 @@ public final class IndexCoordinator: @unchecked Sendable {
         var out: [CrawlRoot] = []
         var seen = Set<String>()
         for entry in options.fileRoots {
+            if out.count >= SafetyLimits.maxRootEntries { break }
             let roots = entry == "~" ? Crawler.defaultRoots(home: options.home, exclusions: options.exclusions)
                                       : [CrawlRoot(path: Exclusions.expandTilde(entry, home: options.home))]
-            for r in roots where seen.insert(r.path).inserted { out.append(r) }
+            for r in roots where seen.insert(r.path).inserted {
+                out.append(r)
+                if out.count >= SafetyLimits.maxRootEntries { break }
+            }
         }
         return out
     }
@@ -263,17 +502,24 @@ public final class IndexCoordinator: @unchecked Sendable {
     private func fullCrawl() {
         guard !stopped else { return }
         clearCancel()
-        setStatus { $0.phase = .crawling(progress: 0); $0.deniedPaths = []; $0.cappedDirs = []; $0.hitItemCap = false }
+        // Keep the previous completeness signal while rebuilding. Only a successfully completed
+        // full crawl can prove that an earlier capped generation is now complete.
+        setStatus {
+            $0.phase = .crawling(progress: 0)
+            $0.deniedPaths = []
+            $0.cappedDirs = []
+            $0.unsafeEntriesSkipped = 0
+        }
         let eventId = options.watchFileSystem ? UInt64(FSEventsGetCurrentEventId()) : 0
         let builder = IndexBuilder()
-        builder.reserve(items: max(store.count, 50_000), dirs: max(store.dirs.count, 5_000))
-        AppScanner.add(apps, to: builder)
+        builder.reserve(items: min(options.maxItems, max(store.count, 50_000)),
+                        dirs: max(store.dirs.count, 5_000))
+        let appHitCap = appScanTruncated || AppScanner.add(apps, to: builder, maxItems: options.maxItems)
         storeComplete = false
-        var lastPublish = Date()
+        let publishThrottle = CrawlPublishThrottle(minimumInterval: IndexCoordinator.publishInterval)
         let stats = makeCrawler().crawl(into: builder, onBatch: { [self] b in
-            guard Date().timeIntervalSince(lastPublish) >= IndexCoordinator.publishInterval else { return }
-            lastPublish = Date()
-            publish(b.build(generation: nextGeneration(), fsEventId: eventId), complete: false)
+            guard publishThrottle.shouldPublish() else { return }
+            _ = publish(b.build(generation: nextGeneration(), fsEventId: eventId), complete: false)
             setStatus { $0.phase = .crawling(progress: b.count) }
         }, shouldCancel: { [self] in isCancelRequested })
         lastCrawlStats = stats
@@ -281,12 +527,19 @@ public final class IndexCoordinator: @unchecked Sendable {
             setStatus { $0.phase = .idle }
             return
         }
-        publish(builder.build(generation: nextGeneration(), fsEventId: eventId), complete: true)
+        let completed = builder.build(generation: nextGeneration(), fsEventId: eventId)
+        let truncated = appHitCap || stats.hitItemCap
+        // A capped item/work budget or elapsed-time deadline produces a useful partial generation,
+        // but it is not an exact filesystem view: do not enable incremental updates or persist it as
+        // a complete snapshot. A later explicit rebuild may prove completeness.
+        guard publish(completed, complete: !truncated) else { return }
         appliedEventId = eventId
-        dirty = true
+        dirty = !truncated
         setStatus {
             $0.phase = .idle; $0.deniedPaths = stats.deniedPaths; $0.cappedDirs = stats.cappedDirs
-            $0.hitItemCap = stats.hitItemCap; $0.lastBuilt = Date()
+            $0.unsafeEntriesSkipped = stats.skippedUnsafe
+            $0.appCount = completed.appItems.count
+            $0.hitItemCap = truncated; $0.lastBuilt = completed.builtAt
         }
         writeSnapshotIfDirty()
     }
@@ -316,14 +569,14 @@ public final class IndexCoordinator: @unchecked Sendable {
         if batch.needsFullRescan { fullCrawl(); return }
         let appRoots = appRootPaths()
         if batch.changes.contains(where: { c in appRoots.contains { IndexCoordinator.isUnder(c.path, root: $0) } }) {
-            rescanAppsInternal(publishNow: true)
+            if !rescanAppsInternal(publishNow: true) { fullCrawl(); return }
         }
         let crawler = makeCrawler()
         let fileChanges = batch.changes.filter { IndexUpdater.isUnderRoots($0.path, crawler: crawler) }
         if !fileChanges.isEmpty {
             setStatus { $0.phase = .updating }
             if let s = IndexUpdater.apply(changes: fileChanges, to: store, crawler: crawler, generation: nextGeneration(), fsEventId: batch.latestEventId) {
-                publish(s, complete: true)
+                guard publish(s, complete: true) else { fullCrawl(); return }
                 setStatus { $0.phase = .idle }
             } else {
                 fullCrawl()
@@ -335,23 +588,33 @@ public final class IndexCoordinator: @unchecked Sendable {
     }
 
     static func isUnder(_ path: String, root: String) -> Bool {
-        path == root || path.hasPrefix(root.hasSuffix("/") ? root : root + "/")
+        SafetyLimits.isPath(path, within: root)
     }
 
     // MARK: Publishing / status
 
     private func nextGeneration() -> UInt64 { generation += 1; return generation }
 
-    private func publish(_ s: IndexStore, complete: Bool) {
+    @discardableResult
+    private func publish(_ s: IndexStore, complete: Bool) -> Bool {
+        guard s.count <= options.maxItems,
+              IndexStoreLimits.acceptsDirectoryMetadata(itemCount: s.count, dirCount: s.dirs.count,
+                                                        dirArenaBytes: s.dirArena.count,
+                                                        rootAllowance: indexRootAllowance) else {
+            storeComplete = false
+            setStatus { $0.phase = .failed("index exceeded configured resource limits") }
+            return false
+        }
         store = s
         storeComplete = complete
         setStatus { $0.itemCount = s.count }
-        let cb = onStoreChanged
+        let cb = lock.withLock { _onStoreChanged }
         callbackQueue.async { cb?(s) }
+        return true
     }
 
     /// Mutate status under the lock and deliver one coalesced callback.
-    private func setStatus(_ f: @escaping (inout IndexStatus) -> Void) {
+    private func setStatus(_ f: (inout IndexStatus) -> Void) {
         let schedule: Bool = lock.withLock {
             f(&_status)
             let s = !statusCallbackPending
@@ -360,8 +623,11 @@ public final class IndexCoordinator: @unchecked Sendable {
         }
         guard schedule else { return }
         callbackQueue.async { [self] in
-            let s: IndexStatus = lock.withLock { statusCallbackPending = false; return _status }
-            onStatusChanged?(s)
+            let delivery: (IndexStatus, (@Sendable (IndexStatus) -> Void)?) = lock.withLock {
+                statusCallbackPending = false
+                return (_status, _onStatusChanged)
+            }
+            delivery.1?(delivery.0)
         }
     }
 

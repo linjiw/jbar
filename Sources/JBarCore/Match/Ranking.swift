@@ -86,6 +86,24 @@ public enum Ranking {
     /// One day in seconds.
     public static let day: TimeInterval = 86_400
 
+    /// Ranking accepts programmatic/custom weights, so every arithmetic boundary must remain total
+    /// for all Int values. Normal product weights never reach these saturation paths.
+    private static func saturatedAdd(_ lhs: Int, _ rhs: Int) -> Int {
+        let (value, overflow) = lhs.addingReportingOverflow(rhs)
+        return overflow ? (rhs >= 0 ? Int.max : Int.min) : value
+    }
+
+    private static func saturatedSubtract(_ lhs: Int, _ rhs: Int) -> Int {
+        let (value, overflow) = lhs.subtractingReportingOverflow(rhs)
+        return overflow ? (rhs >= 0 ? Int.min : Int.max) : value
+    }
+
+    private static func saturatedMultiply(_ lhs: Int, _ rhs: Int) -> Int {
+        let (value, overflow) = lhs.multipliedReportingOverflow(by: rhs)
+        guard overflow else { return value }
+        return (lhs < 0) == (rhs < 0) ? Int.max : Int.min
+    }
+
     // MARK: Tier
 
     /// Tier for an item given the facts. Apps: exact → 0, prefix → 1; everything else 2.
@@ -119,16 +137,16 @@ public enum Ranking {
     public static func finalScore(facts: MatchFacts, kind: ItemKind, flags: ItemFlags, depth: Int, mtime: UInt32,
                                   frecencyBoost: Int, queryPickBoost: Int, now: Date, weights: RankingWeights) -> Int {
         var score = facts.textScore
-        score += initialsBonus(facts: facts, weights: weights)
-        score += typeBoost(kind: kind, flags: flags, weights: weights)
-        score += min(frecencyBoost, weights.frecencyCap)
-        score += queryPickBoost
+        score = saturatedAdd(score, initialsBonus(facts: facts, weights: weights))
+        score = saturatedAdd(score, typeBoost(kind: kind, flags: flags, weights: weights))
+        score = saturatedAdd(score, min(frecencyBoost, weights.frecencyCap))
+        score = saturatedAdd(score, queryPickBoost)
         if kind != .app {
-            score += recencyBoost(mtime: mtime, now: now, weights: weights)
-            score -= depthPenalty(depth: depth, weights: weights)
+            score = saturatedAdd(score, recencyBoost(mtime: mtime, now: now, weights: weights))
+            score = saturatedSubtract(score, depthPenalty(depth: depth, weights: weights))
         }
-        score -= flagPenalty(flags: flags, weights: weights)
-        score += matchBonuses(facts: facts, weights: weights)
+        score = saturatedSubtract(score, flagPenalty(flags: flags, weights: weights))
+        score = saturatedAdd(score, matchBonuses(facts: facts, weights: weights))
         return score
     }
 
@@ -142,8 +160,8 @@ public enum Ranking {
     /// Penalties derived from item flags: `junk` (DOWNRANK dir) and `dotName` (`.foo`, `~$foo`).
     public static func flagPenalty(flags: ItemFlags, weights: RankingWeights) -> Int {
         var p = 0
-        if flags.contains(.junk) { p += weights.junk }
-        if flags.contains(.dotName) { p += weights.dotName }
+        if flags.contains(.junk) { p = saturatedAdd(p, weights.junk) }
+        if flags.contains(.dotName) { p = saturatedAdd(p, weights.dotName) }
         return p
     }
 
@@ -151,10 +169,10 @@ public enum Ranking {
     /// whole-query-is-prefix (or equal), pinyin-initials exact.
     public static func matchBonuses(facts: MatchFacts, weights: RankingWeights) -> Int {
         var b = 0
-        if facts.extMatched { b += weights.extMatch }
-        if facts.wholeTokenMatch { b += weights.wholeToken }
-        if facts.prefixName || facts.exactName { b += weights.wholePrefix }
-        if facts.pinyinInitialsExact { b += weights.pinyinInitialsExact }
+        if facts.extMatched { b = saturatedAdd(b, weights.extMatch) }
+        if facts.wholeTokenMatch { b = saturatedAdd(b, weights.wholeToken) }
+        if facts.prefixName || facts.exactName { b = saturatedAdd(b, weights.wholePrefix) }
+        if facts.pinyinInitialsExact { b = saturatedAdd(b, weights.pinyinInitialsExact) }
         return b
     }
 
@@ -193,8 +211,10 @@ public enum Ranking {
     /// Depth penalty: `depthPerLevel` per component beyond `depthFree`, capped at `depthCap`.
     /// Never negative (a negative or small depth yields 0).
     public static func depthPenalty(depth: Int, weights: RankingWeights) -> Int {
-        let extra = max(0, depth - weights.depthFree)
-        return min(extra * weights.depthPerLevel, weights.depthCap)
+        let extra = max(0, saturatedSubtract(depth, weights.depthFree))
+        let perLevel = max(0, weights.depthPerLevel)
+        let cap = max(0, weights.depthCap)
+        return min(saturatedMultiply(extra, perLevel), cap)
     }
 
     // MARK: Ordering
@@ -228,23 +248,26 @@ public enum Ranking {
     ///   non-apps to fill the list, more apps (beyond the cap) backfill the remaining slots.
     /// Relative order within each group is preserved. O(n).
     public static func group(_ ordered: [RankedItem], maxResults: Int, appsFirstCap: Int, isApp: (Int) -> Bool) -> [RankedItem] {
-        guard maxResults > 0 else { return [] }
+        // Config normally validates this value, but keep the pure API safe for arbitrary callers:
+        // never reserve more than the input can actually produce.
+        let resultLimit = min(max(0, maxResults), ordered.count)
+        guard resultLimit > 0 else { return [] }
         var apps: [RankedItem] = []
         var others: [RankedItem] = []
         for item in ordered {
             if isApp(item.itemIndex) { apps.append(item) } else { others.append(item) }
         }
-        if others.isEmpty { return Array(apps.prefix(maxResults)) }
-        if apps.isEmpty { return Array(others.prefix(maxResults)) }
+        if others.isEmpty { return Array(apps.prefix(resultLimit)) }
+        if apps.isEmpty { return Array(others.prefix(resultLimit)) }
 
-        let cap = min(max(0, appsFirstCap), maxResults)
+        let cap = min(max(0, appsFirstCap), resultLimit)
         var out: [RankedItem] = []
-        out.reserveCapacity(maxResults)
+        out.reserveCapacity(resultLimit)
         out.append(contentsOf: apps.prefix(cap))
-        out.append(contentsOf: others.prefix(maxResults - out.count))
-        if out.count < maxResults {
+        out.append(contentsOf: others.prefix(resultLimit - out.count))
+        if out.count < resultLimit {
             // Fewer non-apps than slots: backfill with apps beyond the cap.
-            out.append(contentsOf: apps.dropFirst(cap).prefix(maxResults - out.count))
+            out.append(contentsOf: apps.dropFirst(cap).prefix(resultLimit - out.count))
         }
         return out
     }

@@ -9,14 +9,28 @@ public struct SearchResponse: Sendable {
     /// Engine-side request id (monotonic); UI drops responses older than the latest request.
     public var requestId: UInt64
     public var elapsed: TimeInterval
+    /// Number of matches observed by the scan. When `totalMatchesIsComplete` is true this is the exact
+    /// total even when `rows` was capped; otherwise it is only a lower bound (currently zero for cancelled or
+    /// unavailable scans). Callers must not present an incomplete value as an exact result count.
     public var totalMatches: Int
     public var mode: QueryMode
+    /// Whether `totalMatches` is exact. Path mode sets this to false when the directory cannot be read or
+    /// when no scan was requested (`limit == 0`); every cancelled response is also incomplete.
+    public var totalMatchesIsComplete: Bool
+    /// `true`/`false` when the exact total is known; `nil` means truncation cannot be determined because the
+    /// scan was unavailable or cancelled. This keeps UI from presenting an incomplete count as authoritative.
+    public var hasMoreResults: Bool? {
+        guard !cancelled, totalMatchesIsComplete else { return nil }
+        return totalMatches > rows.count
+    }
     /// True when the scan was abandoned because a newer request arrived (`rows` is then empty and the
     /// response must be ignored by the UI). Always false for responses that carry real results.
     public var cancelled: Bool = false
-    public init(query: String, rows: [ResultRow], generation: UInt64, requestId: UInt64, elapsed: TimeInterval, totalMatches: Int, mode: QueryMode) {
+    public init(query: String, rows: [ResultRow], generation: UInt64, requestId: UInt64, elapsed: TimeInterval,
+                totalMatches: Int, mode: QueryMode, totalMatchesIsComplete: Bool = true) {
         self.query = query; self.rows = rows; self.generation = generation; self.requestId = requestId
         self.elapsed = elapsed; self.totalMatches = totalMatches; self.mode = mode
+        self.totalMatchesIsComplete = totalMatchesIsComplete
     }
 }
 
@@ -31,7 +45,8 @@ public struct SearchResponse: Sendable {
 ///   previous candidate set; otherwise full scan.
 /// - Cancellation: each `search` bumps `requestId`; worker chunks poll `latestRequestId` and bail early.
 /// - `.empty` → `recents` (frecency paths that still exist, mapped to rows; itemIndex = -1 if not in the store).
-/// - `.path` → list the directory (FileManager), folders first, hidden only if filter starts with ".", prefix-then-fuzzy filter.
+/// - `.path` → stream the directory into a bounded top-K; prefix before fuzzy, folders on equal group/score,
+///   hidden entries only when the filter starts with ".".
 /// - `.extensionOnly` → items with that ext, ranked by recency/frecency.
 /// - Never blocks the main thread; the UI `await`s this actor.
 ///
@@ -52,10 +67,16 @@ public actor SearchEngine {
     public private(set) var latestRequestId: UInt64 = 0
 
     /// Home directory used for `~` expansion in path mode and for `~`-abbreviated parent display.
-    public private(set) var home: String = NSHomeDirectory()
+    public private(set) var home: String = QueryParser.normalizedHome(NSHomeDirectory())
 
     /// Path mode returns at most `limit × pathModeRowMultiplier` rows (the table scrolls beyond `limit`).
     public static let pathModeRowMultiplier = 4
+    /// Absolute path-mode result-pool ceiling after the public `limit` is validated.
+    public static let maxPathModeRows = SafetyLimits.maxResults.upperBound * pathModeRowMultiplier
+    /// Exact path totals are useful, but must not turn one keypress into an unbounded directory walk.
+    /// When either budget is reached the retained top rows are returned with an explicitly incomplete total.
+    public static let maxPathModeVisitedEntries = 100_000
+    public static let pathModeTimeBudget: TimeInterval = 3
     /// Number of best stage-1 candidates that get frecency/query-pick boosts before final ordering.
     public static let rerankWindow = 300
     /// Candidate count above which the scan is split into parallel chunks. Measured sweet spot: below this,
@@ -81,6 +102,9 @@ public actor SearchEngine {
     private var extLookup: [String: Int16] = [:]
     /// Candidate set of the previous successful `.search` scan (DESIGN.md §6.4 step 4).
     private var cache: IncrementalCache?
+    /// Optional internal-only work counter used by deterministic performance tests. Production leaves this nil,
+    /// so the candidate hot loop performs no observation or locking.
+    private var scanWorkObserver: SearchScanWorkObserver?
     /// Shared with worker threads for cancellation polling.
     private let requestCounter = RequestCounter()
     /// Worker queue for scans and directory listings (keeps the cooperative pool and the actor free).
@@ -97,7 +121,9 @@ public actor SearchEngine {
     /// Attach/detach the frecency store (takes effect on the next `search`).
     public func setFrecency(_ f: FrecencyStore?) { frecency = f }
     /// Override the home directory (tests; `~` expansion and parent display).
-    public func setHome(_ h: String) { home = h }
+    public func setHome(_ h: String) { home = QueryParser.normalizedHome(h) }
+    /// Attach a deterministic scan-work observer for tests/benchmarks.
+    func setScanWorkObserver(_ observer: SearchScanWorkObserver?) { scanWorkObserver = observer }
 
     /// Highest `store.generation` applied so far. `IndexCoordinator` numbers generations monotonically
     /// for the life of the process (never reset by rebuild/update), so this rejects out-of-order applies.
@@ -114,7 +140,9 @@ public actor SearchEngine {
         cache = nil
         var lookup: [String: Int16] = [:]
         lookup.reserveCapacity(store.extensions.count)
-        for (i, e) in store.extensions.enumerated() where lookup[e] == nil { lookup[e] = Int16(clamping: i) }
+        for (i, e) in store.extensions.prefix(Int(Int16.max) + 1).enumerated() where lookup[e] == nil {
+            lookup[e] = Int16(i)
+        }
         extLookup = lookup
     }
 
@@ -125,37 +153,62 @@ public actor SearchEngine {
         latestRequestId = rid
         let parsed = QueryParser.parse(raw, home: home)
         let gen = store.generation
-        func finish(_ rows: [ResultRow], total: Int, cancelled: Bool = false) -> SearchResponse {
+        // Config loading rejects out-of-range values, but this is a public core API too. Bound it
+        // independently so Int.max/Int.min cannot overflow arithmetic or request huge capacities.
+        let safeLimit = min(max(0, limit), SafetyLimits.maxResults.upperBound)
+        let safeAppsFirstCap = min(max(0, appsFirstCap), safeLimit)
+        func finish(_ rows: [ResultRow], total: Int, cancelled: Bool = false,
+                    totalMatchesIsComplete: Bool = true) -> SearchResponse {
             let elapsed = Double(DispatchTime.now().uptimeNanoseconds &- t0) / 1e9
-            var r = SearchResponse(query: raw, rows: rows, generation: gen, requestId: rid, elapsed: elapsed, totalMatches: total, mode: parsed.mode)
+            var r = SearchResponse(query: parsed.raw, rows: rows, generation: gen, requestId: rid,
+                                   elapsed: elapsed, totalMatches: total, mode: parsed.mode,
+                                   totalMatchesIsComplete: totalMatchesIsComplete && !cancelled)
             r.cancelled = cancelled
             return r
         }
+        // A zero/negative public limit requests no rows, not an expensive count-only scan. Returning
+        // an explicitly incomplete total avoids walking up to two million items merely to discard
+        // every match and prevents callers from presenting zero as an authoritative count.
+        guard safeLimit > 0 else {
+            return finish([], total: 0, totalMatchesIsComplete: false)
+        }
         switch parsed.mode {
         case .empty:
-            let rows = recents(limit: limit, now: now)
+            let rows = recents(limit: safeLimit, now: now)
             return finish(rows, total: rows.count)
         case .path(let base, let filter):
-            let cap = max(limit, limit * Self.pathModeRowMultiplier)
+            let cap = safeLimit * Self.pathModeRowMultiplier
             let homeDir = home
-            let listing = await Self.onWorker { Self.listDirectory(base: base, filter: filter, cap: cap, home: homeDir) }
-            return finish(listing.rows, total: listing.total)
+            let counter = requestCounter
+            let listing = await Self.onWorker {
+                Self.listDirectory(base: base, filter: filter, cap: cap, home: homeDir,
+                                   requestId: rid, counter: counter)
+            }
+            // A request can be superseded after the worker's last poll but before this continuation resumes.
+            if listing.cancelled || requestCounter.current != rid {
+                return finish([], total: 0, cancelled: true, totalMatchesIsComplete: false)
+            }
+            return finish(listing.rows, total: listing.totalMatches,
+                          totalMatchesIsComplete: listing.totalMatchesIsComplete)
         case .extensionOnly(let ext):
             // No terms: the rows carry no highlight offsets (the extension is implied by the query).
-            let ctx = makeContext(parsed: parsed, terms: [], limit: limit, appsFirstCap: appsFirstCap, now: now, rid: rid)
+            let ctx = makeContext(parsed: parsed, terms: [], limit: safeLimit, appsFirstCap: safeAppsFirstCap, now: now, rid: rid)
             let ids = extIds(for: ext)
             let outcome = await Self.onWorker { Self.scanExtensionOnly(ids: ids, ctx: ctx) }
             if outcome.cancelled { return finish([], total: 0, cancelled: true) }
             return finish(outcome.rows, total: outcome.totalMatches)
         case .search:
             guard !parsed.terms.isEmpty else {
-                let rows = recents(limit: limit, now: now)
+                let rows = recents(limit: safeLimit, now: now)
                 return finish(rows, total: rows.count)
             }
-            let ctx = makeContext(parsed: parsed, terms: prepareTerms(parsed), limit: limit, appsFirstCap: appsFirstCap, now: now, rid: rid)
+            let terms = prepareTerms(parsed)
             let epoch = storeEpoch
-            let cached = cachedCandidates(for: ctx)
-            ctx.candidates = cached.map { .list($0) } ?? .all(store.count)
+            let cached = cachedCandidates(parsed: parsed, terms: terms)
+            let candidates: CandidateSet = cached.map { .list($0) } ?? .all(store.count)
+            let ctx = makeContext(parsed: parsed, terms: terms, limit: safeLimit,
+                                  appsFirstCap: safeAppsFirstCap, now: now, rid: rid,
+                                  candidates: candidates)
             let outcome = await Self.onWorker { Self.scanSearch(ctx: ctx) }
             if outcome.cancelled { return finish([], total: 0, cancelled: true) }
             if epoch == storeEpoch {
@@ -167,13 +220,14 @@ public actor SearchEngine {
 
     /// Rows for recently/frequently opened items (empty query). `exists` defaults to FileManager check.
     public func recents(limit: Int, now: Date = Date()) -> [ResultRow] {
-        guard limit > 0, let f = frecency else { return [] }
+        let safeLimit = min(max(0, limit), SafetyLimits.maxResults.upperBound)
+        guard safeLimit > 0, let f = frecency else { return [] }
         let fm = FileManager.default
         var rows: [ResultRow] = []
-        rows.reserveCapacity(limit)
-        for p in f.recents(limit: limit * 2, now: now) where fm.fileExists(atPath: p) {
+        rows.reserveCapacity(safeLimit)
+        for p in f.recents(limit: safeLimit * 2, now: now) where fm.fileExists(atPath: p) {
             rows.append(Self.row(forPath: p, home: home))
-            if rows.count >= limit { break }
+            if rows.count >= safeLimit { break }
         }
         return rows
     }
@@ -192,7 +246,7 @@ public actor SearchEngine {
     /// `row(forPath:)` when the caller already knows the directory/package flags (saves a stat per entry).
     nonisolated static func row(forPath path: String, isDirectory: Bool, isPackage: Bool, home: String,
                                 matchedByteOffsets: [Int] = [], score: Int = 0) -> ResultRow {
-        let clean = (path.count > 1 && path.hasSuffix("/")) ? String(path.dropLast()) : path
+        let clean = SafetyLimits.trimmingTrailingPathSlashes(path)
         let ns = clean as NSString
         var name = ns.lastPathComponent
         let parent = ns.deletingLastPathComponent
@@ -215,9 +269,7 @@ public actor SearchEngine {
 
     /// `~`-abbreviate `dir` (mirrors `IndexStore.parentDisplayPath`).
     nonisolated static func abbreviate(_ dir: String, home: String) -> String {
-        if dir == home { return "~" }
-        if dir.hasPrefix(home + "/") { return "~" + dir.dropFirst(home.count) }
-        return dir
+        SafetyLimits.abbreviatingHome(dir, home: home)
     }
 
     // MARK: - Query preparation (actor side)
@@ -229,9 +281,11 @@ public actor SearchEngine {
         }
     }
 
-    private func makeContext(parsed: ParsedQuery, terms: [PreparedTerm], limit: Int, appsFirstCap: Int, now: Date, rid: UInt64) -> ScanContext {
+    private func makeContext(parsed: ParsedQuery, terms: [PreparedTerm], limit: Int, appsFirstCap: Int,
+                             now: Date, rid: UInt64, candidates: CandidateSet = .all(0)) -> ScanContext {
         ScanContext(store: store, parsed: parsed, terms: terms, weights: weights, frecency: frecency, now: now,
-                    limit: limit, appsFirstCap: appsFirstCap, home: home, requestId: rid, counter: requestCounter)
+                    limit: limit, appsFirstCap: appsFirstCap, home: home, requestId: rid,
+                    counter: requestCounter, candidates: candidates, workObserver: scanWorkObserver)
     }
 
     /// Interned ids of `ext` and its aliases in the current store (empty if the store has no such extension).
@@ -250,25 +304,25 @@ public actor SearchEngine {
     /// prefix of the corresponding new term; an ext-satisfiable new term has the same ext ids as the old one (so the
     /// set of items satisfied by extension did not grow); and an old trailing-space query is only reused by the
     /// identical trailing-space query (substring semantics are not monotone under extension).
-    private func cachedCandidates(for ctx: ScanContext) -> [Int32]? {
-        guard let c = cache, c.storeEpoch == storeEpoch, !c.terms.isEmpty, ctx.terms.count >= c.terms.count else { return nil }
+    private func cachedCandidates(parsed: ParsedQuery, terms: [PreparedTerm]) -> [Int32]? {
+        guard let c = cache, c.storeEpoch == storeEpoch, !c.terms.isEmpty, terms.count >= c.terms.count else { return nil }
         for k in 0..<c.terms.count {
-            guard ctx.terms[k].folded.starts(with: c.terms[k].folded) else { return nil }
+            guard terms[k].folded.starts(with: c.terms[k].folded) else { return nil }
             // The extension-substring rule makes match membership non-monotone across the
             // extension/non-extension boundary, so any change to a term's ext ids — GAINING or LOSING
             // extension-ness — must invalidate the cache (e.g. "pdf" → "pdfx" lifts the substring rule).
-            if ctx.terms[k].extIds != c.terms[k].extIds { return nil }
+            if terms[k].extIds != c.terms[k].extIds { return nil }
         }
         if c.lastTermComplete {
-            guard ctx.parsed.lastTermComplete, ctx.terms.count == c.terms.count,
-                  ctx.terms[ctx.terms.count - 1].folded == c.terms[c.terms.count - 1].folded else { return nil }
+            guard parsed.lastTermComplete, terms.count == c.terms.count,
+                  terms[terms.count - 1].folded == c.terms[c.terms.count - 1].folded else { return nil }
         }
         return c.candidates
     }
 
     // MARK: - Worker bridge
 
-    private static func onWorker<T>(_ body: @escaping () -> T) async -> T {
+    private static func onWorker<T: Sendable>(_ body: @escaping @Sendable () -> T) async -> T {
         await withCheckedContinuation { (cont: CheckedContinuation<T, Never>) in
             workerQueue.async { cont.resume(returning: body()) }
         }
@@ -281,21 +335,24 @@ public actor SearchEngine {
         let n = ctx.candidates.count
         guard n > 0 else { return ScanOutcome(rows: [], matched: [], totalMatches: 0, cancelled: false) }
         let chunks = chunkRanges(count: n)
-        var results: [ChunkResult] = []
+        let results: [ChunkResult]
         if chunks.count == 1 {
             results = [runChunk(index: 0, range: chunks[0], ctx: ctx)]
         } else {
-            let lock = NSLock()
+            let slots = ChunkResultSlots(count: chunks.count)
             DispatchQueue.concurrentPerform(iterations: chunks.count) { c in
                 if ctx.isStale { return }
                 let r = runChunk(index: c, range: chunks[c], ctx: ctx)
-                lock.lock(); results.append(r); lock.unlock()
+                slots.store(r, at: c)
             }
+            guard let completed = slots.completed() else {
+                return ScanOutcome(rows: [], matched: [], totalMatches: 0, cancelled: true)
+            }
+            results = completed
         }
         if ctx.isStale || results.count != chunks.count || results.contains(where: { $0.cancelled }) {
             return ScanOutcome(rows: [], matched: [], totalMatches: 0, cancelled: true)
         }
-        results.sort { $0.index < $1.index }
         var matched: [Int32] = []
         var total = 0
         var pool: [Scored] = []
@@ -387,15 +444,31 @@ public actor SearchEngine {
     private static func makeRow(_ r: RankedItem, ctx: ScanContext) -> ResultRow {
         let store = ctx.store
         let i = r.itemIndex
-        let nameF = store.foldedName(of: i), nameB = store.bonus(of: i)
-        var offsets: [Int] = []
-        for t in ctx.terms {
-            let p = Scorer.matchPositions(query: t.folded[...], text: nameF, bonus: nameB)
-            if !p.isEmpty { offsets.append(contentsOf: p) }
+        let storedName = store.name(of: i)
+        let app = store.itemKind(i) == .app ? store.appInfo[Int32(i)] : nil
+        let displayName = app.flatMap { $0.displayName.isEmpty ? nil : $0.displayName } ?? storedName
+        var offsets: [Int]
+        if displayName == storedName {
+            offsets = matchOffsets(terms: ctx.terms, folded: store.foldedName(of: i), bonus: store.bonus(of: i))
+        } else {
+            // Finder's localized display name is the UI contract for apps. Re-run highlight mapping on
+            // that short string so offsets never point into the hidden filesystem/bundle name.
+            let analyzed = TextAnalyzer.analyze(displayName)
+            offsets = matchOffsets(terms: ctx.terms, folded: analyzed.folded[...], bonus: analyzed.bonus[...])
         }
         offsets = ctx.terms.count > 1 ? Array(Set(offsets)).sorted() : offsets.sorted()
-        return ResultRow(itemIndex: i, name: store.name(of: i), path: store.path(of: i), parentDisplay: store.parentDisplayPath(of: i, home: ctx.home),
+        return ResultRow(itemIndex: i, name: displayName, path: store.path(of: i), parentDisplay: store.parentDisplayPath(of: i, home: ctx.home),
                          kind: store.itemKind(i), matchedByteOffsets: offsets, score: r.finalScore, tier: r.tier)
+    }
+
+    private static func matchOffsets(terms: [PreparedTerm], folded: ArraySlice<UInt8>,
+                                     bonus: ArraySlice<UInt8>) -> [Int] {
+        var offsets: [Int] = []
+        for term in terms {
+            let positions = Scorer.matchPositions(query: term.folded[...], text: folded, bonus: bonus)
+            if !positions.isEmpty { offsets.append(contentsOf: positions) }
+        }
+        return offsets
     }
 
     /// Ranking key (DESIGN.md §6.5): tier ASC, finalScore DESC, nameLength ASC, firstMatch ASC, itemIndex ASC.
@@ -409,60 +482,158 @@ public actor SearchEngine {
 
     // MARK: - Path mode (worker side)
 
-    /// List `base` (DESIGN.md §7.5): hidden (dot-name) entries only — and exclusively — when `filter` starts with ".",
-    /// folders first then files,
-    /// alphabetical (`localizedStandardCompare`); a non-empty `filter` keeps case-insensitive prefix matches first
-    /// (folders first, alphabetical) then fuzzy subsequence matches (by score). Returns at most `cap` rows and
-    /// the number of entries that matched before capping. Unreadable/missing directory → no rows.
-    nonisolated static func listDirectory(base: String, filter: String, cap: Int, home: String) -> (rows: [ResultRow], total: Int) {
-        let url = URL(fileURLWithPath: base, isDirectory: true)
-        let keys: [URLResourceKey] = [.isDirectoryKey, .isPackageKey]
-        guard cap > 0, let urls = try? FileManager.default.contentsOfDirectory(at: url, includingPropertiesForKeys: keys, options: []) else {
-            return ([], 0)
+    /// List `base` (DESIGN.md §7.5) without materialising the directory. The enumerator is consumed one URL
+    /// at a time and a bounded heap retains only the best `cap` entries; `totalMatches` is still exact after a
+    /// complete scan. Hidden (dot-name) entries are listed only — and exclusively — when `filter` starts with
+    /// ".". Prefix matches precede fuzzy matches, comparable folders precede files, and the final order is
+    /// deterministic. Missing/unreadable directories return an incomplete empty result, rather than claiming an
+    /// exact zero. A superseding request abandons enumeration, scoring, metadata, sorting, or row construction.
+    nonisolated static func listDirectory(base: String, filter: String, cap: Int, home: String,
+                                          requestId: UInt64, counter: RequestCounter,
+                                          visitLimit: Int = maxPathModeVisitedEntries,
+                                          timeBudget: TimeInterval = pathModeTimeBudget) -> PathScanOutcome {
+        let boundedCap = min(max(0, cap), maxPathModeRows)
+        guard boundedCap > 0, SafetyLimits.isSafeAbsolutePath(base) else {
+            return PathScanOutcome(rows: [], totalMatches: 0, totalMatchesIsComplete: false, cancelled: false)
         }
+        guard counter.current == requestId else { return .cancelled }
+        let boundedVisitLimit = min(max(0, visitLimit), maxPathModeVisitedEntries)
+        let boundedSeconds = timeBudget.isFinite ? min(max(0, timeBudget), pathModeTimeBudget) : 0
+        let started = DispatchTime.now().uptimeNanoseconds
+        let deadline = started &+ UInt64(boundedSeconds * 1_000_000_000)
+
+        let url = URL(fileURLWithPath: base, isDirectory: true)
+        let directoryKeys: Set<URLResourceKey> = [.isDirectoryKey]
+        let packageKeys: Set<URLResourceKey> = [.isPackageKey]
+        let enumerationStatus = PathEnumerationStatus()
+        guard let enumerator = FileManager.default.enumerator(
+            at: url,
+            includingPropertiesForKeys: Array(directoryKeys),
+            options: [.skipsSubdirectoryDescendants],
+            errorHandler: { _, _ in
+                enumerationStatus.markFailed()
+                // Continue when Foundation can skip a single bad entry. The response remains explicitly
+                // incomplete because one or more matches may have been inaccessible.
+                return true
+            }
+        ) else {
+            return PathScanOutcome(rows: [], totalMatches: 0, totalMatchesIsComplete: false, cancelled: false)
+        }
+
         // A filter starting with "." browses hidden entries: only dot-names are listed (and without it, none are).
-        let dotFilter = filter.hasPrefix(".")
+        let dotFilter = SafetyLimits.hasDotPrefix(filter)
         let filterA: SearchString? = filter.isEmpty ? nil : TextAnalyzer.analyze(filter)
         let scratch = ScorerScratch()
-        var entries: [PathEntry] = []
-        entries.reserveCapacity(urls.count)
-        for u in urls {
-            let name = u.lastPathComponent
-            if name.hasPrefix(".") != dotFilter { continue }
-            let rv = try? u.resourceValues(forKeys: Set(keys))
-            let isDir = rv?.isDirectory ?? false
-            let isPkg = rv?.isPackage ?? false
-            var e = PathEntry(name: name, isDirectory: isDir, isPackage: isPkg, isFolder: isDir && !isPkg, group: 0, score: 0, analyzed: nil)
+        var best = PathTopK(capacity: boundedCap)
+        var total = 0
+        var visited = 0
+
+        while true {
+            // Check before advancing Foundation's enumerator: the visit budget is a bound on actual
+            // filesystem entries requested, not merely on entries processed after one extra read.
+            guard visited < boundedVisitLimit else {
+                enumerationStatus.markFailed()
+                break
+            }
+            guard DispatchTime.now().uptimeNanoseconds < deadline else {
+                enumerationStatus.markFailed()
+                break
+            }
+            guard let object = enumerator.nextObject() else { break }
+            visited &+= 1
+            // Poll each phase on a staggered 32-entry cadence. Matching entries reach a cancellation point every
+            // eight entries; hidden/nonmatching runs still poll at least every 32. This avoids taking an NSLock
+            // four times for every filename while keeping supersession latency sub-millisecond in the 20k test.
+            let cancellationPhase = visited & 31
+            if cancellationPhase == 0, counter.current != requestId { return .cancelled }
+            guard let entryURL = object as? URL else {
+                enumerationStatus.markFailed()
+                continue
+            }
+            let name = entryURL.lastPathComponent
+            if SafetyLimits.hasDotPrefix(name) != dotFilter { continue }
+
+            var analyzed: SearchString?
+            var group = 0
+            var score = 0
             if let f = filterA {
                 let a = TextAnalyzer.analyze(name)
+                if cancellationPhase == 8, counter.current != requestId { return .cancelled }
                 if a.folded.starts(with: f.folded) {
-                    e.group = 0
-                } else if let r = Scorer.score(query: f.folded[...], text: a.folded[...], bonus: a.bonus[...], scratch: scratch) {
-                    e.group = 1; e.score = Int(r.score)
-                } else { continue }
-                e.analyzed = a
+                    group = 0
+                } else if let match = Scorer.score(query: f.folded[...], text: a.folded[...],
+                                                   bonus: a.bonus[...], scratch: scratch) {
+                    group = 1
+                    score = Int(match.score)
+                } else {
+                    continue
+                }
+                analyzed = a
             }
-            entries.append(e)
+
+            let values = try? entryURL.resourceValues(forKeys: directoryKeys)
+            if cancellationPhase == 16, counter.current != requestId { return .cancelled }
+            guard DispatchTime.now().uptimeNanoseconds < deadline else {
+                enumerationStatus.markFailed()
+                break
+            }
+            let isDirectory = values?.isDirectory ?? false
+            // Package metadata is meaningful only for a directory. Avoid asking Launch Services/Foundation
+            // for it on the overwhelmingly common regular-file path.
+            let isPackage = isDirectory
+                ? ((try? entryURL.resourceValues(forKeys: packageKeys).isPackage) ?? false)
+                : false
+            let entry = PathEntry(name: name, isDirectory: isDirectory, isPackage: isPackage,
+                                  isFolder: isDirectory && !isPackage, group: group, score: score,
+                                  analyzed: analyzed)
+            if total < Int.max {
+                total += 1
+            } else {
+                // Defensive only (a real directory cannot reach this on supported macOS), but do not label a
+                // saturated counter as exact if a synthetic filesystem ever exposes more than Int.max entries.
+                enumerationStatus.markFailed()
+            }
+            best.insert(entry)
+            if cancellationPhase == 24, counter.current != requestId { return .cancelled }
         }
+
+        guard counter.current == requestId else { return .cancelled }
+        var entries = best.items
         entries.sort(by: pathOrder)
-        let total = entries.count
-        let rows = entries.prefix(cap).map { e -> ResultRow in
-            let path = base.hasSuffix("/") ? base + e.name : base + "/" + e.name
+        guard counter.current == requestId else { return .cancelled }
+
+        var rows: [ResultRow] = []
+        rows.reserveCapacity(entries.count)
+        for (index, entry) in entries.enumerated() {
+            if index & 31 == 0, counter.current != requestId { return .cancelled }
+            let path = base.hasSuffix("/") ? base + entry.name : base + "/" + entry.name
             var offsets: [Int] = []
-            if let f = filterA, let a = e.analyzed {
-                offsets = e.group == 0 ? Array(0..<f.folded.count) : Scorer.matchPositions(query: f.folded[...], text: a.folded[...], bonus: a.bonus[...])
+            if let f = filterA, let analyzed = entry.analyzed {
+                offsets = entry.group == 0
+                    ? Array(0..<f.folded.count)
+                    : Scorer.matchPositions(query: f.folded[...], text: analyzed.folded[...], bonus: analyzed.bonus[...])
             }
-            return row(forPath: path, isDirectory: e.isDirectory, isPackage: e.isPackage, home: home, matchedByteOffsets: offsets, score: e.score)
+            rows.append(row(forPath: path, isDirectory: entry.isDirectory, isPackage: entry.isPackage,
+                            home: home, matchedByteOffsets: offsets, score: entry.score))
         }
-        return (Array(rows), total)
+        return PathScanOutcome(rows: rows, totalMatches: total,
+                               totalMatchesIsComplete: !enumerationStatus.failed, cancelled: false)
     }
 
-    /// Path-mode order: prefix group before fuzzy group; folders before files; fuzzy by score desc; then name.
-    private nonisolated static func pathOrder(_ a: PathEntry, _ b: PathEntry) -> Bool {
+    /// Path-mode order: prefix group before fuzzy; fuzzy score descending; within an equal group/score folders
+    /// before files; finally deterministic Finder-style name order.
+    nonisolated static func pathOrder(_ a: PathEntry, _ b: PathEntry) -> Bool {
         if a.group != b.group { return a.group < b.group }
         if a.group == 1 && a.score != b.score { return a.score > b.score }
         if a.isFolder != b.isFolder { return a.isFolder }
-        return a.name.localizedStandardCompare(b.name) == .orderedAscending
+        let localized = a.name.localizedStandardCompare(b.name)
+        if localized != .orderedSame { return localized == .orderedAscending }
+        // Finder-style comparison can consider case/canonical variants equivalent. A binary tie-break prevents
+        // filesystem enumeration order from leaking into results and makes repeated scans deterministic.
+        if a.name != b.name { return a.name.utf8.lexicographicallyPrecedes(b.name.utf8) }
+        if a.isDirectory != b.isDirectory { return a.isDirectory }
+        if a.isPackage != b.isPackage { return a.isPackage }
+        return false
     }
 }
 
@@ -479,7 +650,7 @@ final class RequestCounter: @unchecked Sendable {
 }
 
 /// One query term, prepared for the hot loop.
-struct PreparedTerm: Equatable {
+struct PreparedTerm: Equatable, Sendable {
     var folded: [UInt8]
     var mask: UInt64
     /// Interned ext ids this term satisfies by extension (empty if none in the store).
@@ -487,7 +658,7 @@ struct PreparedTerm: Equatable {
 }
 
 /// Candidate set of the previous `.search` scan.
-struct IncrementalCache {
+struct IncrementalCache: Sendable {
     var storeEpoch: UInt64
     var terms: [PreparedTerm]
     var lastTermComplete: Bool
@@ -496,7 +667,7 @@ struct IncrementalCache {
 }
 
 /// Which item indices a scan iterates.
-enum CandidateSet {
+enum CandidateSet: Sendable {
     case all(Int)
     case list([Int32])
     var count: Int {
@@ -509,15 +680,15 @@ enum CandidateSet {
 }
 
 /// A stage-1 scored candidate (facts kept so stage 2 can recompute the score with frecency).
-struct Scored {
+struct Scored: Sendable {
     var item: RankedItem
     var facts: MatchFacts
     var kind: ItemKind
 }
 
-/// Everything a worker needs for one scan. Immutable after construction except `candidates`, which the actor sets
-/// before handing the context over. Store/frecency are thread-safe by contract.
-final class ScanContext: @unchecked Sendable {
+/// Everything a worker needs for one scan. The actor finishes construction before handing this immutable
+/// value graph to a worker; `IndexStore`, `FrecencyStore`, and `RequestCounter` provide their own synchronization.
+final class ScanContext: Sendable {
     let store: IndexStore
     let parsed: ParsedQuery
     let terms: [PreparedTerm]
@@ -529,7 +700,8 @@ final class ScanContext: @unchecked Sendable {
     let home: String
     let requestId: UInt64
     let counter: RequestCounter
-    var candidates: CandidateSet = .all(0)
+    let candidates: CandidateSet
+    let workObserver: SearchScanWorkObserver?
     /// OR of the masks of terms that cannot be satisfied by an extension (items lacking any bit cannot match).
     let baseMask: UInt64
     /// Packed single term (≤ 8 ASCII alnum bytes) for the initials facts; 0 when not applicable.
@@ -540,9 +712,11 @@ final class ScanContext: @unchecked Sendable {
     let hasLongTerm: Bool
 
     init(store: IndexStore, parsed: ParsedQuery, terms: [PreparedTerm], weights: RankingWeights, frecency: FrecencyStore?, now: Date,
-         limit: Int, appsFirstCap: Int, home: String, requestId: UInt64, counter: RequestCounter) {
+         limit: Int, appsFirstCap: Int, home: String, requestId: UInt64, counter: RequestCounter,
+         candidates: CandidateSet = .all(0), workObserver: SearchScanWorkObserver? = nil) {
         self.store = store; self.parsed = parsed; self.terms = terms; self.weights = weights; self.frecency = frecency; self.now = now
         self.limit = limit; self.appsFirstCap = appsFirstCap; self.home = home; self.requestId = requestId; self.counter = counter
+        self.candidates = candidates; self.workObserver = workObserver
         var m: UInt64 = 0
         for t in terms where t.extIds.isEmpty { m |= t.mask }
         baseMask = m
@@ -562,8 +736,36 @@ final class ScanContext: @unchecked Sendable {
     static func isASCIIAlnum(_ b: UInt8) -> Bool { (b >= 0x61 && b <= 0x7A) || (b >= 0x30 && b <= 0x39) }
 }
 
+/// Aggregate work from one or more search scans. Tests use this for deterministic scan-shape assertions.
+/// This records only chunk starts and candidate visits; it does not observe or prove allocation, retain,
+/// or arena-borrow behaviour.
+struct SearchScanWork: Equatable, Sendable {
+    var chunkScansStarted = 0
+    var visitedCandidates = 0
+}
+
+/// Optional, thread-safe observer for deterministic hot-loop work accounting. The production engine never
+/// installs one, so normal scans do not take this lock.
+final class SearchScanWorkObserver: @unchecked Sendable {
+    private let lock = NSLock()
+    private var work = SearchScanWork()
+
+    func recordChunkScan(visitedCandidates: Int) {
+        lock.lock()
+        work.chunkScansStarted += 1
+        work.visitedCandidates += visitedCandidates
+        lock.unlock()
+    }
+
+    var snapshot: SearchScanWork {
+        lock.lock()
+        defer { lock.unlock() }
+        return work
+    }
+}
+
 /// Result of one scan.
-struct ScanOutcome {
+struct ScanOutcome: Sendable {
     var rows: [ResultRow]
     var matched: [Int32]
     var totalMatches: Int
@@ -571,12 +773,35 @@ struct ScanOutcome {
 }
 
 /// Result of one parallel chunk.
-struct ChunkResult {
+struct ChunkResult: Sendable {
     var index: Int
     var top: TopK
     var matched: [Int32]
     var total: Int
     var cancelled: Bool
+}
+
+/// Parallel chunks publish to their own fixed slot. Filesystem/search work never runs under the lock;
+/// the lock only protects short value assignments and the final snapshot. Fixed indices preserve the
+/// serial chunk order exactly. This complete invariant is the narrow basis for `@unchecked Sendable`.
+private final class ChunkResultSlots: @unchecked Sendable {
+    private let lock = NSLock()
+    private var values: [ChunkResult?]
+
+    init(count: Int) { values = [ChunkResult?](repeating: nil, count: count) }
+
+    func store(_ result: ChunkResult, at index: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        values[index] = result
+    }
+
+    func completed() -> [ChunkResult]? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard values.allSatisfy({ $0 != nil }) else { return nil }
+        return values.compactMap { $0 }
+    }
 }
 
 /// One directory entry in path mode.
@@ -591,8 +816,89 @@ struct PathEntry {
     var analyzed: SearchString?
 }
 
+/// Result of a streaming path-mode scan. `rows` is empty for cancellation so a partial heap can never reach UI.
+struct PathScanOutcome: Sendable {
+    var rows: [ResultRow]
+    var totalMatches: Int
+    var totalMatchesIsComplete: Bool
+    var cancelled: Bool
+
+    static let cancelled = PathScanOutcome(rows: [], totalMatches: 0,
+                                           totalMatchesIsComplete: false, cancelled: true)
+}
+
+/// Foundation's enumeration error handler may be invoked from implementation-defined code. Keep its state behind
+/// a lock so this remains valid under strict-concurrency checking as well as today's synchronous implementation.
+final class PathEnumerationStatus: @unchecked Sendable {
+    private let lock = NSLock()
+    private var didFail = false
+
+    func markFailed() {
+        lock.lock()
+        didFail = true
+        lock.unlock()
+    }
+
+    var failed: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return didFail
+    }
+}
+
+/// Bounded heap of path entries (root = worst retained). Directory size affects scan time and exact total only;
+/// retained entry memory never exceeds the validated path-mode row cap.
+struct PathTopK {
+    private(set) var items: [PathEntry] = []
+    let capacity: Int
+
+    init(capacity: Int) {
+        self.capacity = min(max(0, capacity), SearchEngine.maxPathModeRows)
+        items.reserveCapacity(self.capacity)
+    }
+
+    mutating func insert(_ entry: PathEntry) {
+        guard capacity > 0 else { return }
+        if items.count < capacity {
+            items.append(entry)
+            siftUp(items.count - 1)
+        } else if SearchEngine.pathOrder(entry, items[0]) {
+            items[0] = entry
+            siftDown(0)
+        }
+    }
+
+    private mutating func siftUp(_ index: Int) {
+        var i = index
+        while i > 0 {
+            let parent = (i - 1) / 2
+            // The parent is the worse entry. If it is better than its child, swap them.
+            if SearchEngine.pathOrder(items[parent], items[i]) {
+                items.swapAt(parent, i)
+                i = parent
+            } else {
+                break
+            }
+        }
+    }
+
+    private mutating func siftDown(_ index: Int) {
+        var i = index
+        while true {
+            let left = 2 * i + 1
+            let right = left + 1
+            var worst = i
+            if left < items.count && SearchEngine.pathOrder(items[worst], items[left]) { worst = left }
+            if right < items.count && SearchEngine.pathOrder(items[worst], items[right]) { worst = right }
+            guard worst != i else { return }
+            items.swapAt(i, worst)
+            i = worst
+        }
+    }
+}
+
 /// Bounded "best K" heap keyed by `SearchEngine.better` (root = worst kept item).
-struct TopK {
+struct TopK: Sendable {
     private(set) var items: [Scored] = []
     let capacity: Int
     init(capacity: Int) { self.capacity = max(1, capacity); items.reserveCapacity(self.capacity) }
@@ -646,26 +952,42 @@ struct ChunkWorker {
     /// Scan `range` of `ctx.candidates`, polling for cancellation every 2048 items.
     mutating func run(range: Range<Int>) {
         let cands = ctx.candidates
-        for k in range {
-            if k & 2047 == 0 && ctx.isStale { cancelled = true; return }
-            let i = cands.item(at: k)
-            guard let s = evaluate(i) else { continue }
-            total += 1
-            matched.append(Int32(i))
-            top.insert(s)
+        let store = ctx.store
+        var visited = 0
+        defer { ctx.workObserver?.recordChunkScan(visitedCandidates: visited) }
+        // Keep the two immutable store arenas borrowed for the whole chunk. Constructing an ArraySlice for
+        // every candidate retains/releases its backing Array; these rebased pointer views are trivial values
+        // whose lifetime cannot escape either closure.
+        store.foldedArena.withUnsafeBufferPointer { foldedArena in
+            store.bonusArena.withUnsafeBufferPointer { bonusArena in
+                for k in range {
+                    if k & 2047 == 0 && ctx.isStale { cancelled = true; return }
+                    visited += 1
+                    let i = cands.item(at: k)
+                    guard let s = evaluate(i, foldedArena: foldedArena, bonusArena: bonusArena) else { continue }
+                    total += 1
+                    matched.append(Int32(i))
+                    top.insert(s)
+                }
+            }
         }
     }
 
     /// Score item `i` against all terms; nil if it does not satisfy every term.
-    func evaluate(_ i: Int) -> Scored? {
+    func evaluate(_ i: Int, foldedArena: UnsafeBufferPointer<UInt8>,
+                  bonusArena: UnsafeBufferPointer<UInt8>) -> Scored? {
         let store = ctx.store
         let itemMask = store.mask[i]
         let kindRaw = store.kind[i]
         // Apps may match through an alias whose characters are absent from the name, so only non-apps are
         // rejected by the name mask (apps are a few hundred items; the alias masks are checked per alias).
         if itemMask & ctx.baseMask != ctx.baseMask && kindRaw != ItemKind.app.rawValue { return nil }
-        let nameF = store.foldedName(of: i)
-        let nameB = store.bonus(of: i)
+        let start = Int(store.nameStart[i])
+        let length = Int(store.nameLen[i])
+        guard start >= 0, start <= foldedArena.count, length <= foldedArena.count - start,
+              start <= bonusArena.count, length <= bonusArena.count - start else { return nil }
+        let nameF = UnsafeBufferPointer(rebasing: foldedArena[start..<(start + length)])
+        let nameB = UnsafeBufferPointer(rebasing: bonusArena[start..<(start + length)])
         let app: AppInfo? = kindRaw == ItemKind.app.rawValue ? store.appInfo[Int32(i)] : nil
         let extId = store.extId[i]
         var textScore = 0
@@ -677,12 +999,14 @@ struct ChunkWorker {
             if byExt { extMatched = true }
             var best: ScoreResult? = nil
             if itemMask & term.mask == term.mask {
-                best = Scorer.score(query: term.folded[...], text: nameF, bonus: nameB, scratch: scratch)
+                best = term.folded.withUnsafeBufferPointer {
+                    Scorer.score(query: $0, text: nameF, bonus: nameB, scratch: scratch)
+                }
                 // An extension-like term ("pdf", "md", "zip" — a term equal to an extension present in the
                 // index) that is NOT this item's extension must occur literally in the name; a scattered
                 // fuzzy hit ("re·p·ort ·d·ra·f·t") does not count. Users type such terms to mean the type.
                 if best != nil, !byExt, !term.extIds.isEmpty, app == nil,
-                   Scorer.substringStart(query: term.folded[...], text: nameF) == nil { best = nil }
+                   Self.substringStart(query: term.folded, text: nameF) == nil { best = nil }
             }
             if let a = app { best = bestAlias(term, a, best) }
             if k == last && ctx.parsed.lastTermComplete && !byExt && !Self.hasSubstring(term, nameF, app) { return nil }
@@ -713,14 +1037,27 @@ struct ChunkWorker {
     }
 
     /// Contiguous-substring check on the name or any alias (trailing-space semantics).
-    private static func hasSubstring(_ term: PreparedTerm, _ nameF: ArraySlice<UInt8>, _ app: AppInfo?) -> Bool {
-        if Scorer.substringStart(query: term.folded[...], text: nameF) != nil { return true }
+    private static func hasSubstring(_ term: PreparedTerm, _ nameF: UnsafeBufferPointer<UInt8>, _ app: AppInfo?) -> Bool {
+        if substringStart(query: term.folded, text: nameF) != nil { return true }
         guard let a = app else { return false }
         return a.aliases.contains { Scorer.substringStart(query: term.folded[...], text: $0.folded[...]) != nil }
     }
 
+    /// Pointer-backed contiguous-substring check for a name already borrowed from the folded arena.
+    private static func substringStart(query: [UInt8], text: UnsafeBufferPointer<UInt8>) -> Int? {
+        let m = query.count, n = text.count
+        if m == 0 { return 0 }
+        if m > n { return nil }
+        return query.withUnsafeBufferPointer { q -> Int? in
+            guard let qp = q.baseAddress, let tp = text.baseAddress else { return nil }
+            guard let hit = memmem(tp, n, qp, m) else { return nil }
+            return UnsafeRawPointer(hit).assumingMemoryBound(to: UInt8.self) - tp
+        }
+    }
+
     /// Facts for `Ranking` (DESIGN.md §6.5): exact/prefix name, initials, whole token, pinyin initials.
-    private func computeFacts(_ i: Int, nameF: ArraySlice<UInt8>, nameB: ArraySlice<UInt8>, app: AppInfo?, textScore: Int, extMatched: Bool) -> MatchFacts {
+    private func computeFacts(_ i: Int, nameF: UnsafeBufferPointer<UInt8>, nameB: UnsafeBufferPointer<UInt8>,
+                              app: AppInfo?, textScore: Int, extMatched: Bool) -> MatchFacts {
         var f = MatchFacts(textScore: textScore, extMatched: extMatched)
         let whole = ctx.parsed.wholeFolded
         if !whole.isEmpty {
@@ -745,7 +1082,8 @@ struct ChunkWorker {
             f.wholeTokenMatch = ctx.terms.contains { $0.folded.count >= 8 && Self.matchesWholeToken(term: $0.folded, name: nameF, bonus: nameB) }
         }
         if let a = app, ctx.terms.count == 1 {
-            f.pinyinInitialsExact = Self.isPinyinInitialsExact(term: ctx.terms[0].folded, app: a, nameF: nameF, displayName: { ctx.store.name(of: i) })
+            f.pinyinInitialsExact = Self.isPinyinInitialsExact(term: ctx.terms[0].folded, app: a, nameF: nameF,
+                                                               displayName: { a.displayName })
         }
         return f
     }
@@ -759,16 +1097,25 @@ struct ChunkWorker {
 
     /// True when `term` equals a whole token of `name` (token boundaries from the bonus array / non-word bytes).
     static func matchesWholeToken(term: [UInt8], name: ArraySlice<UInt8>, bonus: ArraySlice<UInt8>) -> Bool {
+        name.withUnsafeBufferPointer { nameBuffer in
+            bonus.withUnsafeBufferPointer { bonusBuffer in
+                matchesWholeToken(term: term, name: nameBuffer, bonus: bonusBuffer)
+            }
+        }
+    }
+
+    /// Pointer-backed variant used while the store arenas are pinned for a complete chunk.
+    static func matchesWholeToken(term: [UInt8], name: UnsafeBufferPointer<UInt8>,
+                                  bonus: UnsafeBufferPointer<UInt8>) -> Bool {
         let k = term.count, n = name.count
-        guard k > 0, k <= n else { return false }
-        let ns = name.startIndex, bs = bonus.startIndex
+        guard k > 0, k <= n, bonus.count == n else { return false }
         var p = 0
         while p + k <= n {
-            let startsToken = p == 0 || bonus[bs + p] > 0 || !isWordByte(name[ns + p - 1])
-            let endsToken = p + k == n || bonus[bs + p + k] > 0 || !isWordByte(name[ns + p + k])
+            let startsToken = p == 0 || bonus[p] > 0 || !isWordByte(name[p - 1])
+            let endsToken = p + k == n || bonus[p + k] > 0 || !isWordByte(name[p + k])
             if startsToken && endsToken {
                 var eq = true
-                for j in 0..<k where name[ns + p + j] != term[j] { eq = false; break }
+                for j in 0..<k where name[p + j] != term[j] { eq = false; break }
                 if eq { return true }
             }
             p += 1
@@ -783,6 +1130,14 @@ struct ChunkWorker {
     /// Heuristic: the single term equals a short pure-letter alias of an app whose display name contains CJK
     /// (that alias is then the pinyin-initials string, e.g. "wx" for 微信).
     static func isPinyinInitialsExact(term: [UInt8], app: AppInfo, nameF: ArraySlice<UInt8>, displayName: () -> String) -> Bool {
+        nameF.withUnsafeBufferPointer {
+            isPinyinInitialsExact(term: term, app: app, nameF: $0, displayName: displayName)
+        }
+    }
+
+    /// Pointer-backed variant used while the store folded-name arena is pinned for a complete chunk.
+    static func isPinyinInitialsExact(term: [UInt8], app: AppInfo, nameF: UnsafeBufferPointer<UInt8>,
+                                      displayName: () -> String) -> Bool {
         guard term.count <= TextAnalyzer.maxInitials, term.allSatisfy({ $0 >= 0x61 && $0 <= 0x7A }) else { return false }
         guard !nameF.elementsEqual(term), app.aliases.contains(where: { $0.folded == term }) else { return false }
         return containsCJK(displayName()) || app.aliases.contains { $0.folded.contains { $0 >= 0x80 } }

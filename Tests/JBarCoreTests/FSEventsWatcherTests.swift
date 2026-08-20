@@ -300,14 +300,105 @@ final class FSEventsWatcherTests: XCTestCase {
         XCTAssertFalse(r.needsFullRescan)
     }
 
+    func testOversizedRawBatchFallsBackBeforePathsOrExistsWork() {
+        let existsCalls = LockedInt()
+        let paths = (0..<4).map { "/a/new-\($0)" }
+        let flags = Array(repeating: FSEventStreamEventFlags(
+            kFSEventStreamEventFlagItemCreated | kFSEventStreamEventFlagItemIsDir), count: paths.count)
+        let result = FSEventsWatcher.mapEvents(paths: paths, flags: flags,
+                                               rawEventLimit: 3, uniquePathLimit: 3,
+                                               exists: { _ in existsCalls.increment(); return true })
+
+        XCTAssertTrue(result.needsFullRescan)
+        XCTAssertTrue(result.changes.isEmpty)
+        XCTAssertEqual(existsCalls.value, 0, "raw count must fail before filesystem probes")
+    }
+
+    func testUniquePathStormFallsBackEarlyAndBoundsExistsCalls() {
+        let existsCalls = LockedInt()
+        let paths = (0..<10).map { "/a/new-\($0)" }
+        let flags = Array(repeating: FSEventStreamEventFlags(
+            kFSEventStreamEventFlagItemCreated | kFSEventStreamEventFlagItemIsDir), count: paths.count)
+        let result = FSEventsWatcher.mapEvents(paths: paths, flags: flags,
+                                               rawEventLimit: 10, uniquePathLimit: 3,
+                                               exists: { _ in existsCalls.increment(); return true })
+
+        XCTAssertTrue(result.needsFullRescan)
+        XCTAssertTrue(result.changes.isEmpty)
+        XCTAssertLessThanOrEqual(existsCalls.value, 3,
+                                 "unique fallback must bound synchronous fileExists probes")
+    }
+
+    func testOversizedEventPathFallsBackBeforeExistsProbe() {
+        let existsCalls = LockedInt()
+        let path = "/" + String(repeating: "p", count: SafetyLimits.maxPathUTF8Bytes)
+        let result = FSEventsWatcher.mapEvents(
+            paths: [path],
+            flags: [FSEventStreamEventFlags(kFSEventStreamEventFlagItemCreated
+                                            | kFSEventStreamEventFlagItemIsDir)],
+            exists: { _ in existsCalls.increment(); return true }
+        )
+        XCTAssertTrue(result.needsFullRescan)
+        XCTAssertTrue(result.changes.isEmpty)
+        XCTAssertEqual(existsCalls.value, 0)
+    }
+
+    func testDuplicateStormIsDedupedAndProbesExistenceOnce() {
+        let existsCalls = LockedInt()
+        let paths = Array(repeating: "/a/new", count: 100)
+        let flags = Array(repeating: FSEventStreamEventFlags(
+            kFSEventStreamEventFlagItemCreated | kFSEventStreamEventFlagItemIsDir), count: paths.count)
+        let result = FSEventsWatcher.mapEvents(paths: paths, flags: flags,
+                                               rawEventLimit: 100, uniquePathLimit: 2,
+                                               exists: { _ in existsCalls.increment(); return true })
+
+        XCTAssertFalse(result.needsFullRescan)
+        XCTAssertEqual(result.changes, [.init(path: "/a", mustScanSubDirs: false),
+                                        .init(path: "/a/new", mustScanSubDirs: false)])
+        XCTAssertEqual(existsCalls.value, 1)
+    }
+
+    func testOversizedMetadataSummaryKeepsLatestIdInOneBoundedResult() {
+        let flags: [FSEventStreamEventFlags] = [0,
+            FSEventStreamEventFlags(kFSEventStreamEventFlagKernelDropped), 0]
+        let ids: [FSEventStreamEventId] = [7, 99, 12]
+        let summary = flags.withUnsafeBufferPointer { flagBuffer in
+            ids.withUnsafeBufferPointer { idBuffer in
+                FSEventsWatcher.summarizeOversizedBatch(count: ids.count,
+                                                         flags: flagBuffer.baseAddress!,
+                                                         ids: idBuffer.baseAddress!)
+            }
+        }
+
+        XCTAssertEqual(summary.latestEventId, 99)
+        XCTAssertTrue(summary.observedFullRescanFlag)
+    }
+
+    func testPublicInitializerBoundsRootsAndNonFiniteLatency() {
+        let c = Collector()
+        var paths = (0...SafetyLimits.maxRootEntries).map { "/tmp/root-\($0)" }
+        paths[0] = String(repeating: "x", count: SafetyLimits.maxPathUTF8Bytes + 1)
+        paths[1] = "/\u{301}组合目录"
+        let watcher = makeWatcher(c, paths: paths, latency: .nan)
+        XCTAssertLessThanOrEqual(watcher.paths.count, SafetyLimits.maxRootEntries)
+        XCTAssertTrue(watcher.paths.allSatisfy {
+            SafetyLimits.isSafeAbsolutePath($0)
+        })
+        XCTAssertTrue(watcher.paths.contains("/\u{301}组合目录"),
+                      "absolute POSIX paths must be recognized by slash byte, not Character prefix")
+        XCTAssertEqual(watcher.latency, 1.0)
+    }
+
     func testDirnameAndStrip() {
         XCTAssertEqual(FSEventsWatcher.dirname("/a/b/c"), "/a/b")
+        XCTAssertEqual(FSEventsWatcher.dirname("/a/\u{301}组合/file"), "/a/\u{301}组合")
         XCTAssertEqual(FSEventsWatcher.dirname("/a"), "/")
         XCTAssertEqual(FSEventsWatcher.dirname("/"), "/")
         XCTAssertEqual(FSEventsWatcher.dirname("rel"), ".")
         XCTAssertEqual(FSEventsWatcher.stripTrailingSlash("/a/"), "/a")
         XCTAssertEqual(FSEventsWatcher.stripTrailingSlash("/"), "/")
         XCTAssertEqual(FSEventsWatcher.stripTrailingSlash("///"), "/")
+        XCTAssertEqual(FSEventsWatcher.stripTrailingSlash("/a/\u{301}组合/"), "/a/\u{301}组合")
     }
 
     func testCreateFlags() {
@@ -317,4 +408,11 @@ final class FSEventsWatcherTests: XCTestCase {
             XCTAssertNotEqual(f & expected, 0)
         }
     }
+}
+
+private final class LockedInt: @unchecked Sendable {
+    private let lock = NSLock()
+    private var number = 0
+    func increment() { lock.lock(); number += 1; lock.unlock() }
+    var value: Int { lock.lock(); defer { lock.unlock() }; return number }
 }

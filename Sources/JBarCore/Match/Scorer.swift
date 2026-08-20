@@ -30,16 +30,18 @@ public final class ScorerScratch {
     /// hot path pays no array accessor / exclusivity cost; owned by this object (freed in deinit).
     let starts: UnsafeMutablePointer<Int32>
     public init(capacity: Int = 512) {
-        h = [Int16](repeating: 0, count: capacity)
-        c = [Int16](repeating: 0, count: capacity)
+        let safeCapacity = min(max(0, capacity), Scorer.maxTextBytes)
+        h = [Int16](repeating: 0, count: safeCapacity)
+        c = [Int16](repeating: 0, count: safeCapacity)
         starts = UnsafeMutablePointer<Int32>.allocate(capacity: Scorer.maxQueryBytes)
         starts.initialize(repeating: 0, count: Scorer.maxQueryBytes)
     }
     deinit { starts.deallocate() }
     /// Grow if needed (both rows are kept the same length).
     @inlinable public func ensure(_ n: Int) {
-        if h.count < n || c.count < n {
-            let cap = max(n, h.count, c.count)
+        let requested = min(max(0, n), Scorer.maxTextBytes)
+        if h.count < requested || c.count < requested {
+            let cap = max(requested, h.count, c.count)
             h = [Int16](repeating: 0, count: cap); c = [Int16](repeating: 0, count: cap)
         }
     }
@@ -72,6 +74,9 @@ public enum Scorer {
     /// Maximum number of query bytes the DP scores (longer queries are truncated for scoring; the
     /// subsequence check still uses all bytes). 64 bytes × 255-byte names keeps the DP bounded.
     public static let maxQueryBytes = 64
+    /// The DP rows intentionally support the full UInt16-sized text range documented below, while
+    /// arbitrary public capacities are clamped before allocation.
+    public static let maxTextBytes = 65_535
 
     /// Lowest value a reachable cell can hold (see the floor note in the type doc).
     static let floorScore: Int16 = ScoreConstants.neg + 1
@@ -144,7 +149,7 @@ public enum Scorer {
         let n = t.count
         let mFull = q.count
         if mFull == 0 { return ScoreResult(score: 0, firstMatch: 0) }
-        if mFull > n { return nil }
+        if mFull > n || n > maxTextBytes { return nil }
         guard b.count == n else { assertionFailure("Scorer.score: bonus must parallel text"); return nil }
         guard let qp = q.baseAddress, let tp = t.baseAddress, let bp = b.baseAddress else { return nil }
         let m = min(mFull, maxQueryBytes)
@@ -281,7 +286,7 @@ public enum Scorer {
     public static func matchPositions(query: ArraySlice<UInt8>, text: ArraySlice<UInt8>, bonus: ArraySlice<UInt8>) -> [Int] {
         let n = text.count
         let mFull = query.count
-        if mFull == 0 || mFull > n || bonus.count != n { return [] }
+        if mFull == 0 || mFull > n || n > maxTextBytes || bonus.count != n { return [] }
         guard subsequenceStart(query: query, text: text) != nil else { return [] }
         let m = min(mFull, maxQueryBytes)
         let q = Array(query.prefix(m)), t = Array(text), b = Array(bonus)

@@ -38,6 +38,7 @@ final class FrecencyTests: XCTestCase {
         XCTAssertEqual(makeStore(maxEntries: 0).maxEntries, 1)
         XCTAssertEqual(makeStore(maxEntries: -5).maxEntries, 1)
         XCTAssertEqual(makeStore(maxEntries: 42).maxEntries, 42)
+        XCTAssertEqual(makeStore(maxEntries: Int.max).maxEntries, SafetyLimits.maxHistoryEntries)
     }
 
     // MARK: - Record weights and decay
@@ -106,6 +107,51 @@ final class FrecencyTests: XCTestCase {
         XCTAssertEqual(s.queryPickCount, 0)
     }
 
+    func testOversizedPathIsRejectedBeforeHistoryRetention() {
+        let s = makeStore()
+        let path = "/" + String(repeating: "a", count: SafetyLimits.maxPathUTF8Bytes)
+        s.record(open: path, query: "ab", at: t0)
+        XCTAssertEqual(s.count, 0)
+        XCTAssertEqual(s.queryPickCount, 0)
+        XCTAssertEqual(s.queryPickBoost(query: "ab", path: path), 0)
+    }
+
+    func testUnsafePathsAndNonFiniteDatesAreRejectedAtThePublicBoundary() {
+        let s = makeStore()
+        s.record(open: "relative/path", query: "ab", at: t0)
+        s.record(open: "/bad\0path", query: "ab", at: t0)
+        s.record(open: "/bad\0\u{301}path", query: "ab", at: t0)
+        s.record(open: "/safe/\u{301}/../escape", query: "ab", at: t0)
+        s.record(open: "/nan", query: "ab", at: Date(timeIntervalSinceReferenceDate: .nan))
+        XCTAssertEqual(s.count, 0)
+        XCTAssertEqual(s.queryPickCount, 0)
+
+        s.record(open: "/valid", query: "ab", at: t0)
+        XCTAssertEqual(s.score(for: "/valid", now: Date(timeIntervalSinceReferenceDate: .infinity)), 0)
+        XCTAssertEqual(s.score(for: "relative/path", now: t0), 0)
+        XCTAssertEqual(s.score(for: "/bad\0path", now: t0), 0)
+        XCTAssertEqual(s.score(for: "/" + String(repeating: "x", count: SafetyLimits.maxPathUTF8Bytes),
+                               now: t0), 0)
+        XCTAssertEqual(s.queryPickBoost(query: "ab", path: "relative/path"), 0)
+    }
+
+    func testOversizedQueryUsesTheSameBoundAsSearchBeforeFolding() throws {
+        let s = makeStore()
+        let query = String(repeating: "e\u{301}", count: SafetyLimits.maxQueryUTF8Bytes)
+        s.record(open: "/bounded", query: query, at: t0)
+        XCTAssertEqual(s.count, 1)
+        XCTAssertEqual(s.queryPickCount, 1)
+        XCTAssertEqual(s.queryPickBoost(query: query, path: "/bounded"), 30)
+        XCTAssertTrue(s.save())
+
+        let data = try Data(contentsOf: s.fileURL)
+        let object = try XCTUnwrap(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let picks = try XCTUnwrap(object["queryPicks"] as? [String: String])
+        let stored = try XCTUnwrap(picks.keys.first)
+        XCTAssertTrue(SafetyLimits.utf8Fits(stored, maxBytes: SafetyLimits.maxQueryUTF8Bytes))
+        XCTAssertLessThan(data.count, SafetyLimits.maxHistoryFileBytes)
+    }
+
     // MARK: - Boost formula
 
     func testBoostFormula() {
@@ -140,6 +186,27 @@ final class FrecencyTests: XCTestCase {
         XCTAssertEqual(s.boost(for: "/a", now: t0, weights: w), 10)
         for _ in 0..<2 { s.record(open: "/a", query: nil, at: t0) } // f = 3 → 20 → cap 12
         XCTAssertEqual(s.boost(for: "/a", now: t0, weights: w), 12)
+    }
+
+    func testBoostSaturatesExtremeOrInvalidPublicWeightsWithoutTrapping() {
+        let s = makeStore()
+        s.record(open: "/a", query: nil, at: t0)
+
+        var weights = RankingWeights()
+        weights.frecencyScale = 1e300
+        weights.frecencyCap = Int.max
+        XCTAssertEqual(s.boost(for: "/a", now: t0, weights: weights), Int.max)
+
+        weights.frecencyScale = .infinity
+        weights.frecencyCap = 123
+        XCTAssertEqual(s.boost(for: "/a", now: t0, weights: weights), 123)
+
+        weights.frecencyScale = .nan
+        XCTAssertEqual(s.boost(for: "/a", now: t0, weights: weights), 0)
+
+        weights.frecencyScale = 16
+        weights.frecencyCap = Int.min
+        XCTAssertEqual(s.boost(for: "/a", now: t0, weights: weights), 0)
     }
 
     // MARK: - Query picks
@@ -245,7 +312,7 @@ final class FrecencyTests: XCTestCase {
         s.record(open: "/keep", query: "keep", at: t0)
         s.record(open: "/gone", query: "gone", at: t0)
         s.record(open: "/gone2", query: nil, at: t0)
-        s.prune { $0 == "/keep" }
+        XCTAssertEqual(s.prune { $0 == "/keep" }, 2)
         XCTAssertEqual(s.count, 1)
         XCTAssertEqual(s.recents(limit: 5, now: t0), ["/keep"])
         XCTAssertEqual(s.queryPickBoost(query: "keep", path: "/keep"), 30)
@@ -256,9 +323,27 @@ final class FrecencyTests: XCTestCase {
     func testPruneWithNothingMissingIsNoop() {
         let s = makeStore()
         s.record(open: "/a", query: "aa", at: t0)
-        s.prune { _ in true }
+        XCTAssertEqual(s.prune { _ in true }, 0)
         XCTAssertEqual(s.count, 1)
         XCTAssertEqual(s.queryPickCount, 1)
+    }
+
+    func testClearRemovesEntriesAndQueryPicksAndPersistsEmptyState() {
+        let s = makeStore()
+        s.record(open: "/private/client-one", query: "client one", at: t0)
+        s.record(open: "/private/client-two", query: "client two", at: t0)
+        XCTAssertTrue(s.save())
+
+        XCTAssertEqual(s.clear(), 2)
+        XCTAssertEqual(s.count, 0)
+        XCTAssertEqual(s.queryPickCount, 0)
+        XCTAssertEqual(s.clear(), 0, "clearing an already-empty store is idempotent")
+        XCTAssertTrue(s.save())
+
+        let reloaded = makeStore()
+        reloaded.load()
+        XCTAssertEqual(reloaded.count, 0)
+        XCTAssertEqual(reloaded.queryPickCount, 0)
     }
 
     // MARK: - Persistence
@@ -352,14 +437,72 @@ final class FrecencyTests: XCTestCase {
         XCTAssertEqual(s.queryPickBoost(query: "bb", path: "/b"), 30)
     }
 
+    func testLoadDropsOversizedPathsAndQueryPickFields() throws {
+        let url = tempDir.appendingPathComponent("history.json")
+        let longPath = "/" + String(repeating: "p", count: SafetyLimits.maxPathUTF8Bytes)
+        let longQuery = String(repeating: "q", count: SafetyLimits.maxQueryUTF8Bytes + 1)
+        let object: [String: Any] = [
+            "version": 1,
+            "entries": [
+                ["path": "/ok", "f": 2, "last": 0],
+                ["path": longPath, "f": 9, "last": 0],
+            ],
+            "queryPicks": ["ok": "/ok", longQuery: "/ok", "badpath": longPath],
+        ]
+        try JSONSerialization.data(withJSONObject: object).write(to: url)
+        let s = FrecencyStore(fileURL: url, halfLife: 0)
+        s.load()
+        XCTAssertEqual(s.recents(limit: 10, now: t0), ["/ok"])
+        XCTAssertEqual(s.queryPickCount, 1)
+        XCTAssertEqual(s.queryPickBoost(query: "ok", path: "/ok"), 30)
+    }
+
+    func testSaveRefusesEncodedHistoryLargerThanItsOwnReadLimit() {
+        let s = makeStore(maxEntries: SafetyLimits.maxHistoryEntries)
+        let pathTail = String(repeating: "\n", count: SafetyLimits.maxPathUTF8Bytes - 16)
+        for i in 0..<2_200 {
+            s.record(open: "/\(i)-\(pathTail)", query: nil, at: t0)
+        }
+        XCTAssertFalse(s.save())
+        XCTAssertFalse(FileManager.default.fileExists(atPath: s.fileURL.path))
+    }
+
+    func testSavePreflightKeepsOrdinaryASCIIHistoryWithinTheReadLimit() throws {
+        let s = makeStore(maxEntries: 500)
+        let tail = String(repeating: "p", count: SafetyLimits.maxPathUTF8Bytes - 7)
+        for index in 0..<500 {
+            s.record(open: "/\(String(format: "%04d", index))-\(tail)", query: nil, at: t0)
+        }
+        XCTAssertEqual(s.count, 500)
+        XCTAssertTrue(s.save())
+        let data = try Data(contentsOf: s.fileURL)
+        XCTAssertLessThan(data.count, SafetyLimits.maxHistoryFileBytes)
+        XCTAssertGreaterThan(data.count, 1_900_000)
+    }
+
     func testSaveToUnwritableLocationDoesNotCrash() {
         // A path under a regular file cannot be created as a directory.
         let blocker = tempDir.appendingPathComponent("file")
         FileManager.default.createFile(atPath: blocker.path, contents: Data())
         let s = FrecencyStore(fileURL: blocker.appendingPathComponent("sub/history.json"))
         s.record(open: "/a", query: nil, at: t0)
-        s.save() // logs, no throw
+        XCTAssertFalse(s.save()) // logs, no throw; privacy callers can surface the failure
         XCTAssertEqual(s.count, 1)
+    }
+
+    func testFailedEmptySaveCannotBeMistakenForDurableHistoryClear() throws {
+        // A directory at the destination is a deterministic write failure on every supported macOS
+        // version (unlike chmod-based fixtures, which can vary in privileged CI environments).
+        let destination = tempDir.appendingPathComponent("history-as-directory", isDirectory: true)
+        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+        let s = FrecencyStore(fileURL: destination)
+        s.record(open: "/private/client", query: "client", at: t0)
+        XCTAssertEqual(s.clear(), 1)
+        XCTAssertFalse(s.save())
+        XCTAssertEqual(s.count, 0, "the current process must still forget the history")
+        var isDirectory: ObjCBool = false
+        XCTAssertTrue(FileManager.default.fileExists(atPath: destination.path, isDirectory: &isDirectory))
+        XCTAssertTrue(isDirectory.boolValue, "a failed save must not replace or remove the caller's object")
     }
 
     func testSavePerformanceFor500Entries() {
@@ -382,14 +525,16 @@ final class FrecencyTests: XCTestCase {
 
     func testConcurrentRecordFromEightThreadsDoesNotCrash() {
         let s = makeStore(maxEntries: 100)
+        let baseTime = t0
         let perThread = 500
         DispatchQueue.concurrentPerform(iterations: 8) { t in
             for i in 0..<perThread {
                 let path = "/p\(i % 150)"
-                s.record(open: path, query: i % 3 == 0 ? "q\(i % 40)" : nil, at: t0.addingTimeInterval(Double(i)))
-                _ = s.boost(for: path, now: t0.addingTimeInterval(Double(i)))
+                s.record(open: path, query: i % 3 == 0 ? "q\(i % 40)" : nil,
+                         at: baseTime.addingTimeInterval(Double(i)))
+                _ = s.boost(for: path, now: baseTime.addingTimeInterval(Double(i)))
                 _ = s.queryPickBoost(query: "q\(i % 40)", path: path)
-                if i % 100 == 0 { _ = s.recents(limit: 10, now: t0); s.save() }
+                if i % 100 == 0 { _ = s.recents(limit: 10, now: baseTime); s.save() }
                 if t == 0 && i % 250 == 0 { s.prune { _ in true } }
             }
         }
@@ -404,10 +549,11 @@ final class FrecencyTests: XCTestCase {
 
     func testConcurrentRecordWithoutEvictionAccumulatesAllWeight() {
         let s = makeStore(halfLife: 0, maxEntries: 10_000)
+        let baseTime = t0
         DispatchQueue.concurrentPerform(iterations: 8) { _ in
-            for _ in 0..<1000 { s.record(open: "/same", query: nil, at: t0) }
+            for _ in 0..<1000 { s.record(open: "/same", query: nil, at: baseTime) }
         }
-        XCTAssertEqual(s.score(for: "/same", now: t0), 8000, accuracy: 1e-6)
+        XCTAssertEqual(s.score(for: "/same", now: baseTime), 8000, accuracy: 1e-6)
         XCTAssertEqual(s.count, 1)
     }
 }

@@ -1,266 +1,282 @@
-# JBar UX test matrix
+# JBar executable UX and compatibility matrix
 
-158 checks across the five surfaces a user actually touches, produced by auditing the code and by driving
-the real panel headlessly. Each row says what to do, what should happen, and whether it is an everyday
-case or an edge case. This is a **manual checklist plus a record of what has been verified**; the
-automated parts live in `Tests/JBarAppTests` (panel geometry, row model, badges, Tab autocomplete, empty
-states) and `Tests/JBarCoreTests` (everything below the UI).
+This checklist is the release evidence plan, not a static claim that every row passed. A code-level fixture is marked **Automated** only when a test exists and is rerun on the candidate commit. A real keyboard/input source/display check is **Physical**. Signature, notarization, Gatekeeper, install, and upgrade checks are **Release**. One level never substitutes for another.
 
-**Status** — `OK` verified working · `BROKEN` verified failing when audited · `TODO` not yet exercised.
+The highest-priority regression is the reported crash/dismissal behavior on macOS Sequoia 15.x (reported as 15.2) with a Simplified Chinese system/input method: pressing Control or Delete must not terminate JBar or unexpectedly close the panel.
 
-Ten `BROKEN` rows were fixed in the same pass that produced this document: results are now scrollable past
-the visible rows and show a peek sliver so you can tell there are more; path labels no longer truncate when
-there is room; the app↔file separator marks both boundaries; hover no longer steals the keyboard selection
-from under a stationary pointer; Tab autocomplete updates the visible text; `showRecentsOnEmpty` is honoured
-(and the never-read `useSpotlightFallback` key was removed); a search during the first crawl says "Indexing…"
-instead of "No matches"; clicking a row opens the row you pressed even if results changed mid-click; and
-`visibleRows` actually changes the panel height. Re-run those rows to confirm on your machine.
+## 1. Record the test environment
 
-## Driving the UI headlessly
+Run and attach this header to every physical/release session:
 
 ```bash
-# render the panel to a PNG without touching your real index (hard-coded demo rows, no permission prompts)
-JBAR_DEMO=1 JBAR_SNAPSHOT_QUERY="e" JBAR_SNAPSHOT_PATH=/tmp/panel.png \
-  build/JBar.app/Contents/MacOS/JBar
+git rev-parse HEAD
+sw_vers
+uname -m
+sysctl -n hw.model
+defaults read -g AppleLanguages
+defaults read com.apple.HIToolbox AppleSelectedInputSources
 
-# same, but move the selection down 8 rows first (proves scrolling and keyboard nav)
-JBAR_DEMO=1 JBAR_SNAPSHOT_QUERY="e" JBAR_SNAPSHOT_DOWN=8 JBAR_SNAPSHOT_PATH=/tmp/scrolled.png \
-  build/JBar.app/Contents/MacOS/JBar
-
-# point the app at a throwaway config so settings tests don't disturb your own
-XDG_CONFIG_HOME=/tmp/jbar-test build/JBar.app/Contents/MacOS/JBar --cli "vsc"
+# For an assembled candidate:
+lipo -archs JBar.app/Contents/MacOS/JBar
+xcrun vtool -show-build JBar.app/Contents/MacOS/JBar
+codesign --verify --deep --strict --verbose=2 JBar.app
+shasum -a 256 JBar.zip 2>/dev/null || true
 ```
 
-> The panel takes keyboard focus while it is on screen, so don't run these while you are typing something
-> else — your keystrokes will land in the test panel.
+Also record physical keyboard model/layout, active input source, display resolution/scaling, Reduce Motion/Transparency/Increase Contrast settings, whether the app is a source/ad-hoc or exact downloaded candidate, and any other foreground launcher/input utility.
 
----
+Before starting, note the newest `JBar-*.ips` timestamp under `~/Library/Logs/DiagnosticReports`. After each high-risk batch, confirm the JBar menu-bar item still responds and no newer report appeared. “The panel closed” and “the process crashed” are different failures and must be recorded separately.
 
-## Results list & rendering
+## 2. Automated regression map
 
-28 checks — 15 everyday, 13 edge; 9 failing when audited.
+Run the complete debug and release suites first:
 
-| # | Check | Do this | Expect | Kind | Sev | Status |
-|---|---|---|---|---|---|---|
-| R01 | More than 8 results: 9th row is reachable and there is no way to know it exists | Default config (maxResults 40, visibleRows 8). Open the panel, type a query that matches >8 items. Demo repro: JBAR_DEMO=1 JBAR_SNAPSHOT_QUERY="s" -> 9 rows. Look at the panel; then scroll the wheel over the list; then p | Panel is 452pt (8 rows). Wheel scrolls to row 9. Down-arrow past row 8 scrolls the list. CRITICALLY: something on screen must tell the user rows 9..N exist (partial row peeking, persistent scroller, or a '+N more' afford | common | high | **BROKEN** |
-| R02 | visibleRows > 8 in config: selection walks off the bottom of the window | Set ~/.config/jbar/config.json to {"visibleRows": 12}. Search for something with >=12 results. Press Down repeatedly and watch the highlighted row. | Panel grows to 12 rows tall (or visibleRows is clamped to what the panel can show), and every selected row stays visible. | common | high | **BROKEN** |
-| R06 | Zero results -> 'No matches' row | Type a query that matches nothing (demo: 'zzzq'). Then press Down/Up, Enter, Cmd+Enter, Cmd+C, Cmd+1. | One dimmed, non-selectable row 'No matches for "zzzq"' with a magnifyingglass symbol; panel 116pt; arrows do nothing; Enter/Cmd+Enter/Cmd+C/Cmd+1 beep and do NOT open anything. | common | high | OK |
-| R03 | Parent path label must not truncate when there is room | Search for anything. Look at the dimmed right-hand path on each row for short paths such as /Applications or ~/jbar. | '/Applications' and '~/jbar' render in full; head truncation only kicks in when the path genuinely exceeds 45% of the free width. | common | medium | **BROKEN** |
-| R04 | Exactly 8 results | JBAR_DEMO=1 JBAR_SNAPSHOT_QUERY="a" (3 apps + 5 files). | Panel is exactly 452pt, 8 rows, 8pt bottom pad, no scroll needed, group hairline between the last app and the first file. | common | medium | OK |
-| R05 | Exactly one result | JBAR_DEMO=1 JBAR_SNAPSHOT_QUERY="safari". | Panel is 116pt (60 + 48 + 8), one row, selected, divider under the input row visible, no separator hairline. | common | medium | OK |
-| R07 | Query becomes empty again after having results | Type 'safari' (1 row), then select-all and delete so the field is empty. | Rows collapse to the recents list (or the first-run hint row); panel shrinks smoothly; no stale 'No matches' flash. panelRows() must return [] not [.empty] for a whitespace-only query. | common | medium | TODO |
-| R08 | First-run hint row | Fresh install (empty frecency). Press the hotkey, do not type. | One non-selectable row: 'Type to search · ↩ open · ⌘↩ reveal · ⌘C copy path · ⌥Space toggle' with a keyboard symbol; panel 116pt; Enter beeps rather than opening anything. | common | medium | OK |
-| R09 | Empty-query recents | Open a few items so frecency is populated, then press the hotkey and do not type. | Up to maxResults recents; apps-first grouping still applies; hint row is NOT shown once recents exist. | common | medium | TODO |
-| R10 | showRecentsOnEmpty:false is honoured | Set {"showRecentsOnEmpty": false} in config.json, wait for the hot reload, open the panel with an empty query. | No recents; either an empty panel or the hint row. | common | medium | **BROKEN** |
-| R13 | Very long file name plus very long parent path in one row | Search for a file with a 70+ character name that lives 8 directories deep. | Name middle-truncates, path head-truncates, badge stays right-aligned, nothing overlaps, one line, 48pt row. | common | medium | OK |
-| R15 | CJK and emoji names render and highlight correctly | Search for '研究会議のメモ 2024年度.pdf' and '🎉 party 🎈 plan 🥳.md'; check the bold/accent highlight lands on the matched characters. | One line, no clipping, correct glyphs, highlight covers exactly the matched characters (a 3-byte CJK char or a 4-byte emoji must map to one character, not three/four). | common | medium | OK |
-| R21 | Hover must not steal the keyboard selection | Position the pointer where results will appear. Press the hotkey, type 'saf', then nudge the trackpad 2-3px without meaning to. Press Enter. | Enter opens the row the keyboard selected (the top hit), or hover selection is visually distinct from keyboard selection. | common | medium | TODO |
-| R26 | Panel height transitions while typing | Type one character at a time: 'a' (8 rows) -> 'ap' (fewer) -> 'apx' (0 rows) -> backspace back to 'a'. Watch the top edge and the divider. | The top edge never moves; the height follows the row count; the divider under the input row hides at 0 rows and reappears otherwise; no flicker of a stale row count. | common | medium | TODO |
-| R11 | App/file group separator - 0 apps, all apps, mixed | Query matching files only (demo 'md'); query matching apps only (demo 'co'); mixed query (demo 'a'). | No hairline in the 0-app and all-app cases; exactly one hairline above the first file in the mixed case. | common | low | OK |
-| R12 | Separator when apps are backfilled AFTER the file group | Query where app matches > appsFirstCap but total matches < maxResults, e.g. 7 app matches and 10 file matches with appsFirstCap 5. | A hairline at BOTH group boundaries (app->file and file->app), or the backfilled apps clearly marked. | edge | medium | **BROKEN** |
-| R14 | Badge text for names containing dots | Search for files named 'report.final-draft-version-two', 'v1.2.3', 'archive.tar.gz', 'Makefile', '.gitignore'. | A short kind badge (<= ~5 chars) or none; the badge must never dominate the row. | edge | medium | **BROKEN** |
-| R18 | Missing / deleted path shows a generic icon and no crash | Search for something, then delete the file before the panel refreshes; or list a path-mode directory containing a broken symlink. | Generic document icon, row still selectable, Enter fails gracefully via AppLauncher. | edge | medium | OK |
-| R20 | Icon cache eviction under a large path-mode listing | Path mode on a directory with >500 entries (e.g. ~/Library/Fonts or a node_modules), scroll the whole listing up and down twice. | Smooth scrolling; the 500-entry NSCache countLimit must not cause visible icon popping or a hitch while re-fetching NSWorkspace icons on the main thread. | edge | medium | TODO |
-| R22 | Wheel-scroll then Enter | Search, scroll the wheel down 5 rows without moving the pointer, press Enter. | Defined and documented behaviour - either the selection follows the scroll or Enter opens the still-selected (now off-screen) row. Today it silently opens the off-screen selection. | edge | medium | TODO |
-| R23 | Click a row while a newer response is in flight | In path mode on a slow directory (or with the config being hot-reloaded), press and hold the mouse on row 3, and while held let the pending response land; release. | Either the originally-clicked item opens, or nothing opens - never a different item. | edge | medium | TODO |
-| R27 | Slow query shows the Loading row, and it never sticks | Path-mode a directory that takes >300ms to list (a network volume or a huge folder). Watch the panel, then type another character before it finishes. | A single dimmed 'Loading…' row after ~300ms; it is replaced by the real listing; it never remains after the response lands; the panel does not oscillate 8 rows -> 1 row -> 8 rows while typing fast. | edge | medium | TODO |
-| R16 | RTL (Arabic/Hebrew) file name | Search for a file named 'مستند عربي مهم.pdf'. | Renders left-aligned next to the icon; bidi reordering puts '.pdf' at the visual left - that is correct Unicode behaviour, not corruption. Badge still reads PDF. | edge | low | OK |
-| R17 | File name containing a newline or tab | Create a file whose name contains \n and \t (legal on APFS), index it, search for it. | One 48pt row, no layout break; ideally control characters are shown as visible placeholders so two files differing only after the newline are distinguishable. | edge | low | **BROKEN** |
-| R19 | Icon cache does not serve a stale icon after the item changes | Search for an app so its icon is cached, update/replace that app (or replace a file with a directory at the same path), search again without restarting JBar. | The new icon appears, or the cache expires within a reasonable window. | edge | low | **BROKEN** |
-| R24 | Double-click a result | Double-click a result row quickly. | The item opens exactly once. | edge | low | TODO |
-| R25 | Cmd+1..8 vs what is on screen | (a) Set visibleRows to 5, search, press Cmd+7. (b) With visibleRows 8, search, scroll down 5 rows, press Cmd+1. | Cmd+N opens the Nth VISIBLE row, matching the documented 'Cmd+1..8 open row N'. | edge | low | **BROKEN** |
-| R28 | Narrow panel (small screen / 320pt minimum width) | Run on a display whose visibleFrame width is ~360pt so placeOnScreen clamps the panel to 320pt. Search for a deep-path file with a badge. | Icon, name, path and badge still fit; the name gets a usable share of the width; the hint row and the 'No matches' row truncate gracefully. | edge | low | TODO |
+```bash
+swift test
+swift test -c release
+```
 
-## Keyboard & text input
+Test counts are deliberately omitted because they change with the implementation. The focused commands below explain what evidence to inspect when a failure occurs.
 
-36 checks — 17 everyday, 19 edge; 3 failing when audited.
+| ID | Behavior under test | Focused command / evidence | Status needed for release |
+|---|---|---|---|
+| AUTO-VIEW-01 | `visibleRows` 1/8/12/20 drives height, viewport, page stride, overflow peek, and short-screen capacity from one calculation | `swift test --filter PanelGeometryTests` | Automated + Physical |
+| AUTO-VIEW-02 | empty models can be installed repeatedly without scrolling nonexistent row zero | `swift test --filter PanelGeometryTests/testEmptyResultsCanBeInstalledRepeatedly` | Automated + Physical on oldest OS |
+| AUTO-RECENT-01 | `showRecentsOnEmpty:false` shows only the hint and rejects a stale in-flight response | `swift test --filter PanelGeometryTests/testDisablingRecentsCancelsAndRejectsAnOlderSearchResponse` | Automated + Physical |
+| AUTO-IME-01 | Chinese/Korean marked text survives command routing, Escape policy, resign timing, and programmatic clear | `swift test --filter PanelGeometryTests` | Automated + Physical for every required IME |
+| AUTO-KEY-01 | `⌘1...⌘8` uses physical ANSI digit key codes; Delete never maps to close | `swift test --filter PanelGeometryTests/testCommandResultOrdinalsUsePhysicalANSIDigitKeys` | Automated + Physical layouts |
+| AUTO-PATH-01 | readable empty vs missing/unreadable path, exact totals, truncation, hidden filtering, ordering, bounded top-K, 1k/20k directories, and supersession | `swift test --filter PathModeStreamingTests` | Automated + Physical filesystem smoke |
+| AUTO-APP-01 | Finder display name, localized aliases, bundle metadata, symlink deduplication, deterministic parallel reads, and shared item cap | `swift test --filter AppScannerTests` | Automated + Physical system-language check |
+| AUTO-OPEN-01 | async app failure never records history; success records only after LaunchServices confirmation; dead history is pruned/persisted at startup | `swift test --filter AppLauncherTests` | Automated + Physical real app/failure |
+| AUTO-CONFIG-01 | range/size validation, legacy row migration, no-symlink bounded reads, atomic writes, and hot-reload last-good behavior | `swift test --filter ConfigTests` | Automated + Runtime |
+| AUTO-STATE-01 | owner-only atomic state, symlink/special-file refusal, and oversized history rejection | `swift test --filter SecureFileIOTests` | Automated + Runtime permission inspection |
+| AUTO-BENCH-01 | schema-1/workload-2 matrix, deterministic in-memory history, complete/non-cancelled responses, exact ordered-row + total parity, sample bounds, isolated state, safe report output, and no cross-tool speedup wording | `swift test --filter BenchmarkTests`; `scripts/tests/benchmark-report-gate.rb --self-test`; `scripts/tests/benchmark-release-tests.sh` | Automated + repeated benchmark evidence |
+| AUTO-APPKIT-01 | packaged-clone `NSApplication` lifecycle; dispatched Control `flagsChanged`, text, Delete, Down, Return; panel remains visible until the exact second fixture is recorded; clean termination and bounded crash-report diff | `scripts/tests/appkit-smoke.sh /absolute/path/JBar.app /absolute/new-evidence-directory` | Automated packaged smoke + Physical IME/keyboard + Release artifact |
 
-| # | Check | Do this | Expect | Kind | Sev | Status |
-|---|---|---|---|---|---|---|
-| KB-01 | Enter with no explicit selection opens the first result | ⌥Space; type "saf" (demo: Safari is row 1); do NOT press ↓; press Return. | Safari launches and the panel hides. actionTarget falls back to results.firstResult when table.selectedRow is -1. | common | high | TODO |
-| KB-02 | Enter on an informational row (no-matches / hint / Loading…) must not open anything | ⌥Space; type "zzzznomatch" so only the "No matches for …" row shows; press Return. Repeat with an empty query on a fresh profile (hint row) and with a slow path query showing "Loading…". | System beep, panel stays open, nothing launches, no Finder window. PanelRow.empty/.hint/.loading have result == nil so isSelectable is false, the table deselects, and both selectedResult and firstResult are nil. | common | high | OK |
-| KB-05 | ⌘V paste works in an LSUIElement / non-activating panel | Copy "Safari" in another app; ⌥Space; press ⌘V. Also try ⌘A, ⌘X, ⌘Z, ⇧⌘Z in the field. | Text pastes and a search runs (controlTextDidChange fires on paste). ⌘A selects all, ⌘X cuts, ⌘Z/⇧⌘Z undo/redo the field text. All five reach the field editor via the programmatic Edit menu; handleKeyDown lets them throu | common | high | TODO |
-| KB-09 | Esc closes the panel and clears the query | ⌥Space; type "safari"; Esc; ⌥Space again. | Panel closes; on reopen the field is empty with the placeholder "Search apps and files" and recents (or the hint row) show — not "safari". | common | high | OK |
-| KB-13 | Typing very fast: the rows on screen always belong to the last-typed query | ⌥Space; type "docum" as fast as possible (or hold a key to autorepeat) over a full index; watch the rows settle. Repeat 10×. Then type into a slow path query (~/Library/) and immediately keep typing. | After the burst, the visible rows match the final query text. No flash of "No matches" from a cancelled intermediate response, and no rows for a prefix of the query left on screen. | common | high | TODO |
-| KB-03 | ↓ past the last row and ↑ on the first row wrap around | ⌥Space; type a query returning ≥3 results; press ↓ until the last row is selected, then ↓ once more; then press ↑ from row 1. | ↓ from the last row selects row 1; ↑ from row 1 selects the last row (wrap: true). With the new 40-row pool the list scrolls, so wrapping from row 40 must scroll the table back to the top (select() calls scrollRowToVisib | common | medium | TODO |
-| KB-04 | ⌃N / ⌃P mirror ↓ / ↑ | ⌥Space; type a query with ≥3 results; press ⌃N three times, then ⌃P three times; confirm wrap at both ends. | Identical to ↓/↑ including wrap. macOS StandardKeyBinding maps ⌃N→moveDown: and ⌃P→moveUp:, both handled in control(_:textView:doCommandBy:). The ⌘-only guard in handleKeyDown lets control-modified events through untouch | common | medium | TODO |
-| KB-06 | ⌘C with no field selection copies the row's POSIX path and hides | ⌥Space; type "saf"; without selecting any text in the field, press ⌘C; paste elsewhere. | Clipboard holds /Applications/Safari.app and the panel closes. field.hasTextSelection is false so the local monitor swallows the event before the Edit menu's Copy item can claim it. | common | medium | TODO |
-| KB-07 | ⌘A then ⌘C copies the query text, not a path, and keeps the panel open | ⌥Space; type "safari"; ⌘A; ⌘C; paste elsewhere; check the panel is still open. | Clipboard holds "safari", panel stays open. hasTextSelection is true so the event is returned and the Edit menu's Copy runs on the field editor. | common | medium | OK |
-| KB-08 | ⌘1…⌘8 open the Nth result; digits beyond the result count beep and keep the panel open | ⌥Space; type a query returning exactly 3 results; press ⌘3 (opens row 3); reopen, same query, press ⌘5. | ⌘3 launches row 3 and hides. ⌘5 beeps, the panel stays open, no launch, and the digit is NOT typed into the query field (the monitor returns nil either way). | common | medium | TODO |
-| KB-10 | Tab on a folder row in normal search mode jumps into path mode | ⌥Space; type "jbar" so the ~/jbar FOLDER row is selected; press Tab. | Query becomes "~/jbar/" (home-abbreviated because the query did not start with "/"), the PATH badge appears, and the directory listing replaces the results. Caret sits at the end. | common | medium | TODO |
-| KB-15 | Chinese IME: pinyin composition does not search until the candidate is committed | Switch to Pinyin - Simplified; ⌥Space; type "wenjian" (candidate bar open, text underlined); observe the results list; then press Return/Space to commit 文件 and observe again. | While the text is still marked (underlined) the results list does not update — it keeps showing whatever was there before composition started. On commit, exactly one search runs against the committed characters. Nothing  | common | medium | OK |
-| KB-18 | ⌘Q inside the panel is ignored (no quit, no beep) | ⌥Space; press ⌘Q. Confirm JBar is still running (menu-bar item present). Then close the panel and quit only from the status menu. | Nothing happens: the local monitor returns nil and the main menu deliberately has no Quit item. Also check ⇧⌘Q and ⌥⌘Q do not quit either (they take the early-return paths). | common | medium | TODO |
-| KB-11 | Tab on a file row in normal (non-path) mode beeps and leaves the query untouched | ⌥Space; type "README"; ↓ onto README.md (a file, not a folder); press Tab. | Beep; query text unchanged; results unchanged. autocompleteTarget returns nil because the row is neither a folder nor in path mode. | common | low | TODO |
-| KB-19 | ⌘, opens the config file and the panel gets out of the way | ⌥Space; type "saf"; press ⌘,. | The config JSON opens in the default editor. Because that app activates, the panel resigns key and hide() runs, clearing the query. No stray comma is typed into the field (the monitor returns nil). | common | low | TODO |
-| KB-20 | PgDn / PgUp move by visibleRows and clamp at both ends (no wrap) | Set "visibleRows": 8 and a query returning 40 rows. Press PgDn repeatedly to the bottom, then once more; then PgUp to the top and once more. | Each PgDn advances the selection by 8 and scrolls; at the last result further PgDn does nothing (clamped, no wrap); same at the top. Repeat with "visibleRows": 3 — the step size must follow the config, not a hard-coded 8 | common | low | TODO |
-| KB-36 | Automated regression coverage for the pure keyboard helpers | Run `swift test --filter SearchPanel` and `swift test --filter Autocomplete`. | Tests exist for SearchPanel.panelRows(for:hint:), SearchPanel.autocompleteTarget(for:query:inPathMode:home:isDirectory:), SearchPanel.abbreviateHome, ResultsController.result(atOrdinal:) and moveSelection(by:wrap:). Toda | common | low | **BROKEN** |
-| KB-14 | Type, then Esc before the response lands, then reopen | ⌥Space; type a query that takes >150 ms (a path query on a big directory, e.g. "~/Library/", or type on a cold index); press Esc within ~50 ms of the last keystroke; immediately press ⌥Space again and look at the first f | The reopened panel shows recents (or the hint row) at the right height — never the previous query's rows. | edge | medium | TODO |
-| KB-23 | Pasting a very large blob then pressing one more key | Copy ~20 000 characters (e.g. `head -c 20000 /dev/urandom \| base64 \| tr -d '\n' \| pbcopy`); ⌥Space; ⌘V; then press one more character and hold Backspace. | The panel stays responsive; each keystroke costs single-digit ms. | edge | medium | **BROKEN** |
-| KB-27 | ⌘1…⌘8 and ⌘, on a non-US keyboard layout | System Settings › Keyboard › Input Sources, add French (AZERTY); switch to it; ⌥Space; type a query with results; press ⌘1 (the & key). Repeat with ⌘,. | ⌘1 opens result 1. Today the key produces "&" so nothing at all happens — no open, no beep. Also verify ⌘, on layouts where comma needs Shift (the `!flags.contains(.shift)` guard rejects it). | edge | medium | TODO |
-| KB-32 | ⌘↩ (reveal) on an app row, a path-mode row, and an informational row | ⌥Space; type "saf"; ⌘↩ (expect Finder selects Safari.app). Then "zzzznomatch"; ⌘↩. Then reveal a file whose index entry is stale (rename it on disk first, keep the panel query the same). | App/file rows: Finder opens with the item selected and the panel hides. Informational row: beep, panel stays. Stale path: beep, panel stays OPEN (reveal returns false so hide() is not called). | edge | medium | TODO |
-| KB-34 | Mouse-wheel scroll then Enter | ⌥Space; type a query with 40 results; without touching the arrow keys, scroll the list down with the trackpad until rows 20-28 are visible; press Return. | Enter should open something the user can see. Today the selection is still row 1 (off-screen) and Enter opens that — verify whether wheel-scrolling should move the selection or whether the selected row should be scrolled | edge | medium | TODO |
-| KB-12 | Tab with no results at all, or on the hint / No-matches row | ⌥Space; type "zzzznomatch"; press Tab. Then on a fresh profile with an empty query showing only the hint row, press Tab. | Beep, nothing changes, focus stays in the field (the delegate returns true so Tab never moves the key view). actionTarget is nil. | edge | low | TODO |
-| KB-16 | ⌘-shortcuts pressed in the middle of an IME composition | Pinyin IME; ⌥Space; type "nihao" (still marked, candidate bar open); press ⌘C. Repeat with ⌘1 and ⌘↩. | Ideally the composition is not silently abandoned. Today ⌘C copies the selected result's PATH and closes the panel, discarding the composition (marked text reports selectedRange.length == 0, so hasTextSelection is false) | edge | low | **BROKEN** |
-| KB-17 | Esc while the IME candidate window is open cancels the composition, not the panel | Pinyin IME; ⌥Space; type "nihao"; press Esc once (expect: composition cleared, panel still open); press Esc again. | First Esc is swallowed by the input method; the panel must stay open. Second Esc closes and clears. | edge | low | TODO |
-| KB-21 | ⌘↑ / ⌘↓ jump to the first / last result | ⌥Space; query returning 40 rows; press ⌘↓ then ⌘↑. | ⌘↓ selects and scrolls to the last of the 40 results; ⌘↑ returns to row 1. These arrive as moveToEndOfDocument:/moveToBeginningOfDocument: — verify they are not swallowed by the ⌘ monitor (charactersIgnoringModifiers for | edge | low | TODO |
-| KB-22 | Home / End keys on a full-size keyboard | ⌥Space; type a long path query such as "~/Library/Application Support/"; press End, then Home. | Something useful and documented should happen — either the caret moves to the end/start of the query text, or the selection jumps to the last/first row. Today neither happens. | edge | low | TODO |
-| KB-24 | Pasting multi-line text | Copy three lines of text (e.g. `printf 'DESIGN.md\nREADME\nPackage\n' \| pbcopy`); ⌥Space; ⌘V. | No newline ever enters the query. AppKit's single-line field editor converts each newline to a space, so the query becomes "DESIGN.md README Package" — a 3-term AND search (QueryParser splits on whitespace, cap 6 terms). | edge | low | OK |
-| KB-25 | ⌥Return, ⌃O and ⌃V do not corrupt the query | ⌥Space; type "saf"; press ⌥Return; press ⌃O; press ⌃V. | ⌥Return and ⌃O are silent no-ops that insert nothing (DESIGN.md lists ⌥Enter Open With as "not in v1"). ⌃V is the emacs pageDown: binding and moves the selection down one page — verify that is acceptable, since ⌃V is als | edge | low | OK |
-| KB-26 | ⌘1…⌘8 when visibleRows is smaller than 8, or after scrolling the list | Set "visibleRows": 4 in ~/.config/jbar/config.json; ⌥Space; type a query with 40 results; press ⌘8. Separately, with visibleRows 8, scroll the list to rows 20-28 with the trackpad and press ⌘1. | A ⌘-digit should address a row the user can actually see. Today ⌘8 opens the 8th result even though only 4 rows are on screen, and after scrolling ⌘1 still opens result #1 far above the viewport. | edge | low | TODO |
-| KB-28 | Emoji and astral-plane input in the query | ⌥Space; press ⌃⌘Space and insert 👨‍👩‍👧‍👦 then a flag emoji; then type ASCII after it and backspace over the emoji. | No crash, no garbled rendering, backspace removes one whole grapheme cluster, and the search returns "No matches" rather than hanging. TextAnalyzer.analyze force-unwraps `ch.unicodeScalars.first!` per Character — confirm | edge | low | OK |
-| KB-29 | Dead keys (ABC - Extended / US International) | Switch to ABC - Extended; ⌥Space; press ⌥e (acute dead key) then e to produce é; also press ⌘e (a dead-key key with Command held). | é is composed into the query and one search runs; ⌘e is harmless. charactersIgnoringModifiers is empty for a dead key, so the `chars.count == 1` guard returns the event untouched. | edge | low | TODO |
-| KB-30 | Repeated Tab in path mode on a file or .app row | ⌥Space; type "~/jbar/"; ↓ onto Package.swift; press Tab; press Tab again, and again. Repeat in "/Applications/" on Safari.app. | After the first Tab completes the name, further Tabs should give clear feedback. Today they silently do nothing (no beep, no visible change) because autocompleteTarget returns the same string the query already holds — in | edge | low | TODO |
-| KB-31 | ⇧Tab moves the selection up | ⌥Space; type a query with ≥3 results; press ↓ twice; press ⇧Tab. | Selection moves up one row (insertBacktab: is mapped to moveSelection(by: -1)). This is undocumented in DESIGN.md §7.3 and is not the reverse of Tab-autocomplete — confirm it is intended and document it, since ⇧Tab is wh | edge | low | TODO |
-| KB-33 | Keyboard still works after clicking in the results list | ⌥Space; type a query; click once on a row's empty right-hand area (do not click a row that opens), then press ↓, Esc, and a letter key. | ↓ moves the selection, Esc closes, and the letter appends to the query (SearchPanel.keyDown's default branch restores first responder to the field and forwards). Note this fallback path calls editor.keyDown directly, byp | edge | low | TODO |
-| KB-35 | Config hot-reload of visibleRows/maxResults while the panel is open and mid-query | ⌥Space; type "doc"; in another editor change "visibleRows" from 8 to 3 and save; watch the panel. | The panel shrinks to 3 rows and re-runs the current query; the selection stays on a valid row and the field text is untouched. Then press PgDn and confirm it now steps by 3. | edge | low | TODO |
+Automated marked-text tests instantiate AppKit text components and real marked-string state, but they do not launch the macOS candidate window or exercise a specific OS/input-method implementation. Never label a physical IME cell “pass” from these tests alone.
 
-## Panel & window behaviour
+`AUTO-APPKIT-01` launches a private, ad-hoc re-signed clone with a derived bundle identifier and an
+in-memory fixture. It deliberately bypasses the real hotkey, index, history, login item, and
+`NSWorkspace`. Its queued AppKit events catch panel/event-routing/lifecycle regressions, but they do
+not prove a physical Control/Delete path, a particular IME, LaunchServices, Gatekeeper, or
+notarization. CI retains the bounded JSON, PNG, marker, logs, and crash-report diff for each matrix
+runner.
 
-32 checks — 9 everyday, 23 edge; 5 failing when audited.
+## 3. Sequoia 15.x Simplified Chinese crash regression
 
-| # | Check | Do this | Expect | Kind | Sev | Status |
-|---|---|---|---|---|---|---|
-| PNL-01 | Hotkey toggles the panel when it is already open and key | 1. Press ⌥Space to open the panel. 2. Type "saf". 3. Press ⌥Space again without clicking anywhere. | The panel hides immediately (SearchPanel.toggle -> hide, Sources/JBarApp/UI/SearchPanel.swift:167). No non-breaking space is inserted into the query field (the Carbon hotkey must consume the keystroke). Keyboard focus re | common | high | TODO |
-| PNL-02 | Hotkey while another app is full-screen | 1. Put Safari (or Xcode) into full screen on the built-in display. 2. Press ⌥Space. 3. Type a query, press Esc. 4. Repeat with a full-screen app on the secondary display. | The panel draws on top of the full-screen space without switching Spaces, takes keyboard focus, and Esc returns focus to the full-screen app. Watch for: no Space flip, no panel drawn behind the full-screen window. | common | high | TODO |
-| PNL-03 | Click outside dismisses; click inside does not | 1. Open the panel. 2. Click on the panel background between the input row and the first result. 3. Click on the search-glass icon. 4. Click a result row (should open it). 5. Reopen and click another app's window, then th | Steps 2-3 keep the panel open and keep the caret in the query field. Step 4 opens the item and hides. Step 5: each outside click hides the panel exactly once (didResignKeyNotification -> hide, SearchPanel.swift:137). No  | common | high | TODO |
-| PNL-06 | Multi-monitor: panel appears on the screen under the mouse | 1. Leave screen: "mouse" (default). 2. Move the pointer to the external display, press ⌥Space. 3. Move to the built-in, press ⌥Space. 4. Park the pointer exactly on the shared edge between the two displays and press ⌥Spa | The panel is centred horizontally on the screen under the pointer, input-row centre 1/3 down that screen's visibleFrame, fully on-screen in all three cases; the boundary case picks exactly one screen (no flicker, no half | common | high | OK |
-| PNL-04 | Top edge stays put while the row count changes | 1. Open the panel and note the y of the input row against a fixed screen landmark. 2. Type "s" (many rows), then "saf" (2 rows), then "zzzq" (No matches), then delete back to empty. | The input row never moves; the panel only grows/shrinks downward. Heights: 68pt empty-with-no-rows, 116pt for 1 row, 164pt for 2, 452pt for 8+. | common | medium | OK |
-| PNL-13 | Notched display: panel never collides with the menu bar / camera housing | 1. On the 14"/16" built-in (safeAreaInsets.top = 32), press ⌥Space with 0 and with 8 results. 2. Enable 'Automatically hide and show the menu bar' and repeat. 3. Repeat with the menu bar hidden in a full-screen app. | The panel top is always at least 8pt below visibleFrame.maxY and never under the notch. With the auto-hiding menu bar, visibleFrame grows and the panel simply sits a bit higher — never above the safe area. | common | medium | OK |
-| PNL-17 | Light vs dark appearance, including a live switch | 1. Open the panel in dark mode; screenshot. 2. Switch to light mode (or let auto-appearance flip) while the panel is open. 3. Change the accent colour in System Settings while the panel is open, then type a character. | Text, badges, separators and the panel border all follow the appearance; the border colour is re-resolved (updateBorder) and the selection/matched-character accent picks up the new accent colour on the next row rebuild.  | common | medium | TODO |
-| PNL-24 | Panel survives hundreds of open/close cycles without drifting | 1. Press ⌥Space 50 times in a row alternating open/close, occasionally typing and pressing Esc. 2. Verify the frame each time via: /usr/bin/log stream --predicate 'subsystem == "com.linji.jbar" AND category == "panel"'. | Every 'panel shown' line reports the same x and the same top edge for a given pointer screen (on this machine: x=395, y+h=666 for the built-in). No 1pt-per-cycle drift, no growth in topEdge, no accumulation of key monito | common | medium | OK |
-| PNL-05 | Panel opens at input-row height and then jumps to full height | 1. Close the panel. 2. Press ⌥Space and watch the first ~300 ms carefully (record the screen at 60 fps if possible). 3. Repeat with a path query left in the field (restoreQueryOnReopen: true) over a large directory such  | Ideally the panel appears once at its final height. Actual: it is ordered in at 68pt and only resizes after the async search returns; with a slow path listing it goes 68 -> 116 ("Loading…") -> full height, i.e. two visib | common | low | **BROKEN** |
-| HK-01 | Configured hotkey cannot be registered -> fallback + visible warning | 1. Set "hotkey": "cmd+space" (owned by Spotlight) in config.json and restart JBar. 2. Open the menu-bar menu. 3. Try ⌃⌥Space. | Either the hotkey registers (see HK-02 — conflicts usually do NOT fail) or the fallback ⌃⌥Space is registered, the menu shows '⚠ Hotkey unavailable — …; using ⌃⌥Space', and the panel's hint row reads '⌃⌥Space toggle'. | edge | high | TODO |
-| HK-06 | Hotkey after sleep/wake, display reconnect and fast user switching | 1. Sleep the Mac, wake, press ⌥Space. 2. Dock/undock an external display, press ⌥Space. 3. Fast-switch to another user account and back, press ⌥Space. | The hotkey still fires in all three cases and the panel opens on the correct screen with a freshly computed position (not the pre-sleep coordinates). | edge | high | TODO |
-| PNL-08 | External display disconnected while the panel is open | 1. Set the pointer on the external display and press ⌥Space so the panel opens there. 2. Without closing it, unplug the display (or close the lid on a clamshell setup). 3. Type one character. | The panel should re-place itself onto a surviving screen and stay usable. Actual risk: applyHeight() forces origin.y back to the topEdge captured for the removed display, so the panel jumps off-screen while still being t | edge | high | TODO |
-| PNL-10 | visibleRows greater than 8 in config.json | 1. Set "visibleRows": 12 in ~/.config/jbar/config.json and save (hot reload; no restart needed). 2. Press ⌥Space, type a query that returns 40 results. 3. Count visible rows. 4. Press ↓ twelve times and watch the highlig | Expected: a 12-row-tall panel (60 + 12x48 + 8 = 644pt). Actual: the window stays 452pt (8 rows) because maxHeight is the constant 452, while the results scroll view is laid out 576pt tall inside it — rows 9-12 are drawn  | edge | high | **BROKEN** |
-| PNL-22 | Hotkey while another app has Secure Input active (password field focused) | 1. Focus a password field (login keychain prompt, 1Password, sudo in Terminal, the macOS lock-screen sheet). 2. Press ⌥Space. 3. Type a query. | Either the panel does not appear, or it appears AND receives the keystrokes. The dangerous outcome to look for: the panel is visible but never becomes key, so the typed query goes into the other app's password field, and | edge | high | TODO |
-| HK-02 | A second process already owns the same hotkey | 1. Leave /Applications/JBar.app running. 2. Launch build/JBar.app as well. 3. Open the menu-bar menu of both. 4. Press ⌥Space once. | Expected by the design: the second instance fails with eventHotKeyExistsErr and shows '⚠ Hotkey unavailable'. Actual: both processes register successfully (OSStatus 0) and both panels appear on one keypress, each hiding  | edge | medium | **BROKEN** |
-| HK-03 | Hotkey recovery after the conflict clears (config hot reload) | 1. Make JBar fall back to ⌃⌥Space (HK-01). 2. Quit the app that owns the combination. 3. Touch/save config.json without changing the "hotkey" value. 4. Press the configured hotkey. | JBar should re-attempt the configured hotkey. Actual: applyConfig only calls registerHotkey when the hotkey string changed (AppDelegate.swift:117), so JBar stays on ⌃⌥Space until it is relaunched or the string is edited  | edge | medium | **BROKEN** |
-| HK-04 | Invalid / exotic hotkey strings in config | 1. Try in turn: "", "space", "option+", "cmd+shift+option+ctrl+space", "option+space " (trailing space), "OPTION+SPACE", non-ASCII. 2. Save each and watch the menu-bar menu and the panel hint row. | Unparseable values produce '⚠ Hotkey unavailable — '…' is not a valid hotkey; using ⌃⌥Space' and the panel keeps working via the fallback and the menu; no crash, no silently dead hotkey, and the hint row text matches wha | edge | medium | TODO |
-| PNL-07 | screen: "main" and screen: "active" behave as documented | 1. Set "screen": "main" in ~/.config/jbar/config.json, save (hot reload). Put the pointer on the secondary display, press ⌥Space. 2. Set "screen": "active", click into a window on the secondary display to make it frontmo | 1: panel appears on the menu-bar (primary) display. 2: panel appears on the display holding the frontmost window (the secondary). 3: unknown values silently fall back to "mouse" behaviour, no crash, no config error. | edge | medium | TODO |
-| PNL-09 | Resolution / Dock / menu-bar change while the panel is open | 1. Open the panel. 2. With it open, toggle 'Automatically hide and show the Dock' (⌥⌘D), or change the display resolution in System Settings, or plug in a second display. 3. Type a character to force a resize. | The panel stays centred and fully on-screen relative to the new visibleFrame. Actual risk: the same stale-topEdge reposition as PNL-08, plus the horizontal centre is never recomputed while visible. | edge | medium | TODO |
-| PNL-12 | Screen shorter than the panel (small external display) | 1. Connect a display whose visibleFrame height is under 460pt (e.g. 640x480 with the Dock on it, or mirror to a 720p device and scale). 2. Put the pointer on it, press ⌥Space, type a query returning 8+ results. | The whole panel, including the 8th row and the 8pt bottom padding, is on-screen and above the Dock. Actual: the bottom is placed below visibleFrame.minY and, because the panel is level .floating (3) and the Dock is level | edge | medium | **BROKEN** |
-| PNL-14 | Mission Control / Spaces / space switch with the panel open | 1. Open the panel. 2. Press ⌃→ to switch to another Space. 3. Press ⌥Space on the new Space. 4. Open the panel, then invoke Mission Control (F3). 5. Open the panel, then ⌘H / hide all apps. | 2: the panel either follows (canJoinAllSpaces) or hides — but never leaves a ghost on the old Space. 3: the panel opens on the current Space. 4: with .transient the panel disappears during Mission Control and comes back  | edge | medium | TODO |
-| PNL-15 | Reduce Transparency | 1. System Settings > Accessibility > Display > Reduce transparency ON. 2. Open the panel over a busy wallpaper and over a white document, in both light and dark mode. 3. Toggle the setting while the panel is open. | The NSVisualEffectView(.popover) substitutes an opaque material: the panel is fully legible with no wallpaper bleed-through, the 1px separator border is still visible, and toggling live re-renders without a stale blur. | edge | medium | TODO |
-| PNL-16 | Increase Contrast | 1. Accessibility > Display > Increase contrast ON. 2. Open the panel; check the selected row, the hairline between the app group and file group, the panel border, and the matched-character highlight. 3. Toggle it while t | The selection is clearly distinguishable. Risk: the selected row is drawn only as controlAccentColor at 18% alpha with no outline (RowView.swift:53-58), which can be near-invisible under Increase Contrast; the border col | edge | medium | TODO |
-| PNL-18 | Screen lock / display sleep / fast user switching with the panel open | 1. Open the panel, then press ⌃⌘Q to lock. 2. Try the hotkey at the lock screen. 3. Unlock. 4. Repeat with display sleep and with fast user switching to another account and back. | The hotkey does nothing at the lock screen (no panel over the login UI). After unlocking, the panel is either gone or still usable and correctly placed — never a stale window at an old position, and never a key window th | edge | medium | TODO |
-| PNL-20 | resignKey while a menu is open (right-click in the query field) | 1. Open the panel, type "doc". 2. Right-click inside the query field to get the standard text context menu. 3. Choose Paste. 4. Also try: open the panel, then click the JBar menu-bar icon. | The context menu appears and the panel stays open long enough to use it — Paste must land in the query field. If the menu causes didResignKeyNotification, the panel hides out from under the menu and Paste does nothing, w | edge | medium | TODO |
-| PNL-21 | Status-menu 'Open JBar' while the panel is already open | 1. Open the panel with ⌥Space and type a query. 2. Without closing it, click the menu-bar magnifying glass and choose 'Open JBar'. | The panel ends up open and focused. Risk: opening the status menu makes the panel resign key, queuing hide() on the main queue, while the menu action calls show() (AppDelegate.swift:39, StatusMenu.openAction) — if the qu | edge | medium | TODO |
-| PNL-25 | First-run / launch-at-login auto-show | 1. Move ~/.config/jbar/config.json aside and launch JBar (first run auto-shows the panel), or launch with JBAR_SHOW_ON_LAUNCH=1. 2. Do not touch the keyboard for 10 s. 3. Then click on another app. | The panel appears focused with the hint row 'Type to search · ↩ open · ⌘↩ reveal · ⌘C copy path · ⌥Space toggle', and clicking away dismisses it. Risk: at login the panel is shown before/while other apps are activating;  | edge | medium | TODO |
-| PNL-26 | Panel over other high-level windows | 1. Start a Zoom/FaceTime call with a floating self-view or PiP video (level .floating). 2. Open the panel over it. 3. Also try over Control Center, a Notification banner, and another launcher (Spotlight, Raycast). | The panel is readable and on top of ordinary content. Since JBar is at level 3, expect it to be covered by status-bar-level UI (25) and pop-up menus (101) and to tie with other .floating windows; confirm that at minimum  | edge | medium | TODO |
-| HK-05 | Hotkey auto-repeat and rapid double-press | 1. Press and HOLD ⌥Space for three seconds. 2. Then press ⌥Space twice as fast as possible. 3. Then press it repeatedly ~10x/second for five seconds. | Holding it opens the panel once (no strobing open/close from key repeat). Rapid presses leave the panel in a consistent state matching the parity of the presses, with no orphaned key monitor, no duplicate window, and the | edge | low | TODO |
-| PNL-11 | visibleRows 1 and 3 | 1. Set "visibleRows": 1, reload, open the panel with a query returning many results, press ↓ five times. 2. Repeat with 3. 3. With visibleRows: 3, press ⌘5. | 1: a 116pt panel showing one row that scrolls as the selection moves; ↓ never leaves a blank list. 3: a 212pt panel, three rows, PgDn moves by 3. ⌘5 with visibleRows:3 opens the 5th result even though it is off-panel — d | edge | low | TODO |
-| PNL-19 | Panel content during screen sharing / recording | 1. Start a Zoom/Meet screen share or a QuickTime screen recording. 2. Open the panel and type a query that surfaces private file names. | Decide deliberately: the panel is currently captured by screen recording and sharing (sharingType = readOnly, the default). If launcher contents should be excluded from shares, set window.sharingType = .none. | edge | low | OK |
-| PNL-23 | Very narrow display width | 1. Attach/mirror to a display narrower than 720pt (e.g. 640 wide, or a small Sidecar window). 2. Open the panel and type a query with long paths. | Panel width = min(680, max(320, vf.width - 40)) = 600 on a 640-wide screen and it is centred; the query field, PATH badge, name, parent path and kind badge all still lay out without overlap or negative widths. | edge | low | TODO |
+Run this first on the reporting Mac with the Chinese system language and the exact candidate artifact.
 
-## App lifecycle & state
+### CHN-CTRL — Control and input-source switching
 
-32 checks — 16 everyday, 16 edge; 3 failing when audited.
+1. Launch JBar and confirm the menu-bar item is present.
+2. Open the panel and leave the query empty.
+3. Press and release the left Control key 20 times, then the right Control key if present.
+4. Hold Control for five seconds, release it, and type a normal ASCII query.
+5. With Control-Space configured as macOS input-source switching, switch English → Simplified Chinese Pinyin → English ten times while the panel is open.
+6. Repeat while a Pinyin composition/candidate window is active.
 
-| # | Check | Do this | Expect | Kind | Sev | Status |
-|---|---|---|---|---|---|---|
-| LC-01 | First run: ⌥Space one second after install, empty query | rm -rf ~/.config/jbar ~/Library/Caches/com.linji.jbar ~/Library/Application\ Support/JBar; launch JBar.app; within ~1 s press ⌥Space (or observe the auto-shown panel, since firstRun triggers panel.show() at AppDelegate.s | Panel appears with the hint row: "Type to search · ↩ open · ⌘↩ reveal · ⌘C copy path · ⌥Space toggle" (SearchPanel.hintText, line 320). It must NOT look like an empty broken box. | common | high | TODO |
-| LC-02 | First run: type a real filename while the crawl is still running | Same clean state as LC-01. One second after launch type "invoice" (or any file name you know exists under ~/Documents). Watch the panel while the menu bar still says "Indexing… N items". | The panel should tell the user the index is still being built (e.g. "Indexing… 12,340 items — results will improve"). Today it shows "No matches for “invoice”", which is indistinguishable from a broken app. | common | high | **BROKEN** |
-| LC-03 | First run: apps are searchable within ~1 s even though the file crawl has not finished | Clean state, launch, immediately type "saf" / "term". | Safari / Terminal appear almost at once — IndexCoordinator.scanAppsAndPublish() publishes an apps-only store before loadSnapshot()/fullCrawl() (IndexCoordinator.swift:106). Confirms the app-first design and separates 'in | common | high | TODO |
-| LC-04 | First-run TCC prompt steals key focus and closes the panel | Clean state plus reset the TCC grants (tccutil reset SystemPolicyDesktopFolder com.linji.jbar, likewise Documents/Downloads). Launch JBar so the first-run panel is shown, start typing, and wait for the "JBar would like t | Panel should survive or be re-shown after the prompt is answered. Today SearchPanel installs a didResignKeyNotification observer that unconditionally calls hide() (SearchPanel.swift:134-136), so the panel vanishes and th | common | high | TODO |
-| LC-06 | Rebuild Index while the panel is open and a search is running | Warm index. Press ⌥Space, type "pro" so rows appear. Without closing the panel, click the menu-bar item → Rebuild Index. Keep typing/backspacing for 30 s. | Results must not silently collapse to nothing without explanation. Today rebuild() (IndexCoordinator.swift:132) publishes partial stores with complete:false, so the engine's store shrinks to apps-only and the panel shows | common | high | TODO |
-| LC-07 | Edit an index-affecting config key while the first crawl is running | Clean state (no snapshot) so a full crawl runs. While the menu says "Indexing…", edit ~/.config/jbar/config.json and change any of fileRoots / excludePaths / excludeNames / downrankNames / includeHidden / maxDepth / maxI | UI stays responsive; the crawl restarts with the new options. Today the app freezes for the remaining crawl duration (see defect: IndexCoordinator.update does queue.sync before requesting cancellation). | common | high | **BROKEN** |
-| LC-14 | Hot-reload fileRoots to a single small directory | Warm index. Set "fileRoots": ["~/Desktop"] and save. Watch the menu status and the item count; then check that ~/Library/Caches/com.linji.jbar/index-v1.bin was deleted and rewritten. | indexOptionsChanged → coordinator.update → old snapshot removed (line 160), apps rescanned, full crawl of the new root only, item count drops to the Desktop size, status returns to idle with a fresh "updated just now". R | common | high | TODO |
-| LC-16 | Deny folder access, then grant it later | tccutil reset SystemPolicyDocumentsFolder com.linji.jbar; launch JBar; click "Don't Allow" at the Documents prompt; let the crawl finish. Open the menu → "⚠ Some folders not accessible — Fix…" (hover for the tooltip list | After granting, the missing folder should be indexed without further user action. Today nothing re-crawls: the file is still not found and the ⚠ line is still there until the user separately discovers Rebuild Index or 7  | common | high | TODO |
-| LC-05 | Menu-bar status text for each index phase | Open the menu-bar magnifying-glass item repeatedly during a fresh launch, during a Rebuild Index, and after a file is saved under a watched root. | loadingSnapshot → "Loading index…"; scanningApps → "Scanning apps…"; crawling → "Indexing… N items"; updating → "Updating index… N items"; idle → "Index: N items · M apps · updated 3 min ago"; failed → "⚠ Index failed —  | common | medium | TODO |
-| LC-08 | Config file made invalid (trailing comma) while JBar is running | With JBar running and a customised config, add a trailing comma to ~/.config/jbar/config.json and save. Wait >300 ms (ConfigWatcher debounce). Open the menu-bar menu. Then press ⌥Space and search. | Last-good config is kept (ConfigWatcher.reload → .invalid → onError, no applyConfig), the menu shows "⚠ Config error — Invalid config /path: …". The panel keeps working with the previous settings. Note the panel itself g | common | medium | TODO |
-| LC-11 | Hot-reload a new hotkey | Change "hotkey" to "cmd+shift+k" and save. Wait 300 ms. Press the old ⌥Space, then the new ⌘⇧K. Open the menu. | Old combo does nothing; new combo toggles the panel; the menu's "Open JBar" row shows "⌘⇧K"; the panel's hint row (empty query, no recents) also shows "⌘⇧K toggle". Covered by applyConfig lines 116-118. | common | medium | TODO |
-| LC-13 | Hot-reload maxResults / visibleRows / appsFirstCap with the panel open | Open the panel and type a query returning many rows. Without closing it, set "visibleRows": 3 then 25 then 0, and "maxResults": 100 then 0. Save each time. | Panel height changes live (settings didSet → applyHeight + runSearch, SearchPanel.swift:43-49). visibleRows is clamped to 1…20 (ResultsController.maxVisible didSet), maxResults clamped to ≥1 — no zero-height or screen-sw | common | medium | TODO |
-| LC-20 | Quit (or log out) while the first crawl is running | Clean state so a full crawl runs. 20-30 s in, choose Quit JBar from the menu. Relaunch and watch the menu status. | Relaunch should not start from zero. Today stop() cancels the crawl, so storeComplete stays false and writeSnapshotIfDirty's `guard dirty, storeComplete` (line 222) writes nothing — every interrupted first crawl is throw | common | medium | TODO |
-| LC-23 | Login item when JBar is NOT in /Applications | Run ./build/JBar.app (never installed). Open the menu, note the Launch at Login row, click it twice, then inspect ~/.config/jbar/config.json. | The row should be visibly unavailable. Today it shows the note "Launch at Login needs JBar in /Applications (run make install)" but the item is still enabled and clickable; each click flips config.launchAtLogin to true a | common | medium | TODO |
-| LC-25 | Indexed file deleted between the search and pressing Enter | Search for a file so it is the selected row. In a Terminal, `rm` that file. Without retyping, press ↩. Then press ⌘↩. Then press ⌘C and paste. | A clear "file no longer exists" signal and the row should drop out of the list. Today AppLauncher.open (line 27) and reveal (line 56) only NSSound.beep() and return false, so the panel stays open with the dead row still  | common | medium | TODO |
-| LC-26 | Discoverability of the keyboard shortcuts after the first use | Fresh install: open the panel, read the hint row, then open one file. Reopen the panel with an empty query. | The hint row is gone forever, because it only renders when the empty-query response has zero rows (SearchPanel.panelRows, line 308-315) and recents now fill it. Judge whether ⌘1-8, Tab autocomplete, ⌘↩, ⌘C, ⌘, and Ctrl+N | common | medium | TODO |
-| LC-09 | Config invalid at STARTUP (not hot-reload) | Customise the config (custom hotkey "cmd+shift+space", launchAtLogin:false, custom fileRoots), then corrupt the JSON, then quit and relaunch JBar. | JBar should keep working with defaults AND make the breakage obvious. Verify what actually changes: hotkey silently reverts to ⌥Space, fileRoots revert to ~ (full recrawl of everything the user had excluded), and launchA | edge | high | TODO |
-| LC-10 | Click "Launch at Login" while the config file on disk is invalid | Corrupt the config JSON, restart JBar (so config == Config.default in memory), then click the menu-bar item → Launch at Login. | The user's file must not be destroyed. Today toggleLoginItem writes the whole in-memory default config over the file (AppDelegate.swift:249), silently discarding the user's hotkey/roots/exclusions — and the "⚠ Config err | edge | high | TODO |
-| LC-12 | Hot-reload an unparseable or already-taken hotkey | Set "hotkey" to "", then to "banana+space", then to "option+space" while another app owns ⌥Space (e.g. run a second JBar copy first). Save each time and check the menu. | Each failure falls back to ⌃⌥Space, the menu shows "⚠ Hotkey unavailable — '<spec>' is not a valid hotkey; using ⌃⌥Space", and the "Open JBar" row shows ⌃⌥Space (AppDelegate.hotkeyDisplay, line 179). Verify the ⌃⌥Space f | edge | medium | TODO |
-| LC-15 | Config file deleted / moved aside while JBar is running | With a heavily customised config, run `mv ~/.config/jbar/config.json /tmp/` and wait 1 s, then `mv` it back. | ConfigWatcher.reload sees the file missing → Config.load returns .created(.default) → applyConfig(.default): the file is rewritten with defaults, the hotkey resets, and (because fileRoots/excludePaths changed) a FULL REC | edge | medium | TODO |
-| LC-17 | Crawl warnings survive a restart | Produce a state with denied folders (LC-16) or a hit item cap (LC-18) so the menu shows a ⚠ line. Quit JBar. Relaunch within 7 days so the snapshot is reused. | The ⚠ line should still be shown, because the index is still missing those folders / still truncated. Today the snapshot branch (IndexCoordinator.swift:107-111) only sets phase and lastBuilt, so deniedPaths/cappedDirs/hi | edge | medium | TODO |
-| LC-18 | Index hits maxIndexedItems | Set "maxIndexedItems": 5000 in the config, save, let the recrawl finish. Open the menu. Then search for a file you know is deep in a late-finishing root, and repeat the whole thing twice. | Menu shows "⚠ Index cap reached (5,000 items)". Check whether the message tells the user what to do (raise maxIndexedItems / narrow fileRoots) — it does not. Also check determinism: the global AtomicInt budget is claimed | edge | medium | TODO |
-| LC-21 | Quit immediately after opening a result (frecency flush) | Press ⌥Space, open a file, then within one second choose Quit JBar from the menu bar. Relaunch, press ⌥Space with an empty query. | The just-opened file appears in the recents list — AppLauncher debounces the frecency save by 1 s (saveDelay) and applicationWillTerminate calls launcher.flush() then frecency.save() (AppDelegate.swift:79-80). A regressi | edge | medium | TODO |
-| LC-22 | Two copies of JBar running at once | With /Applications/JBar.app running (login item), also run ./build/JBar.app/Contents/MacOS/JBar (or `open -n /Applications/JBar.app`). Check the menu bar, press ⌥Space several times, open a few files from each, quit one, | Only one instance should live, or the second should exit with a clear message. Today there is no guard (no LSMultipleInstancesProhibited in Resources/Info.plist, no NSRunningApplication check in AppDelegate): expect two  | edge | medium | TODO |
-| LC-24 | Login item state changed outside JBar | Install to /Applications, enable Launch at Login from JBar's menu (accept the approval prompt if macOS shows one). Then open System Settings › General › Login Items and turn JBar OFF. Return to JBar and open its menu. | Checkmark should be off. Today StatusMenu.menuNeedsUpdate (line 92) only rebuilds from the cached loginItemState, and nothing re-reads SMAppService.mainApp.status, so the checkmark stays on. Same staleness in the opposit | edge | medium | TODO |
-| LC-27 | Crawl progress counter actually moves | Clean state on a home directory with one dominant root (e.g. a big ~/projects). Open the menu-bar menu repeatedly during the crawl and record the "Indexing… N items" number every 2 s. Also search for a file in the big ro | The number should climb steadily. Today it only changes when a whole root finishes and is merged, so on a one-dominant-root home it can sit at roughly the app count for most of the crawl and then jump — and the searchabl | edge | medium | TODO |
-| LC-28 | showRecentsOnEmpty:false and useSpotlightFallback:true have no effect | Set "showRecentsOnEmpty": false, save, wait for the reload, press ⌥Space with an empty query. Separately set "useSpotlightFallback": true and search for something not in the index. | Recents should be suppressed / a Spotlight fallback should kick in. Both keys are written into every user's config by Config.default.save but are read nowhere: `grep -rn 'showRecentsOnEmpty\\|useSpotlightFallback' Source | edge | medium | **BROKEN** |
-| LC-29 | Snapshot invalidation paths | (a) Backdate the snapshot: touch -t with a date 8 days old on ~/Library/Caches/com.linji.jbar/index-v1.bin — actually change IndexStore.builtAt by letting a build age, or set the system clock forward 8 days — and relaunc | (a) fullRecrawlInterval exceeded → snapshot discarded → full crawl. (b) magic/schema/headerHash mismatch → Snapshot.read returns nil, no crash → full crawl. (c) headerHash covers exclusions + roots → mismatch → full craw | edge | medium | TODO |
-| LC-30 | Snapshot cannot be written (read-only or full cache directory) | chmod 500 ~/Library/Caches/com.linji.jbar (or point Snapshot at a read-only volume), let a crawl complete, then open the menu. | writeSnapshotIfDirty sets phase = .failed("snapshot write failed: …") → the menu shows "⚠ Index failed — snapshot write failed: …". Verify the app keeps searching normally with the in-memory index and that the phase even | edge | medium | TODO |
-| LC-19 | Pathological config values for the index caps | Set "maxIndexedItems": 0, then -1, then "maxDepth": 0, then -1. Save each and watch the crawl + menu. | No crash, no infinite loop. maxItems ≤ 0 should still leave the scanned apps searchable (they are added to the builder before the crawl and do not go through AtomicInt.reserve) while file items go to zero; the menu shoul | edge | low | TODO |
-| LC-31 | XDG_CONFIG_HOME handling on a GUI launch | Launch JBar from Finder (no shell env), then from a shell with XDG_CONFIG_HOME=/tmp/xdg, then with XDG_CONFIG_HOME="" and XDG_CONFIG_HOME=relative/path. Check where config.json lands and what ⌘, opens. | Absolute XDG_CONFIG_HOME is honoured; empty or relative values are ignored and ~/.config/jbar/config.json is used (Config.defaultURL, line 33-40) — a relative value must never resolve against "/" for a GUI-launched app. | edge | low | TODO |
-| LC-32 | Rebuild Index in demo mode is a silent no-op | JBAR_DEMO=1 ./build/JBar.app/Contents/MacOS/JBar, open the menu, click Rebuild Index and Launch at Login. | Both are enabled but do nothing (coordinator is nil at AppDelegate.swift:40, toggleLoginItem guards on !demo at line 239). Acceptable for a debug switch, but confirm nothing crashes and the status line stays coherent ("I | edge | low | TODO |
+Expected: Control alone neither closes the panel nor launches an item; input-source switching follows macOS; the field remains editable; the process/menu item remains alive; no crash report appears.
 
-## Actions & side effects
+### CHN-DEL — backward/forward Delete
 
-30 checks — 12 everyday, 18 edge; 17 failing when audited.
+1. Open the panel with an empty query and press Delete 20 times.
+2. Type `abcdef`, press Delete once, then hold Delete until empty.
+3. Type several Chinese syllables without committing. Press Delete repeatedly inside the marked text and candidate window.
+4. Commit Chinese text, then press Delete and hold Delete.
+5. Repeat with Fn-Delete/forward Delete on hardware that supports it.
 
-| # | Check | Do this | Expect | Kind | Sev | Status |
-|---|---|---|---|---|---|---|
-| ACT-01 | Open a document whose file was deleted after indexing | 1. Create ~/Desktop/audit-victim.pdf and open it once via JBar so it is indexed. 2. Quit JBar (so FSEvents cannot see the change), delete the file in Finder, relaunch JBar. 3. ⌥Space, type "audit-victim", press Enter on  | The user is told the item is gone (inline row such as "audit-victim.pdf no longer exists"), the dead row disappears from the list, and the item is dropped from the index/history. Today the ONLY feedback is NSSound.beep() | common | high | **BROKEN** |
-| ACT-13 | Every open records history and history.json stays bounded and intact | 1. Open 600 distinct files/apps through JBar over a session. 2. Inspect history.json size and entry count. 3. Force-kill JBar (kill -9) within 1 s of an open, relaunch, check the file still parses. | entries capped at 500 (lowest decayed f evicted), queryPicks capped at 200, file stays small, and a kill mid-write never corrupts it (write is temp+rename). At most the last <1 s of opens is lost because save() is deboun | common | high | OK |
-| ACT-22 | Open an app vs a folder vs a document vs a symlink to a folder | 1. Enter on /Applications/Safari.app. 2. Enter on ~/Documents (a folder row). 3. Enter on a .md file. 4. Enter on a symlink that points at a real folder. | App activates via openApplication with activates=true; folder and symlink-to-folder open a Finder window; document opens in its default app. All four record history. This is the happy path and should stay working after a | common | high | TODO |
-| ACT-28 | Rapid typing in normal search never applies a stale response | 1. ⌥Space and type an 8-character query as fast as possible. 2. Watch for the list flickering back to an earlier, broader result set. | Only the newest response is rendered. Cancelled responses are ignored and any response older than the last applied one is dropped, so out-of-order completion on the concurrent worker queue is safe. | common | high | OK |
-| ACT-05 | Open a file whose type has no default application | 1. touch ~/Downloads/report.zzzqqq (no installed app claims .zzzqqq). 2. ⌥Space, type "~/Downloads/report", press Enter. | The user is told no application can open the file (macOS's own behaviour would be a chooser). Today NSWorkspace.shared.open returns false for a type LaunchServices cannot bind, so JBar beeps, the panel stays open, and no | common | medium | TODO |
-| ACT-06 | Empty query recents after deleting the files you used to open | 1. Open 10 files from ~/Downloads through JBar so they enter history.json. 2. Delete all 10 in Finder. 3. ⌥Space with an empty query. | The next-best still-existing recents fill the list and the dead entries leave history.json. Today the dead paths are never removed — FrecencyStore.prune(exists:) has zero callers in the whole of Sources — so they permane | common | medium | **BROKEN** |
-| ACT-09 | Path mode into a directory JBar has no permission to read | 1. On a fresh install (before granting Files & Folders access), ⌥Space and type "~/Documents/". 2. Also try a nonexistent directory "~/Doesnotexist/", an empty directory, and a path to a FILE with a trailing slash ("~/no | Four distinguishable outcomes (permission needed / no such directory / directory is empty / not a directory). Today all four render the identical row "No matches for "~/Documents/"" because listDirectory swallows the err | common | medium | **BROKEN** |
-| ACT-10 | ⌘C copy path immediately after reopening with restoreQueryOnReopen enabled | 1. Set "restoreQueryOnReopen": true in ~/.config/jbar/config.json. 2. ⌥Space, type "design", ⌥Space to hide, ⌥Space to reopen (the query is restored and auto-selected). 3. Press ⌘C and paste. | The selected row's POSIX path is on the clipboard (that is what the hint row advertises: "⌘C copy path"). Today show() selects the whole query, so hasTextSelection is true and ⌘C falls through to the field editor: the cl | common | medium | **BROKEN** |
-| ACT-11 | Setting showRecentsOnEmpty:false to stop recents leaking file names | 1. Edit ~/.config/jbar/config.json (the file JBar itself wrote) and set "showRecentsOnEmpty": false. 2. Save; the config watcher hot-reloads (menu-bar shows no error). 3. ⌥Space with an empty query. | No recently-opened files are listed. Today the list of recently-opened paths still appears on every panel open — the key is decoded, defaulted, encoded and documented in DESIGN.md §7.6 but read by nothing. | common | medium | **BROKEN** |
-| ACT-16 | "~" alone, "/" alone, "//", trailing space, leading space | Type each of: "~", "~/", "/", "//", "///", "/ " (trailing space), " /etc" (leading space), "~/My Folder " (trailing space on a real folder name). | "~" and "~/" list the home directory; "/", "//", "///" and "/ " all list the volume root; " /etc" lists / filtered by "etc". A trailing space is trimmed, so "~/My Folder " lists home filtered by "My Folder" rather than d | common | medium | OK |
-| ACT-23 | Open an .app that lives inside an ordinary folder (not /Applications) | 1. Put a real, working app bundle at ~/Downloads/Tools/SomeApp.app. 2. Reach it two ways: (a) fuzzy search "SomeApp", (b) path mode "~/Downloads/Tools/". 3. Press Enter in each case. | Identical behaviour both ways: the app launches and comes to the front. Both routes classify it .app (path mode via isPackage, search via the index), so both take the openApplication branch. Check that a quarantined/unsi | common | medium | TODO |
-| ACT-21 | ⌘C copy path for names with spaces, quotes, and non-ASCII | 1. Create ~/Downloads/"My Report (v2) 'final' \"draft\".pdf" and ~/Downloads/中文 文档.txt. 2. Select each in JBar, press ⌘C, paste into a text editor and into Terminal. | The exact POSIX path lands on the clipboard, byte-for-byte, for both. It is deliberately NOT shell-quoted, so pasting into Terminal will break on the spaces and quotes — acceptable for a path copy, but worth a documented | common | low | TODO |
-| ACT-02 | Open a folder that is named *.app but is not an app bundle | 1. mkdir ~/Downloads/Recovered.app (an ordinary, empty directory). 2. ⌥Space, type "~/Downloads/" and select the Recovered row (it renders as "Recovered" with the app kind, .app stripped). 3. Press Enter. | Either it opens in Finder as the plain folder it is, or the user is told the bundle is not launchable. Today the panel hides instantly, nothing launches, and history records a successful open of a path that never opened. | edge | high | **BROKEN** |
-| ACT-03 | Open a regular file whose name ends in .app | 1. touch ~/Downloads/notes.app (a zero-byte regular file). 2. ⌥Space, type "~/Downloads/notes", press Enter. | Opened with the default handler for the file, or an error. Today AppLauncher treats it as an application because of the path-suffix test even though row.kind is .other (ItemKind.forExtension("app") returns .other), so op | edge | medium | **BROKEN** |
-| ACT-04 | Open a broken symlink surfaced by path mode | 1. ln -s /nonexistent/target ~/Downloads/dead-link 2. ⌥Space, type "~/Downloads/" — dead-link is listed as an ordinary file row. 3. Press Enter on it. | A message that the link target is missing. Today: beep only, row stays, repeated Enter keeps beeping with no explanation. | edge | medium | **BROKEN** |
-| ACT-07 | Panel opens while a network volume is stalled | 1. Open a few files that live on an SMB/AFP mount or an external drive so they enter history. 2. Put the drive to sleep / disconnect the network without unmounting. 3. ⌥Space (empty query). | The panel appears instantly. Today the empty-query path runs recents() ACTOR-ISOLATED with no worker hop, issuing up to ~2-3 blocking stat() calls per candidate for up to `maxResults*2` = 80 candidates; each stat on a st | edge | medium | **BROKEN** |
-| ACT-08 | Path mode into a 100k-entry directory | 1. Point at a directory with ~100000 entries (e.g. a node_modules cache or a generated corpus). 2. ⌥Space, type the directory path ending in "/", then type a 6-character filter at normal typing speed. 3. Watch responsive | Each keystroke narrows the list smoothly. Today every keystroke starts a FULL uncancellable directory scan on a CONCURRENT queue, so six keystrokes run six ~1 s scans in parallel; the 0.3 s loading timer collapses the pa | edge | medium | **BROKEN** |
-| ACT-12 | Open a file reached through a ".." path segment | 1. ⌥Space, type "~/Documents/../Downloads/" — the listing works (the kernel resolves ".."). 2. Enter on a file, e.g. invoice.pdf. 3. Quit JBar and inspect ~/Library/Application Support/JBar/history.json. 4. Reopen JBar a | History records the canonical /Users/me/Downloads/invoice.pdf and the normal search gets the frecency boost. Today it records /Users/me/Documents/../Downloads/invoice.pdf — a second, permanent, non-canonical entry that n | edge | medium | **BROKEN** |
-| ACT-20 | ⌘↩ reveal a file at the root of a mounted volume | 1. Mount a USB volume and put report.pdf at /Volumes/USB/report.pdf. 2. Search for it, press ⌘↩. 3. Repeat after ejecting the volume. | Mounted: Finder opens /Volumes/USB with report.pdf selected. Ejected: an explanation. Today the ejected case gives beep-only (same silent-failure family as ACT-01) — reveal shares the fileExists guard and has no error su | edge | medium | TODO |
-| ACT-27 | Extension-only query surfaces the PDF you actually use | 1. Index a home directory containing more than 300 PDFs. 2. Repeatedly open one whose filename is long (~40 chars) and whose mtime is old, so its frecency is the highest of any PDF. 3. Type ".pdf". | The frequently-opened PDF is at or near the top. Today it may not appear at all: in extension-only mode every candidate carries identical MatchFacts, so the stage-1 300-item window is decided purely by kind/flags/depth/m | edge | medium | **BROKEN** |
-| ACT-14 | Path-mode opens pollute the 200-entry query-pick memory | 1. Train JBar: search "xc" → Enter on Xcode, ten times (queryPicks["xc"] = Xcode). 2. Use path mode heavily: browse and open 200 different files by typing "~/…/…" paths. 3. Search "xc" again. | The "xc" → Xcode pick survives. Today each path-mode open writes the whole typed path (e.g. "~/downloads/inv") as a query-pick key, and 200 of them evict every real search pick from the LRU. Those path keys can never be  | edge | low | **BROKEN** |
-| ACT-15 | ".." as a path-mode filter (go up one level) | 1. ⌥Space, type "~/Documents/" then type ".." so the query is "~/Documents/..". | Navigate to the parent, or at least show nothing surprising. Today filter=".." starts with a dot, so dotFilter flips on and the list shows ONLY hidden dot-entries of ~/Documents fuzzy-matched against ".." — the most natu | edge | low | **BROKEN** |
-| ACT-17 | Extension-only query boundaries: ".", ".x", ".pdf", ".PDF", ".pdfpdfpd", ".pdfpdfpdf", "..", ".p df" | Type each string and observe the mode badge and results. | ".pdf"/".PDF" → extension mode on "pdf" (+ jpg/jpeg, doc/docx and friends via aliases). ".x" → extension mode on "x" (0 results when nothing is indexed with that extension → "No matches for ".x""). ".pdfpdfpd" (8 chars a | edge | low | OK |
-| ACT-18 | Queries that are only whitespace or only punctuation | Type "   " (three spaces), then a non-breaking space alone, then "!!!", then ".". | Whitespace-only (including NBSP, which Foundation treats as whitespace) trims to empty → recents/hint, no scan. "!!!" and "." are literal byte searches — no crash, but "." matches essentially every file with an extension | edge | low | OK |
-| ACT-19 | Query with 7 or more terms | Type "a b c d e f g h" (or a realistic 8-word sentence) and look at whether the results honour the last words. | All typed words constrain the results, or the UI shows that only 6 are used. Today terms 7+ are dropped from `terms` and from `mask`, so the AND filter ignores them — items that contain none of the last two words still r | edge | low | **BROKEN** |
-| ACT-24 | ⌘1…⌘8 after scrolling a long path-mode list | 1. ⌥Space, type a directory path with more than 8 entries. 2. Scroll or arrow down so rows 9-16 are the visible ones. 3. Press ⌘3. | Unambiguous mapping. Today ⌘3 opens the 3rd result overall, not the 3rd VISIBLE row, and no row displays its number, so after scrolling the shortcut opens something the user cannot see. With maxResults defaulting to 40 a | edge | low | **BROKEN** |
-| ACT-25 | ⌘1…⌘8 on a non-US keyboard layout | 1. Switch macOS input to French AZERTY (digits require Shift). 2. ⌥Space, run a query, press ⌘1. | The documented ⌘N shortcut opens row N. Today the handler reads charactersIgnoringModifiers (which yields "&" for that physical key on AZERTY) and bails out earlier on `!flags.contains(.shift)`, so ⌘1…⌘8 is simply unavai | edge | low | TODO |
-| ACT-26 | Tab autocomplete into a package (.photoslibrary, .xcodeproj, .rtfd) | 1. ⌥Space, type "~/Pictures/" and select Photos Library.photoslibrary. 2. Press Tab. | A deliberate decision. Today Tab descends INTO the package and lists its internals, because autocompleteTarget only excludes rows whose kind is .app or whose path ends ".app" — every other bundle is treated as an ordinar | edge | low | TODO |
-| ACT-29 | Config hot-reload of maxResults/visibleRows while the panel is open | 1. ⌥Space with a query showing results. 2. Without closing the panel, edit ~/.config/jbar/config.json to visibleRows: 3 and maxResults: 100. 3. Save. | The panel re-runs the query and resizes to 3 visible rows with up to 100 scrollable results. Note the defaults are maxResults 40 / visibleRows 8, so the search `limit` reaching SearchEngine is 40 (and path mode's cap is  | edge | low | TODO |
-| ACT-30 | Corrupt history.json is not silently destroyed | 1. Quit JBar. Truncate ~/Library/Application Support/JBar/history.json mid-JSON (simulating a disk-full or filesystem event). 2. Launch JBar, open one item, quit. 3. Inspect the file. | The user is told history was reset, or the damaged file is kept as history.json.bak. Today load() logs to os_log and starts empty, and the very next debounced save() overwrites the damaged file with a one-entry store — m | edge | low | **BROKEN** |
+Expected: editing is owned by AppKit/IME; no Delete variant closes or crashes JBar; search results follow committed/current field text; empty-result transitions do not throw an AppKit range exception.
 
----
+### CHN-ESC — composition before panel dismissal
 
-## Known open defects
+1. Start a multi-syllable Pinyin composition and show the candidate window.
+2. Press Escape once.
+3. If marked text remains, press Escape again as needed until the IME finishes/cancels it.
+4. With no marked text left, press physical Escape.
 
-27 issues confirmed by an independent verification pass and **not** fixed in this pass — mostly low-severity polish and error-reporting gaps. Contributions welcome.
+Expected: Escape is first available to the IME. JBar closes only on a physical unmodified Escape when no marked text exists. A candidate-window focus/resign transition must not dismiss or terminate the process.
 
-| Where | Issue | Severity |
-|---|---|---|
-| `SearchPanel.swift:392` | ⌘1…⌘8 (and ⌘,) are dispatched on charactersIgnoringModifiers, which is keyboard-layout dependent, so the digit shortcuts silently do not exist on AZERTY and similar layouts. | medium |
-| `SearchPanel.swift:215` | topEdge is captured once per show() and every later applyHeight() forces origin.y = topEdge - h, but nothing observes NSApplication.didChangeScreenParametersNotification, so after a dis | medium |
-| `CarbonHotkey.swift:50` | The hotkey-conflict machinery (eventHotKeyExistsErr -> fallback -> '⚠ Hotkey unavailable' warning) does not fire for the case it was written for: RegisterEventHotKey returns noErr when  | medium |
-| `IndexCoordinator.swift:153` | IndexCoordinator.update(options:) synchronously blocks its caller on the index queue BEFORE requesting cancellation, so a config hot-reload during a crawl freezes the main thread for th | medium |
-| `AppDelegate.swift:249` | Toggling Launch at Login persists the whole in-memory config, so after a startup config-parse failure it overwrites the user's file with defaults. | medium |
-| `AppDelegate.swift:49` | A config parse error at startup silently re-enables the login item, because the fallback config uses launchAtLogin's default of true. | medium |
-| `IndexCoordinator.swift:107` | Loading a snapshot restores the item counts but not the crawl warnings, so "folders not accessible" and "index cap reached" silently vanish after a restart while the index is still inco | medium |
-| `StatusMenu.swift:180` | The "Some folders not accessible — Fix…" action opens System Settings but nothing ever re-crawls after the user grants access. | medium |
-| `SearchEngine.swift:136` | The empty-query recents path runs actor-isolated with no worker hop, doing up to ~240 blocking stat() calls on the same actor that serves every keystroke. | medium |
-| `SearchEngine.swift:315` | In extension-only mode the 300-item stage-1 window is selected by a key that carries no text score and no frecency, so the stage-2 frecency boost can only reorder within an essentially  | medium |
-| `RowView.swift:41` | IconCache has no invalidation: it is keyed by path with no TTL, and IconCache.clear() has zero callers despite its doc comment promising an appearance-change hook. | low |
-| `RowView.swift:120` | File names containing control characters (newline, tab - both legal on APFS) are truncated at the first newline, hiding the rest of the name behind an ellipsis even though the row is ne | low |
-| `SearchPanel.swift:289` | apply() has no isVisible guard, so a search response that lands after the panel was hidden repopulates the results list behind the user's back and is drawn on the next open. | low |
-| `SearchPanel.swift:424` | Every keystroke re-lays out the whole single-line query field on the main thread, so a long pasted query freezes the panel for hundreds of milliseconds per key. | low |
-| `ResultsTable.swift:120` | ⌘1…⌘8 address result ordinals in the full 40-row pool rather than the rows currently on screen, so the digits can open items the user cannot see. | low |
-| `AppDelegate.swift:117` | Once the configured hotkey fails and JBar falls back to ⌃⌥Space, there is no retry path — applyConfig re-registers only when the hotkey string itself changes, and CarbonHotkey.register  | low |
-| `SearchPanel.swift:145` | show() orders the panel in at the previous (empty, 68pt) height and only resizes once the async search returns, so every invocation flashes a bare input bar before the results appear —  | low |
-| `StatusMenu.swift:92` | menuNeedsUpdate rebuilds from a cached login-item state and never re-reads SMAppService status, so the Launch at Login checkmark goes stale. | low |
-| `Info.plist:16` | No single-instance guard: two JBar processes can run simultaneously and both write the same snapshot and history files with unsynchronised whole-file writes. | low |
-| `AppDelegate.swift:238` | Outside /Applications the Launch at Login menu item is a dead but clickable control that persists a value contradicting reality and can never be turned off. | low |
-| `AppDelegate.swift:179` | hotkeyDisplay falls back to the configured combo when nothing is registered, so the menu and the first-run hint row advertise a shortcut that does nothing. | low |
-| `AppLauncher.swift:32` | App launches are routed by path suffix and their failure is asynchronous and unhandled, so a failed launch hides the panel, gives no feedback, and is recorded in history as a successful | low |
-| `AppLauncher.swift:29` | Every failed action (missing path, broken symlink, no default application) reports itself only with NSSound.beep() — there is no UI surface for launcher errors at all. | low |
-| `SearchEngine.swift:417` | Path-mode directory listing has no cancellation and runs on a concurrent queue, so every keystroke launches a full uncancellable directory scan that always runs to completion. | low |
-| `SearchEngine.swift:420` | listDirectory swallows every directory error with `try?`, so permission-denied, nonexistent, not-a-directory and genuinely-empty all render the identical "No matches for …" row. | low |
-| `SearchEngine.swift:450` | Path-mode rows are built by string concatenation without standardising the base, so a query containing ".." produces non-canonical paths that split frecency history and defeat the frece | low |
-| `AppLauncher.swift:84` | The raw query is used as the frecency query-pick key even in path mode, so browsing paths evicts every real search pick from the 200-entry LRU with keys that can never be matched again. | low |
+### CHN-CMD — shortcuts during composition
+
+1. Start marked Pinyin text.
+2. Exercise the input method's candidate navigation/selection commands, including any Command-modified binding it uses.
+3. After committing, verify Return, ⌘Return, ⌘C, and physical ⌘1...⌘8 perform their documented JBar actions.
+
+Expected: while text is marked, commands are returned to AppKit/IME and JBar does not open the wrong row. After commit, launcher shortcuts work normally.
+
+For every failure, record whether it occurs on key-down or key-up, whether text is marked, the active input source ID, and whether the process exited, hung, or merely hid the panel.
+
+## 4. Input-source and keyboard-layout matrix
+
+Repeat the Control/Delete/Escape/commit/navigation core for each required input source:
+
+| ID | System/input source | Required additions | Current release evidence |
+|---|---|---|---|
+| IME-ZH-01 | Simplified Chinese Pinyin | full CHN suite; candidate-number selection; NFC/NFD filename search | Physical pending |
+| IME-ZH-02 | Shuangpin | marked text, Delete, Escape, candidate selection | Physical pending |
+| IME-ZH-03 | Wubi | marked text, Delete, Escape, commit | Physical pending |
+| IME-KO-01 | Korean 2-Set | compose/decompose syllables, held Delete, focus change | Physical pending |
+| IME-JA-01 | Japanese Romaji | conversion candidates, Escape stages, Return commit vs open | Physical pending |
+| IME-JA-02 | Japanese Kana | direct Kana entry, Delete, candidate commands | Physical pending |
+| KEY-US-01 | US | all documented shortcuts | Physical pending |
+| KEY-FR-01 | French AZERTY | physical ⌘1...⌘8 and configured physical-letter hotkey | Physical pending |
+| KEY-DE-01 | German QWERTZ | Y/Z position expectations and physical digits | Physical pending |
+| KEY-DV-01 | Dvorak | physical hotkey position and physical digits | Physical pending |
+
+For each non-US layout, explicitly state that hotkey letter/digit tokens mean US-ANSI **physical positions**, not the glyph currently printed by the input source. Verify that switching sources does not move the registered shortcut.
+
+Run at least one English system-language session, one Simplified Chinese system-language session, and one RTL system-language smoke. JBar's own UI is expected to remain English in v1; the purpose is layout/input safety, not a translation claim.
+
+## 5. Viewport, scrolling, and visual review
+
+### VIEW-POOL — pool versus viewport
+
+1. Set `maxResults: 40`, `visibleRows: 8`, then search for a term with more than 40 matches.
+2. Confirm exactly eight full rows are visible plus a next-row peek when overflow exists.
+3. Use arrows/trackpad to reach results beyond row eight.
+4. Use Page Down/Up and confirm movement is eight rows.
+5. Scroll away from the top and press ⌘1; confirm it targets result 1 overall, not the first currently visible row.
+
+Expected: the 40-row result pool remains navigable while the window height remains an eight-row viewport. The shortcut's pool-relative behavior is explicit and must not be mistaken for a visible-row shortcut.
+
+### VIEW-CONFIG — supported heights and hot reload
+
+Repeat with `visibleRows` 1, 3, 8, 12, and 20. Change the value while the panel is open and a query is active.
+
+Expected: panel, table, peek, and page stride reflow together; selection stays valid; query text is unchanged. Invalid 0/21 values are rejected and the last valid configuration remains active.
+
+### VIEW-SHORT — small/multiple displays
+
+1. Use the smallest required built-in/scaled resolution and set `visibleRows: 20`.
+2. Open on `screen: mouse`, then test `main` and `active`.
+3. Move between Retina/non-Retina displays and change resolution while the panel is open.
+
+Expected: the screen-limited effective row count controls height and Page Down together; the window stays inside the visible frame; widths never become negative; overflow remains discoverable.
+
+### VIEW-A11Y — appearance and assistive technology
+
+Capture evidence in light/dark appearance, Reduce Transparency, Increase Contrast, and Reduce Motion. Check long Latin/CJK/RTL filenames, long parent paths, PATH count badges, focus/selection contrast, and 200% zoomed screenshots. Perform a VoiceOver keyboard smoke for the query field, result name/kind/path, and PATH completeness label.
+
+Any visual issue gets a screenshot plus OS/display settings. UI review is iterative: fix, rerun the same cell, then run adjacent appearance/display cells before accepting it.
+
+## 6. Recents, localization, and action correctness
+
+### RECENT-OFF
+
+1. Successfully open several files through JBar.
+2. Set `showRecentsOnEmpty: false` and hot reload.
+3. Start a slow non-empty query, immediately clear the field, and wait for the old query to finish.
+
+Expected: only the hint/indexing row appears; no prior or stale result paints later. Confirm `history.json` still exists—this setting hides, not deletes, history.
+
+### RECENT-PRUNE
+
+1. Successfully open one persistent fixture and one temporary fixture.
+2. Quit JBar, delete only the temporary fixture, then relaunch.
+3. Open with an empty query and inspect a redacted copy of history locally.
+
+Expected: startup pruning runs off the UI path, removes the missing target and any query pick pointing to it, persists the result, and keeps the existing target.
+
+### APP-LOCALIZED
+
+1. Under English and Simplified Chinese system languages, choose several apps whose Finder names differ by locale.
+2. Compare Finder's displayed app name with the JBar row.
+3. Search by the displayed localized name, bundle filename, plist name, another bundled localized name, pinyin full form, and initials where applicable.
+
+Expected: the row follows Finder's current display name; aliases find the same bundle path; highlights align with the displayed string. JBar's own badges/messages remain English.
+
+### OPEN-CONFIRM
+
+1. Open a known working application and verify it activates.
+2. Trigger a controlled invalid/nonlaunchable `.app` fixture.
+3. Test a document, folder, missing stale item, Reveal, and Copy Path.
+
+Expected: app history/panel dismissal happens only after LaunchServices confirms success. Failed or missing opens stay unrecorded and keep the panel available (current feedback may be only a beep). File/folder success records normally. Copy Path places the exact unquoted POSIX path on the general pasteboard, including spaces and non-ASCII.
+
+## 7. Path-mode product checks
+
+### PATH-COMPLETE
+
+Test a readable empty directory, one-entry directory, missing directory, regular file with a trailing slash, and a genuinely unreadable/protected directory.
+
+Expected: readable empty is an exact zero; unreadable, missing, not-a-directory, or budget-limited scans show “Folder scan incomplete” with `PATH · ?`, not “No matches.”
+
+### PATH-BOUNDED
+
+1. Browse a directory with more entries than `maxResults × 4`.
+2. Test unfiltered, common prefix, selective, fuzzy, and `.` hidden-entry filters.
+3. Type and delete quickly while enumeration is running.
+
+Expected: prefix group precedes fuzzy; fuzzy score precedes folder preference except at equal score; ties are deterministic; only the bounded best rows are retained; `PATH · shown/total` exposes truncation; newer queries cancel old scans and partial rows never flash.
+
+Use the explicit isolated distribution when recording latency:
+
+```bash
+JBAR_RUN_PATH_BENCHMARK=1 swift test -c release \
+  --filter PathModeStreamingTests/testPathModeTwentyThousandIsolatedReleaseBenchmark
+```
+
+The semantic and catastrophic-regression gates remain automated, but the older local timing distribution is not current-candidate evidence. Re-run this command on the candidate and retain every sample; do not copy values from another machine or source state.
+
+## 8. Performance and soak
+
+Run the reproducible harness without selecting a best run:
+
+```bash
+scripts/benchmark-release.sh 100
+JBAR_BENCHMARK_INCLUDE_REAL=1 scripts/benchmark-release.sh 100
+```
+
+The current local release-mode record uses report schema 1, workload 2, and fixture generator 2. It ran 300k, 500k, and 1M fixtures in three sequential independent processes per size with 100 observations per full-scan/sequence/supersession cell. The opt-in real crawl was disabled for this formal campaign. Every response expected to complete had to be complete and non-cancelled; deliberately superseded older requests had to cancel. Repeated queries across cold/warm/typing/deletion/supersession had to preserve the complete ordered rows and exact total. The harness also required cross-process corpus/history/config/workload identity plus source/tool/binary/checksum manifests.
+
+On the recorded Apple M4 Mac16,12 / 16 GiB / macOS 26.5.2 machine, the synthetic ranges were:
+
+| items | cold `x` p50 range | serial typing `r` p50 range | newest supersession p50 range | cancellation correctness |
+|---:|---:|---:|---:|---:|
+| 300k | 42.730–44.183 ms | 66.936–70.446 ms | 10.750–12.500 ms | older 300/300 cancelled; newest 0 unexpected |
+| 500k | 75.180–76.676 ms | 117.441–119.675 ms | 19.473–21.937 ms | older 300/300 cancelled; newest 0 unexpected |
+| 1M | 154.645–155.734 ms | 240.641–241.884 ms | 43.461–44.741 ms | older 300/300 cancelled; newest 0 unexpected |
+
+The complete p95/p99/max distributions and retained high-tail samples live in the evidence reports; do not reduce the table to a best process. Older real-corpus figures are not current evidence because they used a different binary. These are local observational engine timings, not key-to-paint UI latency or a cross-machine SLA. The current evidence manifest is `c603de43…f43425`, and its immutable benchmark binary is `d8471508…03dbc`.
+
+For a two-hour soak, repeatedly open/hide, type/delete, switch input sources, rebuild, edit config atomically/in place, sleep/wake, attach/detach displays, and open items. Record peak/steady RSS, CPU/energy while idle and indexing, index generation/count, responsiveness, crash/hang reports, and state-file validity after force quit/relaunch. Define acceptance numbers before interpreting the output.
+
+## 9. OS, CPU, and release matrix
+
+The exact required combinations are in [SUPPORT.md](SUPPORT.md). At minimum the release record must contain runtime evidence for macOS 13 Ventura, 14 Sonoma, 15 Sequoia, and the current shipping macOS, across both `arm64` and `x86_64`. Cross-compiling or seeing both `lipo` slices is not Intel runtime evidence.
+
+For the exact downloaded ZIP on a clean Mac:
+
+```bash
+codesign --verify --deep --strict --verbose=2 JBar.app
+spctl --assess --type execute --verbose=4 JBar.app
+xcrun stapler validate JBar.app
+lipo -archs JBar.app/Contents/MacOS/JBar
+```
+
+Then test first launch, Gatekeeper with quarantine intact, protected-folder consent, hotkey conflict/fallback, login-item approval/relaunch, upgrade replacement, rollback after an injected install failure, and uninstall/purge. Do not use `xattr -d`/`xattr -dr` as an acceptance step.
+
+## 10. Evidence record template
+
+```text
+ID:
+Result: PASS | FAIL | BLOCKED
+Commit:
+Artifact SHA-256:
+Build/signing: debug | release-ad-hoc | Developer-ID-notarized
+macOS version/build:
+Mac model / CPU architecture:
+System language:
+Input source + physical layout:
+Display(s) + scaling:
+Accessibility appearance settings:
+Exact steps:
+Observed result:
+Process alive after test: yes/no
+New JBar crash/hang report: yes/no + path
+Screenshot/video/log (redacted) location:
+Issue/commit that resolves a failure:
+Reviewer/date:
+```
+
+A row can be called complete only when its required evidence levels are attached to the candidate commit/artifact. The current repository has meaningful automated coverage, a validated local v2 benchmark campaign, a local Universal 2 package gate, and a packaged synthetic AppKit lifecycle/event smoke. Those do not complete the physical Sequoia Chinese, remaining language/layout, native Intel/OS runtime, Developer ID, notarization, stapling, or Gatekeeper cells; they must remain visibly pending until actually performed on the exact candidate artifact.

@@ -6,12 +6,14 @@ import JBarCore
 ///
 /// The menu is rebuilt from the current state each time it opens (`menuNeedsUpdate`) and whenever
 /// state changes, so the status line is always fresh. The status item is retained by this object.
+@MainActor
 final class StatusMenu: NSObject, NSMenuDelegate {
     static let settingsFilesAndFoldersURL = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_FilesAndFolders")!
 
     // Actions wired by AppDelegate.
     var onOpen: (() -> Void)?
     var onRebuild: (() -> Void)?
+    var onClearHistory: (() -> Void)?
     var onToggleLoginItem: (() -> Void)?
     var onOpenConfig: (() -> Void)?
     var onQuit: (() -> Void)?
@@ -54,6 +56,8 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         rebuild()
         Log.menu.notice("status item installed")
     }
+
+    isolated deinit { NSStatusBar.system.removeStatusItem(item) }
 
     // MARK: - State updates
 
@@ -98,6 +102,7 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         for line in statusLines() { menu.addItem(line) }
         menu.addItem(.separator())
         menu.addItem(action(title: "Rebuild Index", selector: #selector(rebuildAction)))
+        menu.addItem(action(title: "Clear Search History…", selector: #selector(clearHistoryAction)))
         let login = action(title: "Launch at Login", selector: #selector(toggleLoginAction))
         login.state = loginItemState.enabled ? .on : (loginItemState.requiresApproval ? .mixed : .off)
         menu.addItem(login)
@@ -118,9 +123,16 @@ final class StatusMenu: NSObject, NSMenuDelegate {
     private func statusLines() -> [NSMenuItem] {
         var items: [NSMenuItem] = [disabled(statusText())]
         if !status.deniedPaths.isEmpty {
-            let fix = action(title: "⚠ Some folders not accessible — Fix…", selector: #selector(openFilesAndFoldersAction))
-            fix.toolTip = status.deniedPaths.joined(separator: "\n")
+            // Keep this actionable without copying private folder names into menu metadata (which
+            // accessibility tools and diagnostics may inspect). `deniedPaths` is intentionally a
+            // bounded sample rather than a total, so its size must not be presented as exact.
+            let fix = action(title: "⚠ Some folders not accessible — Fix…",
+                             selector: #selector(openFilesAndFoldersAction))
             items.append(fix)
+        }
+        if status.unsafeEntriesSkipped > 0 {
+            let count = status.unsafeEntriesSkipped
+            items.append(disabled("⚠ Skipped \(format(count)) unsafe filesystem entr\(count == 1 ? "y" : "ies")"))
         }
         if status.hitItemCap { items.append(disabled("⚠ Index cap reached (\(format(status.itemCount)) items)")) }
         if !status.cappedDirs.isEmpty { items.append(disabled("⚠ Skipped \(status.cappedDirs.count) very large folder\(status.cappedDirs.count == 1 ? "" : "s")")) }
@@ -147,6 +159,9 @@ final class StatusMenu: NSObject, NSMenuDelegate {
     /// Titles of all current menu items (for tests / debugging).
     var itemTitles: [String] { menu.items.map { $0.isSeparatorItem ? "-" : $0.title } }
 
+    /// Tooltips are exposed only to prove that private index paths never leak into menu metadata.
+    var itemToolTips: [String] { menu.items.compactMap(\.toolTip) }
+
     private func format(_ n: Int) -> String { numberFormatter.string(from: NSNumber(value: n)) ?? String(n) }
 
     private func action(title: String, keyHint: String? = nil, selector: Selector) -> NSMenuItem {
@@ -167,6 +182,7 @@ final class StatusMenu: NSObject, NSMenuDelegate {
 
     @objc private func openAction() { onOpen?() }
     @objc private func rebuildAction() { onRebuild?() }
+    @objc private func clearHistoryAction() { onClearHistory?() }
     @objc private func toggleLoginAction() { onToggleLoginItem?() }
     @objc private func openLoginSettingsAction() { LoginItem.openSettings() }
     @objc private func openConfigAction() { onOpenConfig?() }

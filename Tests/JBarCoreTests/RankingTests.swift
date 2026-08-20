@@ -104,6 +104,22 @@ final class RankingTests: XCTestCase {
         XCTAssertEqual(Ranking.depthPenalty(depth: -3, weights: w), 0)
     }
 
+    func testDepthPenaltyIsTotalForExtremePublicIntegers() {
+        var extreme = RankingWeights()
+        extreme.depthFree = Int.min
+        extreme.depthPerLevel = Int.max
+        extreme.depthCap = Int.max
+        XCTAssertEqual(Ranking.depthPenalty(depth: Int.max, weights: extreme), Int.max)
+
+        extreme.depthFree = Int.max
+        XCTAssertEqual(Ranking.depthPenalty(depth: Int.min, weights: extreme), 0)
+
+        extreme.depthFree = 0
+        extreme.depthPerLevel = Int.min
+        XCTAssertEqual(Ranking.depthPenalty(depth: Int.max, weights: extreme), 0,
+                       "a negative public penalty is normalized instead of becoming a score bonus")
+    }
+
     // MARK: - finalScore components
 
     func testFinalScoreBaselineIsTextPlusType() {
@@ -206,6 +222,41 @@ final class RankingTests: XCTestCase {
         // document: 100 + 60 + 8 + 64 (cap) + 30 + 12 (recency) − 6 (depth 7) − 30 − 10 + 30 + 20 + 30 + 20
         let s = score(facts, kind: .document, flags: [.junk, .dotName], depth: 7, mtime: mtime(age: 10), frecency: 1000, queryPick: 30)
         XCTAssertEqual(s, 100 + 60 + 8 + 64 + 30 + 12 - 6 - 30 - 10 + 30 + 20 + 30 + 20)
+    }
+
+    func testScoreAndComponentSumsSaturateInsteadOfOverflowing() {
+        var extreme = RankingWeights()
+        extreme.initialsExact = Int.max
+        extreme.typeApp = Int.max
+        extreme.frecencyCap = Int.max
+        extreme.junk = Int.max
+        extreme.dotName = Int.max
+        extreme.extMatch = Int.max
+        extreme.wholeToken = Int.max
+        extreme.wholePrefix = Int.max
+        extreme.pinyinInitialsExact = Int.max
+
+        let allMatches = MatchFacts(textScore: Int.max, exactName: true, initialsExact: true,
+                                    extMatched: true, wholeTokenMatch: true,
+                                    pinyinInitialsExact: true)
+        XCTAssertEqual(Ranking.flagPenalty(flags: [.junk, .dotName], weights: extreme), Int.max)
+        XCTAssertEqual(Ranking.matchBonuses(facts: allMatches, weights: extreme), Int.max)
+        XCTAssertEqual(
+            Ranking.finalScore(facts: allMatches, kind: .app, flags: [.junk, .dotName],
+                               depth: Int.max, mtime: 0, frecencyBoost: Int.max,
+                               queryPickBoost: Int.max, now: now, weights: extreme),
+            Int.max
+        )
+
+        extreme.initialsExact = Int.min
+        extreme.typeApp = Int.min
+        extreme.frecencyCap = Int.min
+        XCTAssertNoThrow(
+            Ranking.finalScore(facts: MatchFacts(textScore: Int.min, initialsExact: true),
+                               kind: .app, flags: [], depth: Int.min, mtime: 0,
+                               frecencyBoost: Int.min, queryPickBoost: Int.min,
+                               now: now, weights: extreme)
+        )
     }
 
     func testCustomWeightsAreHonoured() {
@@ -317,6 +368,9 @@ final class RankingTests: XCTestCase {
     func testGroupEdgeCases() {
         XCTAssertEqual(Ranking.group([], maxResults: 8, appsFirstCap: 5, isApp: isApp), [])
         XCTAssertEqual(Ranking.group(ordered(apps: 3, files: 3), maxResults: 0, appsFirstCap: 5, isApp: isApp), [])
+        XCTAssertEqual(Ranking.group(ordered(apps: 3, files: 3), maxResults: Int.min, appsFirstCap: Int.max, isApp: isApp), [])
+        XCTAssertEqual(Ranking.group(ordered(apps: 3, files: 3), maxResults: Int.max, appsFirstCap: Int.max, isApp: isApp).count, 6,
+                       "an extreme public-API limit is bounded by the available input")
         // Cap larger than maxResults behaves like cap == maxResults.
         XCTAssertEqual(Ranking.group(ordered(apps: 10, files: 10), maxResults: 3, appsFirstCap: 50, isApp: isApp).map(\.itemIndex), [0, 2, 4])
         // Cap 0 → files first, apps backfill only if files run out.

@@ -89,6 +89,16 @@ final class TextAnalyzerTests: XCTestCase {
         XCTAssertNil(TextAnalyzer.fileExtension(of: ".bashrc"))
         XCTAssertNil(TextAnalyzer.fileExtension(of: "Makefile"))
         XCTAssertNil(TextAnalyzer.fileExtension(of: "a.verylongextension"))
+        XCTAssertEqual(TextAnalyzer.fileExtension(of: "photo.😀😀😀"), "😀😀😀")
+        XCTAssertEqual(TextAnalyzer.fileExtension(of: "文档.数据表"), "数据表")
+        XCTAssertEqual(TextAnalyzer.fileExtension(of: "문서.데이터"), "데이터")
+        XCTAssertEqual(TextAnalyzer.fileExtension(of: "file.\u{301}txt"), "\u{301}txt",
+                       "the dot is a POSIX byte delimiter even when followed by a combining scalar")
+        XCTAssertNil(TextAnalyzer.fileExtension(of: "file.a \u{301}"),
+                     "a space byte remains invalid even when it joins a combining grapheme")
+        XCTAssertNil(TextAnalyzer.fileExtension(of: String(repeating: "a", count: SafetyLimits.maxNameUTF8Bytes + 1) + ".txt"))
+        XCTAssertNil(TextAnalyzer.fileExtension(of: "photo.😀😀😀😀😀😀😀😀😀"),
+                     "multilingual extensions keep eight Characters within a separate byte ceiling")
     }
 }
 

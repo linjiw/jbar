@@ -57,15 +57,15 @@ final class ResultsTableView: NSTableView {
 /// Owns the scroll view + table and the row model; exposes selection movement and click handling.
 /// Rows beyond `maxVisible` are reachable by scrolling (wheel/trackpad) and by moving the selection
 /// past the last visible row — a search returns `Config.maxResults` (40) rows but shows 8 at a time.
+@MainActor
 final class ResultsController: NSObject, NSTableViewDataSource, NSTableViewDelegate {
-    static let rowHeight: CGFloat = 48
+    nonisolated static let rowHeight = PanelLayoutMetrics.rowHeight
     /// Default number of rows visible without scrolling; overridden per-panel from `Config.visibleRows`.
-    static let defaultVisibleRows = 8
-    /// Rows visible without scrolling. Clamped to a sane range so a bad config cannot produce a
-    /// zero-height or screen-swallowing panel.
-    var maxVisible: Int = defaultVisibleRows {
-        didSet { maxVisible = min(max(1, maxVisible), 20) }
-    }
+    nonisolated static let defaultVisibleRows = 8
+    /// Effective rows visible on this screen, supplied by `PanelLayoutMetrics`. It is intentionally
+    /// read-only here so height, overflow and page movement cannot drift onto different values.
+    private(set) var maxVisible: Int = defaultVisibleRows
+    var pageStride: Int { maxVisible }
 
     let scrollView = NSScrollView()
     let table = ResultsTableView()
@@ -129,6 +129,13 @@ final class ResultsController: NSObject, NSTableViewDataSource, NSTableViewDeleg
     /// True when there are more rows than fit on screen (the user can scroll for the rest).
     var hasHiddenRows: Bool { rows.count > maxVisible }
 
+    /// Apply the panel's single layout decision. Selection is preserved across live config/screen
+    /// reflows and brought back into the newly sized viewport when possible.
+    func applyLayout(_ metrics: PanelLayoutMetrics) {
+        maxVisible = metrics.effectiveVisibleRows
+        scrollSelectionToVisible()
+    }
+
     /// Replace all rows, select the first result and scroll to the top.
     func setRows(_ newRows: [PanelRow]) {
         rows = newRows
@@ -187,6 +194,13 @@ final class ResultsController: NSObject, NSTableViewDataSource, NSTableViewDeleg
         select(selectable[next])
     }
 
+    /// Page by the same effective row count that sized the window. `direction` is reduced to its
+    /// sign so an unexpected large value cannot overflow multiplication.
+    func moveSelectionByPage(_ direction: Int) {
+        guard direction != 0 else { return }
+        moveSelection(by: direction < 0 ? -pageStride : pageStride, wrap: false)
+    }
+
     /// Select the first / last result row.
     func selectEdge(first: Bool) {
         let selectable = rows.indices.filter { rows[$0].isSelectable }
@@ -202,12 +216,19 @@ final class ResultsController: NSObject, NSTableViewDataSource, NSTableViewDeleg
         column.width = width
         table.frame.size.width = width
         table.sizeLastColumnToFit()
+        scrollSelectionToVisible()
     }
 
     private func select(_ i: Int) {
         guard i >= 0, i < rows.count, rows[i].isSelectable else { return }
         table.selectRowIndexes(IndexSet(integer: i), byExtendingSelection: false)
         table.scrollRowToVisible(i)
+    }
+
+    private func scrollSelectionToVisible() {
+        let selected = table.selectedRow
+        guard selected >= 0, selected < rows.count else { return }
+        table.scrollRowToVisible(selected)
     }
 
     private func hover(_ i: Int) {

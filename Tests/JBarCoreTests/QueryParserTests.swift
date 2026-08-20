@@ -105,6 +105,8 @@ final class QueryParserTests: XCTestCase {
         XCTAssertEqual(parse(".tar.gz").mode, .search)
         XCTAssertEqual(parse(".c++").mode, .search)
         XCTAssertEqual(parse(".env-local").mode, .search)
+        XCTAssertEqual(parse(".\u{0301}pdf").mode, .search,
+                       "a combining scalar after the dot is not an ASCII extension")
         // Dot in the middle → search.
         XCTAssertEqual(parse("report.pdf").mode, .search)
     }
@@ -189,12 +191,56 @@ final class QueryParserTests: XCTestCase {
         XCTAssertEqual(q.mode, .path(base: NSHomeDirectory(), filter: "x"))
     }
 
+    func testOversizedQueryIsBoundedBeforeAnalysis() {
+        let huge = String(repeating: "界", count: SafetyLimits.maxQueryCharacters + 10_000)
+        let q = parse(huge)
+        XCTAssertEqual(q.raw.count, SafetyLimits.maxQueryCharacters)
+        XCTAssertEqual(q.termStrings.first?.count, SafetyLimits.maxQueryCharacters)
+        XCTAssertLessThanOrEqual(q.wholeFolded.count, SafetyLimits.maxQueryCharacters * 3)
+
+        let exact = String(repeating: "a", count: SafetyLimits.maxQueryCharacters)
+        XCTAssertEqual(parse(exact).raw, exact, "the documented boundary is not truncated")
+
+        // One Character can itself contain unbounded combining marks. The byte ceiling must apply
+        // before Character segmentation so this adversarial shape cannot bypass the work limit.
+        let combining = "a" + String(repeating: "\u{0301}", count: SafetyLimits.maxQueryUTF8Bytes)
+        let boundedCombining = parse(combining).raw
+        XCTAssertLessThanOrEqual(boundedCombining.utf8.count, SafetyLimits.maxQueryUTF8Bytes + 3,
+                                 "a repaired split scalar may add at most one replacement character")
+    }
+
     // MARK: - Helpers
 
     func testSplitPathHelper() {
         XCTAssertEqual(QueryParser.splitPath("/a/b/c", home: home).base, "/a/b")
         XCTAssertEqual(QueryParser.splitPath("/a/b/c", home: home).filter, "c")
         XCTAssertEqual(QueryParser.splitPath("~", home: "/").base, "/")
+        XCTAssertEqual(QueryParser.splitPath("~/foo/bar", home: "/").base, "/foo")
+        XCTAssertEqual(QueryParser.splitPath("~/foo/bar", home: "/").filter, "bar")
+        XCTAssertEqual(QueryParser.splitPath("~/foo/", home: "/").base, "/foo")
+        XCTAssertEqual(QueryParser.splitPath("~/foo/", home: "/").filter, "")
+        XCTAssertEqual(QueryParser.splitPath("~/\u{301}目录/文件", home: "/").base, "/\u{301}目录")
+        XCTAssertEqual(QueryParser.splitPath("~/x", home: "/Users/test/").base, "/Users/test")
+        let decorated = QueryParser.splitPath("/safe/\u{301}file", home: home)
+        XCTAssertEqual(decorated.base, "/safe")
+        XCTAssertEqual(decorated.filter, "\u{301}file",
+                       "a POSIX slash stays a separator even when followed by a combining mark")
+    }
+
+    func testPathExpansionBoundsAndRejectsUnsafeProgrammaticHome() {
+        let fallback = QueryParser.normalizedHome(NSHomeDirectory())
+        let hostileHomes = [
+            String(repeating: "h", count: 1_000_000),
+            "relative/home",
+            "/bad\0\u{301}home",
+            "/safe/../escape",
+        ]
+        for hostile in hostileHomes {
+            let split = QueryParser.splitPath("~/x", home: hostile)
+            XCTAssertEqual(split.base, fallback)
+            XCTAssertEqual(split.filter, "x")
+            XCTAssertTrue(SafetyLimits.utf8Fits(split.base, maxBytes: SafetyLimits.maxPathUTF8Bytes))
+        }
     }
 
     func testExtensionOnlyHelper() {

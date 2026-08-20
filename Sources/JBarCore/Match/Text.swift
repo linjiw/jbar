@@ -231,9 +231,19 @@ public enum TextAnalyzer {
 
     /// Lowercase extension of a file name (no dot), or nil if none/too long/hidden-file-only.
     public static func fileExtension(of name: String) -> String? {
-        guard let dot = name.lastIndex(of: "."), dot != name.startIndex else { return nil }
-        let ext = name[name.index(after: dot)...]
-        guard !ext.isEmpty, ext.count <= 8, !ext.contains(" ") else { return nil }
-        return ext.lowercased()
+        guard SafetyLimits.utf8Fits(name, maxBytes: SafetyLimits.maxNameUTF8Bytes) else { return nil }
+        let bytes = Array(name.utf8)
+        guard let dot = bytes.lastIndex(of: 0x2E), dot > 0, dot + 1 < bytes.count else { return nil }
+        let extensionBytes = bytes[(dot + 1)...]
+        guard !extensionBytes.contains(0x20) else { return nil }
+        let ext = String(decoding: extensionBytes, as: UTF8.self)
+        guard ext.count <= SafetyLimits.maxExtensionCharacters,
+              SafetyLimits.isSafePathComponent(ext,
+                                               maxUTF8Bytes: SafetyLimits.maxExtensionUTF8Bytes) else { return nil }
+        let lowered = ext.lowercased()
+        guard lowered.count <= SafetyLimits.maxExtensionCharacters,
+              SafetyLimits.isSafePathComponent(lowered,
+                                               maxUTF8Bytes: SafetyLimits.maxExtensionUTF8Bytes) else { return nil }
+        return lowered
     }
 }

@@ -19,6 +19,7 @@ enum PanelRow: Equatable {
 }
 
 /// `NSWorkspace.icon(forFile:)` results keyed by path, capped at 500 entries (DESIGN.md §7.2).
+@MainActor
 enum IconCache {
     static let iconSize: CGFloat = 32
     private static let cache: NSCache<NSString, NSImage> = {
