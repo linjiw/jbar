@@ -57,7 +57,11 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         Log.menu.notice("status item installed")
     }
 
-    isolated deinit { NSStatusBar.system.removeStatusItem(item) }
+    deinit {
+        // StatusMenu is created and released by main-actor UI owners. Keep Swift 6.1 compatibility
+        // while preserving the required AppKit-thread cleanup.
+        MainActor.assumeIsolated { NSStatusBar.system.removeStatusItem(item) }
+    }
 
     // MARK: - State updates
 

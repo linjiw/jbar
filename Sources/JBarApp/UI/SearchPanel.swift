@@ -149,9 +149,13 @@ final class SearchPanel: NSPanel, NSTextFieldDelegate {
         installMonitors()
     }
 
-    isolated deinit {
-        if let m = keyMonitor { NSEvent.removeMonitor(m) }
-        observers.forEach { NotificationCenter.default.removeObserver($0) }
+    deinit {
+        // The panel and its monitors are main-actor owned. Swift 6.1 requires this explicit
+        // assertion because isolated deinitializers are not enabled there by default.
+        MainActor.assumeIsolated {
+            if let m = keyMonitor { NSEvent.removeMonitor(m) }
+            observers.forEach { NotificationCenter.default.removeObserver($0) }
+        }
     }
 
     override var canBecomeKey: Bool { true }

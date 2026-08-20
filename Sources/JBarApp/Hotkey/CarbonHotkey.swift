@@ -31,7 +31,11 @@ final class CarbonHotkey {
 
     init(handler: Handler? = nil) { self.handler = handler }
 
-    isolated deinit { unregister() }
+    deinit {
+        // Instances are main-actor owned for their entire lifetime. Swift 6.1 does not yet enable
+        // isolated deinitializers by default, so make that runtime invariant explicit here.
+        MainActor.assumeIsolated { unregister() }
+    }
 
     /// Register `modifiers` (Carbon bits: `cmdKey|optionKey|controlKey|shiftKey`) + `keyCode` (`kVK_*`).
     /// Any previous registration of this instance is released first. Returns the Carbon status;
