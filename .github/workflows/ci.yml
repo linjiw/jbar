@@ -55,7 +55,7 @@ jobs:
           tar -xzf "$tools/shellcheck.tar.gz" -C "$tools"
           actionlint="$tools/actionlint"
           shellcheck="$tools/shellcheck-v0.11.0/shellcheck"
-          test "$($actionlint -version)" = 1.7.12
+          test "$("$actionlint" -version | sed -n '1p')" = 1.7.12
           test "$($shellcheck --version | awk '/^version:/ {print $2}')" = 0.11.0
           find scripts -type f -name '*.sh' -print0 | xargs -0 "$shellcheck" -S warning
           "$actionlint" -shellcheck="$shellcheck" \
