@@ -49,6 +49,19 @@ final class AppScannerTests: XCTestCase {
         AppScanner.scan(roots: roots.map { $0.path }, extraBundles: extra, home: tempHome.path)
     }
 
+    /// Construct a deliberately non-existent boundary-test URL without routing the path through
+    /// the older Foundation file-system-representation initializer, which is limited by Darwin's
+    /// 1,024-byte `PATH_MAX` on the Xcode 16.4 compatibility runner. The byte assertion makes the
+    /// synthetic input fail at its construction site if a Foundation implementation rewrites it.
+    private func syntheticFileURL(_ absolutePath: String,
+                                  file: StaticString = #filePath,
+                                  line: UInt = #line) -> URL {
+        let url = URL(string: "file://" + absolutePath)!
+        XCTAssertTrue(url.isFileURL, file: file, line: line)
+        XCTAssertEqual(Array(url.path.utf8), Array(absolutePath.utf8), file: file, line: line)
+        return url
+    }
+
     // MARK: - scan
 
     func testScanFindsAppsWithCorrectFileNameDisplayNameBundleID() throws {
@@ -570,7 +583,7 @@ final class AppScannerTests: XCTestCase {
         let components = [String](repeating: "a", count: 1_800)
         let parent = "/" + components.joined(separator: "/")
         XCTAssertLessThan(parent.utf8.count, SafetyLimits.maxPathUTF8Bytes)
-        let app = ScannedApp(url: URL(fileURLWithPath: parent + "/Linear.app"),
+        let app = ScannedApp(url: syntheticFileURL(parent + "/Linear.app"),
                              displayName: "Linear", bundleID: nil, aliases: [], mtime: nil)
         let builder = IndexBuilder()
 
@@ -672,7 +685,7 @@ final class AppScannerTests: XCTestCase {
         XCTAssertEqual(overlongParent.utf8.count, 4_091)
         XCTAssertTrue(SafetyLimits.isSafeAbsolutePath(overlongParent))
         let blocked = ScannedApp(
-            url: URL(fileURLWithPath: overlongParent + "/Blocked.app"),
+            url: syntheticFileURL(overlongParent + "/Blocked.app"),
             displayName: "Blocked", bundleID: nil, aliases: [], mtime: nil
         )
         let valid = ScannedApp(url: URL(fileURLWithPath: "/Applications/Valid.app"),
@@ -699,8 +712,8 @@ final class AppScannerTests: XCTestCase {
         let valid = ScannedApp(url: URL(fileURLWithPath: "/Applications/Valid.app"),
                                displayName: "Valid", bundleID: nil, aliases: [], mtime: nil)
         let invalidComponent = ScannedApp(
-            url: URL(fileURLWithPath: "/" + String(repeating: "x", count: 1_025)
-                                     + "/Bad.app"),
+            url: syntheticFileURL("/" + String(repeating: "x", count: 1_025)
+                                  + "/Bad.app"),
             displayName: "Bad", bundleID: nil, aliases: [], mtime: nil
         )
         let invalidBuilder = IndexBuilder()
@@ -770,9 +783,9 @@ final class AppScannerTests: XCTestCase {
         XCTAssertEqual(nfcParent.utf8.count, 4_089)
         XCTAssertEqual(nfdParent.utf8.count, 4_090)
 
-        let first = ScannedApp(url: URL(fileURLWithPath: nfdParent + "/A.app"),
+        let first = ScannedApp(url: syntheticFileURL(nfdParent + "/A.app"),
                                displayName: "A", bundleID: nil, aliases: [], mtime: nil)
-        let mappedOverlong = ScannedApp(url: URL(fileURLWithPath: nfcParent + "/BB.app"),
+        let mappedOverlong = ScannedApp(url: syntheticFileURL(nfcParent + "/BB.app"),
                                         displayName: "BB", bundleID: nil,
                                         aliases: [], mtime: nil)
         let later = ScannedApp(url: URL(fileURLWithPath: "/Applications/Later.app"),
