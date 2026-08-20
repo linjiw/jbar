@@ -64,6 +64,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.panel.setQuery(query)
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
                 guard let self else { return }
+                for _ in 0..<Runtime.snapshotDown { self.panel.moveSelectionDownForSnapshot() }
                 let ok = self.panel.renderSnapshot(to: URL(fileURLWithPath: path))
                 Log.app.notice("snapshot '\(query, privacy: .public)' → \(path, privacy: .public) ok=\(ok)")
                 NSApp.terminate(nil)

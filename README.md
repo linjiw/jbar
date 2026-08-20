@@ -76,7 +76,7 @@ Press **⌥Space** and start typing:
 
 | Key | Action |
 |---|---|
-| `↑ ↓` / `⌃N ⌃P` | move selection |
+| `↑ ↓` / `⌃N ⌃P` | move selection (scrolls past the visible rows) |
 | `Return` | open |
 | `⌘Return` | reveal in Finder |
 | `⌘C` | copy path |
@@ -95,7 +95,8 @@ Hand-edit `~/.config/jbar/config.json` — created on first launch, hot-reloaded
 |---|---|---|
 | `hotkey` | `"option+space"` | e.g. `"cmd+shift+space"`, `"ctrl+option+space"` |
 | `launchAtLogin` | `true` | registers via `SMAppService` |
-| `maxResults` | `8` | rows shown |
+| `maxResults` | `40` | how many results a query returns — scroll to reach them |
+| `visibleRows` | `8` | rows visible without scrolling (panel height) |
 | `appsFirstCap` | `5` | max apps before files get their slots |
 | `fileRoots` | `["~"]` | what to index |
 | `excludeNames` / `excludePaths` | see [DESIGN.md](docs/DESIGN.md#43-exclude-list) | never descended |
@@ -127,7 +128,7 @@ Full architecture, the verified-API table, and the ranking spec: [`docs/DESIGN.m
 ## Development
 
 ```bash
-make test                       # 297 unit tests (~45 s)
+make test                       # 306 unit tests (~45 s)
 make test-release               # with optimization — enforces perf budgets
 make cli Q="visual studio"      # headless search with timings
 make bench                      # index size / build time / RSS

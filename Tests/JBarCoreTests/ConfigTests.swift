@@ -37,10 +37,11 @@ final class ConfigTests: XCTestCase {
     }
 
     func testPartialJSONUsesDefaults() throws {
-        let json = #"{"hotkey": "cmd+shift+k", "maxResults": 12}"#
+        let json = #"{"hotkey": "cmd+shift+k", "visibleRows": 12}"#
         let c = try Config.decode(Data(json.utf8))
         XCTAssertEqual(c.hotkey, "cmd+shift+k")
-        XCTAssertEqual(c.maxResults, 12)
+        XCTAssertEqual(c.visibleRows, 12)
+        XCTAssertEqual(c.maxResults, Config.default.maxResults)
         XCTAssertEqual(c.appsFirstCap, Config.default.appsFirstCap)
         XCTAssertEqual(c.fileRoots, ["~"])
         XCTAssertEqual(c.excludeNames, Exclusions.defaultExcludeNames)
@@ -321,11 +322,11 @@ final class ConfigTests: XCTestCase {
         Thread.sleep(forTimeInterval: 0.1)
         let fh = try FileHandle(forWritingTo: u)
         try fh.truncate(atOffset: 0)
-        try fh.write(contentsOf: Data(#"{"maxResults": 3}"#.utf8))
+        try fh.write(contentsOf: Data(#"{"visibleRows": 3}"#.utf8))
         try fh.close()
         wait(for: [exp], timeout: 3)
         rec.queue.sync {
-            XCTAssertEqual(rec.changes.last?.maxResults, 3)
+            XCTAssertEqual(rec.changes.last?.visibleRows, 3)
             XCTAssertTrue(rec.errors.isEmpty)
         }
     }
@@ -382,9 +383,9 @@ final class ConfigTests: XCTestCase {
         // Fixing the file fires onChange again (so the app can clear its warning).
         let exp2 = expectation(description: "fixed")
         rec.onChangeExpectation = exp2
-        try atomicReplace(u, #"{"maxResults": 5}"#)
+        try atomicReplace(u, #"{"visibleRows": 5}"#)
         wait(for: [exp2], timeout: 3)
-        rec.queue.sync { XCTAssertEqual(rec.changes.last?.maxResults, 5) }
+        rec.queue.sync { XCTAssertEqual(rec.changes.last?.visibleRows, 5) }
     }
 
     func testWatcherDebouncesBurst() throws {
@@ -399,13 +400,13 @@ final class ConfigTests: XCTestCase {
         exp.assertForOverFulfill = false
         rec.onChangeExpectation = exp
         for i in 1...5 {
-            try atomicReplace(u, #"{"maxResults": \#(i)}"#)
+            try atomicReplace(u, #"{"visibleRows": \#(i)}"#)
             Thread.sleep(forTimeInterval: 0.02)
         }
         wait(for: [exp], timeout: 3)
         Thread.sleep(forTimeInterval: 0.5)
         rec.queue.sync {
-            XCTAssertEqual(rec.changes.last?.maxResults, 5)
+            XCTAssertEqual(rec.changes.last?.visibleRows, 5)
             XCTAssertLessThanOrEqual(rec.changes.count, 2, "burst of 5 writes within 100 ms coalesces (got \(rec.changes.count))")
         }
     }
@@ -445,9 +446,9 @@ final class ConfigTests: XCTestCase {
         // The directory and file sources were re-armed on the new inodes: a later edit is still seen.
         let exp2 = expectation(description: "edit after re-creation")
         rec.onChangeExpectation = exp2
-        try atomicReplace(u, #"{"maxResults": 7}"#)
+        try atomicReplace(u, #"{"visibleRows": 7}"#)
         wait(for: [exp2], timeout: 3)
-        rec.queue.sync { XCTAssertEqual(rec.changes.last?.maxResults, 7) }
+        rec.queue.sync { XCTAssertEqual(rec.changes.last?.visibleRows, 7) }
     }
 
     func testWatcherStopIsIdempotentAndSilencesEvents() throws {
@@ -467,10 +468,10 @@ final class ConfigTests: XCTestCase {
         let exp = expectation(description: "after restart")
         rec.onChangeExpectation = exp
         Thread.sleep(forTimeInterval: 0.1)
-        try atomicReplace(u, #"{"maxResults": 4}"#)
+        try atomicReplace(u, #"{"visibleRows": 4}"#)
         wait(for: [exp], timeout: 3)
         w.stop()
-        rec.queue.sync { XCTAssertEqual(rec.changes.last?.maxResults, 4) }
+        rec.queue.sync { XCTAssertEqual(rec.changes.last?.visibleRows, 4) }
     }
 
     func testWatcherCreatesMissingDirectory() throws {

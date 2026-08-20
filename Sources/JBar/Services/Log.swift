@@ -27,6 +27,9 @@ enum Runtime {
     /// Used for visual verification in headless sessions.
     static var snapshotPath: String? { ProcessInfo.processInfo.environment["JBAR_SNAPSHOT_PATH"].flatMap { $0.isEmpty ? nil : $0 } }
     static var snapshotQuery: String { ProcessInfo.processInfo.environment["JBAR_SNAPSHOT_QUERY"] ?? "code" }
+    /// `JBAR_SNAPSHOT_DOWN=n` → move the selection down n rows before rendering, so a snapshot can show
+    /// the list scrolled past the visible window.
+    static var snapshotDown: Int { Int(ProcessInfo.processInfo.environment["JBAR_SNAPSHOT_DOWN"] ?? "") ?? 0 }
 
     /// Marketing version from the bundle's Info.plist, or a dev marker when run from the SwiftPM binary.
     static var version: String {

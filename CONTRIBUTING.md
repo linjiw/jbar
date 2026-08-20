@@ -8,7 +8,7 @@ below runs with the stock Xcode toolchain.
 ```bash
 git clone https://github.com/linjiw/jbar.git
 cd jbar
-make test      # 297 unit tests, ~45 s
+make test      # 306 unit tests, ~45 s
 make install   # build JBar.app and install it to /Applications
 ```
 

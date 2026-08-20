@@ -10,7 +10,10 @@ import JBarCore
 final class SearchPanel: NSPanel, NSTextFieldDelegate {
     /// The subset of `Config` the panel needs (+ the hotkey's display string for the hint row).
     struct Settings: Equatable {
-        var maxResults = 8
+        /// How many results to fetch — the scrollable pool.
+        var maxResults = 40
+        /// How many rows are visible without scrolling (the panel height).
+        var visibleRows = ResultsController.defaultVisibleRows
         var appsFirstCap = 5
         /// "mouse" | "main" | "active" — which screen the panel appears on.
         var screen = "mouse"
@@ -20,6 +23,7 @@ final class SearchPanel: NSPanel, NSTextFieldDelegate {
         init() {}
         init(config: Config, hotkeyDisplay: String) {
             maxResults = max(1, config.maxResults)
+            visibleRows = max(1, config.visibleRows)
             appsFirstCap = max(0, config.appsFirstCap)
             screen = config.screen
             restoreQueryOnReopen = config.restoreQueryOnReopen
@@ -37,7 +41,11 @@ final class SearchPanel: NSPanel, NSTextFieldDelegate {
 
     /// Live settings; changing them re-runs the current query when visible.
     var settings: Settings {
-        didSet { if settings != oldValue, isVisible { runSearch() } }
+        didSet {
+            guard settings != oldValue else { return }
+            results.maxVisible = settings.visibleRows
+            if isVisible { applyHeight(); runSearch() }
+        }
     }
     /// Answers queries (the engine, or the demo provider).
     var provider: SearchProviding
@@ -69,6 +77,9 @@ final class SearchPanel: NSPanel, NSTextFieldDelegate {
         self.settings = settings
         let rect = NSRect(x: 0, y: 0, width: Self.panelWidth, height: Self.inputRowHeight + Self.bottomPadding)
         super.init(contentRect: rect, styleMask: [.borderless, .nonactivatingPanel, .fullSizeContentView], backing: .buffered, defer: false)
+        // `didSet` does not fire for the assignment above (property observers are skipped during init),
+        // so seed the visible-row cap explicitly.
+        results.maxVisible = settings.visibleRows
         configureWindow()
         buildContent()
         installMonitors()
@@ -132,6 +143,7 @@ final class SearchPanel: NSPanel, NSTextFieldDelegate {
 
     /// Show the panel on the configured screen and run the current (usually empty) query.
     func show() {
+        results.armHover()   // the panel may appear under a stationary pointer
         placeOnScreen()
         applyHeight()
         orderFrontRegardless()
@@ -226,6 +238,9 @@ final class SearchPanel: NSPanel, NSTextFieldDelegate {
     }
 
     // MARK: - Snapshot (debug aid)
+
+    /// Move the selection down one result (`JBAR_SNAPSHOT_DOWN`), exercising the same call the ↓ key makes.
+    func moveSelectionDownForSnapshot() { results.moveSelection(by: 1, wrap: false) }
 
     /// Render the panel's content view to a PNG at `url` (2× scale). Returns false on failure.
     /// Draws the app's own view hierarchy, so no Screen Recording permission is needed.
@@ -419,9 +434,9 @@ final class SearchPanel: NSPanel, NSTextFieldDelegate {
         case #selector(NSResponder.moveDown(_:)): results.moveSelection(by: 1, wrap: true)
         case #selector(NSResponder.insertBacktab(_:)): results.moveSelection(by: -1, wrap: true)
         case #selector(NSResponder.scrollPageUp(_:)), #selector(NSResponder.pageUp(_:)):
-            results.moveSelection(by: -ResultsController.maxVisibleRows, wrap: false)
+            results.moveSelection(by: -results.maxVisible, wrap: false)
         case #selector(NSResponder.scrollPageDown(_:)), #selector(NSResponder.pageDown(_:)):
-            results.moveSelection(by: ResultsController.maxVisibleRows, wrap: false)
+            results.moveSelection(by: results.maxVisible, wrap: false)
         case #selector(NSResponder.moveToBeginningOfDocument(_:)): results.selectEdge(first: true)
         case #selector(NSResponder.moveToEndOfDocument(_:)): results.selectEdge(first: false)
         case #selector(NSResponder.insertNewline(_:)): openSelected()

@@ -5,7 +5,11 @@ import Foundation
 public struct Config: Codable, Equatable, Sendable {
     public var hotkey: String = "option+space"
     public var launchAtLogin: Bool = true
-    public var maxResults: Int = 8
+    /// How many results a query returns — i.e. how many you can scroll through. Only `visibleRows`
+    /// of them fit on screen at once; the rest are reachable with ↓ / the scroll wheel.
+    public var maxResults: Int = 40
+    /// How many result rows are visible without scrolling (the panel's height).
+    public var visibleRows: Int = 8
     public var appsFirstCap: Int = 5
     /// "mouse" | "main" | "active"
     public var screen: String = "mouse"
@@ -45,7 +49,7 @@ public struct Config: Codable, Equatable, Sendable {
 
     /// JSON keys. Declared explicitly so the on-disk format is stable even if property order changes.
     public enum CodingKeys: String, CodingKey, CaseIterable {
-        case hotkey, launchAtLogin, maxResults, appsFirstCap, screen, restoreQueryOnReopen, showRecentsOnEmpty
+        case hotkey, launchAtLogin, maxResults, visibleRows, appsFirstCap, screen, restoreQueryOnReopen, showRecentsOnEmpty
         case appDirectories, fileRoots, excludePaths, excludeNames, downrankNames, includeHidden, maxDepth
         case maxIndexedItems, useSpotlightFallback
     }
@@ -57,7 +61,17 @@ public struct Config: Codable, Equatable, Sendable {
         let d = Config.default
         hotkey = try c.decodeIfPresent(String.self, forKey: .hotkey) ?? d.hotkey
         launchAtLogin = try c.decodeIfPresent(Bool.self, forKey: .launchAtLogin) ?? d.launchAtLogin
-        maxResults = try c.decodeIfPresent(Int.self, forKey: .maxResults) ?? d.maxResults
+        let legacyMaxResults = try c.decodeIfPresent(Int.self, forKey: .maxResults)
+        maxResults = legacyMaxResults ?? d.maxResults
+        visibleRows = try c.decodeIfPresent(Int.self, forKey: .visibleRows) ?? d.visibleRows
+        // Migration: before `visibleRows` existed, `maxResults` meant "rows shown on screen". A config
+        // written then would pin the result pool to the panel height and never have anything to scroll
+        // to, so reinterpret it: the old value becomes the visible height, and the pool takes the new
+        // default (never smaller than what the user asked to see).
+        if !c.contains(.visibleRows), let legacy = legacyMaxResults {
+            visibleRows = legacy
+            maxResults = max(d.maxResults, legacy)
+        }
         appsFirstCap = try c.decodeIfPresent(Int.self, forKey: .appsFirstCap) ?? d.appsFirstCap
         screen = try c.decodeIfPresent(String.self, forKey: .screen) ?? d.screen
         restoreQueryOnReopen = try c.decodeIfPresent(Bool.self, forKey: .restoreQueryOnReopen) ?? d.restoreQueryOnReopen
@@ -79,6 +93,7 @@ public struct Config: Codable, Equatable, Sendable {
         try c.encode(hotkey, forKey: .hotkey)
         try c.encode(launchAtLogin, forKey: .launchAtLogin)
         try c.encode(maxResults, forKey: .maxResults)
+        try c.encode(visibleRows, forKey: .visibleRows)
         try c.encode(appsFirstCap, forKey: .appsFirstCap)
         try c.encode(screen, forKey: .screen)
         try c.encode(restoreQueryOnReopen, forKey: .restoreQueryOnReopen)

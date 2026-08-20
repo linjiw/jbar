@@ -6,6 +6,19 @@ final class ResultsTableView: NSTableView {
     /// Called with the row index under the mouse whenever the pointer moves over a row.
     var onHover: ((Int) -> Void)?
     private var tracking: NSTrackingArea?
+    /// Screen point the pointer occupied when hover was last armed, or nil once the pointer has moved.
+    ///
+    /// Showing the panel — or replacing the rows on every keystroke — happens under a pointer that is
+    /// usually sitting still somewhere over the list. AppKit still delivers `mouseMoved` in that case,
+    /// which would select whatever row happened to land under the cursor and silently hijack the
+    /// keyboard selection, so Return would open the wrong item. Hover therefore stays inert until the
+    /// pointer genuinely moves.
+    private var armedPoint: NSPoint?
+    /// Distance in points the pointer must travel before hover selection takes over.
+    private static let hoverSlop: CGFloat = 3
+
+    /// Suppress hover selection until the pointer moves again.
+    func armHover() { armedPoint = NSEvent.mouseLocation }
 
     override var acceptsFirstResponder: Bool { false }
 
@@ -19,6 +32,11 @@ final class ResultsTableView: NSTableView {
     }
 
     override func mouseMoved(with event: NSEvent) {
+        if let armed = armedPoint {
+            let now = NSEvent.mouseLocation
+            guard abs(now.x - armed.x) > Self.hoverSlop || abs(now.y - armed.y) > Self.hoverSlop else { return }
+            armedPoint = nil
+        }
         let p = convert(event.locationInWindow, from: nil)
         let r = row(at: p)
         if r >= 0 { onHover?(r) }
@@ -26,10 +44,17 @@ final class ResultsTableView: NSTableView {
 }
 
 /// Owns the scroll view + table and the row model; exposes selection movement and click handling.
-/// Rows beyond `maxVisibleRows` scroll (path mode lists whole directories).
+/// Rows beyond `maxVisible` are reachable by scrolling (wheel/trackpad) and by moving the selection
+/// past the last visible row — a search returns `Config.maxResults` (40) rows but shows 8 at a time.
 final class ResultsController: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     static let rowHeight: CGFloat = 48
-    static let maxVisibleRows = 8
+    /// Default number of rows visible without scrolling; overridden per-panel from `Config.visibleRows`.
+    static let defaultVisibleRows = 8
+    /// Rows visible without scrolling. Clamped to a sane range so a bad config cannot produce a
+    /// zero-height or screen-swallowing panel.
+    var maxVisible: Int = defaultVisibleRows {
+        didSet { maxVisible = min(max(1, maxVisible), 20) }
+    }
 
     let scrollView = NSScrollView()
     let table = ResultsTableView()
@@ -82,13 +107,16 @@ final class ResultsController: NSObject, NSTableViewDataSource, NSTableViewDeleg
     var rowCount: Int { rows.count }
     /// Number of result rows.
     var resultCount: Int { rows.reduce(0) { $0 + ($1.isSelectable ? 1 : 0) } }
-    /// Rows that should be visible without scrolling (0…8).
-    var visibleRowCount: Int { min(rows.count, Self.maxVisibleRows) }
+    /// Rows that should be visible without scrolling (0…`maxVisible`).
+    var visibleRowCount: Int { min(rows.count, maxVisible) }
+    /// True when there are more rows than fit on screen (the user can scroll for the rest).
+    var hasHiddenRows: Bool { rows.count > maxVisible }
 
     /// Replace all rows, select the first result and scroll to the top.
     func setRows(_ newRows: [PanelRow]) {
         rows = newRows
         table.reloadData()
+        table.armHover()
         if let first = rows.firstIndex(where: { $0.isSelectable }) {
             select(first)
         } else {
@@ -139,6 +167,9 @@ final class ResultsController: NSObject, NSTableViewDataSource, NSTableViewDeleg
         guard let i = first ? selectable.first : selectable.last else { return }
         select(i)
     }
+
+    /// Suppress hover selection until the pointer moves (called when the panel is shown).
+    func armHover() { table.armHover() }
 
     /// Resize the table to `width` (the scroll view frame is set by the panel).
     func layout(width: CGFloat) {
