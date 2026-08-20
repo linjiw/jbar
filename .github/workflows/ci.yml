@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Build & test (macOS)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          sw_vers
+          swift --version
+          xcodebuild -version
+
+      - name: Build (debug)
+        run: swift build
+
+      - name: Run tests
+        run: swift test
+
+      - name: Build release + assemble app bundle
+        run: scripts/build-app.sh
+
+      - name: Verify the bundle launches headlessly
+        run: |
+          build/JBar.app/Contents/MacOS/JBar --version
+          build/JBar.app/Contents/MacOS/JBar --help
+
+      - name: Upload JBar.app
+        uses: actions/upload-artifact@v4
+        with:
+          name: JBar.app
+          path: build/JBar.app
+          if-no-files-found: error
