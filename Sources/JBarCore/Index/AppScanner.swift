@@ -127,6 +127,9 @@ private final class OpenAppDirectory {
     /// retained localization order cannot depend on filesystem enumeration order.
     func entries(limit: Int) -> AppDirectoryListing? {
         guard limit >= 0, requireInsideBoundary() else { return nil }
+        guard let recordLengthOffset = MemoryLayout<dirent>.offset(of: \.d_reclen),
+              let nameLengthOffset = MemoryLayout<dirent>.offset(of: \.d_namlen),
+              let nameOffset = MemoryLayout<dirent>.offset(of: \.d_name) else { return nil }
         let duplicate = dup(fd)
         guard duplicate >= 0 else { return nil }
         guard let stream = fdopendir(duplicate) else {
@@ -144,16 +147,27 @@ private final class OpenAppDirectory {
                 guard errno == 0 else { return nil }
                 break
             }
-            var rawName = pointer.pointee.d_name
-            let length = Int(pointer.pointee.d_namlen)
-            let cName: [CChar] = withUnsafePointer(to: &rawName) { tuple in
-                tuple.withMemoryRebound(to: CChar.self, capacity: length + 1) {
-                    var bytes = Array(UnsafeBufferPointer(start: $0, count: length))
-                    bytes.append(0)
-                    return bytes
-                }
-            }
-            let name = String(decoding: cName.dropLast().map { UInt8(bitPattern: $0) }, as: UTF8.self)
+            // Darwin `readdir` returns variable-length records even though Swift imports `dirent`
+            // with a fixed 1,024-byte `d_name` tuple. Reading `pointer.pointee.d_name` can therefore
+            // copy beyond the current record. Read only the fixed header fields first, validate the
+            // kernel-reported record extent, and then copy exactly `d_namlen` bytes.
+            let rawRecord = UnsafeRawPointer(pointer)
+            let recordLength = Int(rawRecord.load(fromByteOffset: recordLengthOffset,
+                                                   as: UInt16.self))
+            let nameLength = Int(rawRecord.load(fromByteOffset: nameLengthOffset,
+                                                 as: UInt16.self))
+            guard recordLength > nameOffset,
+                  nameLength <= SafetyLimits.maxNameUTF8Bytes,
+                  nameLength < Int(MAXPATHLEN),
+                  nameLength < recordLength - nameOffset else { return nil }
+            guard rawRecord.load(fromByteOffset: nameOffset + nameLength, as: UInt8.self) == 0
+            else { return nil }
+            let rawName = UnsafeRawBufferPointer(start: rawRecord.advanced(by: nameOffset),
+                                                  count: nameLength)
+            guard !rawName.contains(0) else { return nil }
+            var cName = rawName.map { CChar(bitPattern: $0) }
+            cName.append(0)
+            let name = String(decoding: rawName, as: UTF8.self)
             if name == "." || name == ".." { continue }
             inspected += 1
             guard inspected <= limit else {
@@ -731,12 +745,17 @@ public enum AppScanner {
         for app in apps.prefix(SafetyLimits.maxAppCandidates) {
             guard builder.count < limit else { return true }
             guard app.url.isFileURL else { continue }
-            let component = app.url.lastPathComponent
+            let absolutePath = app.url.path
+            guard SafetyLimits.isSafeAbsolutePath(absolutePath),
+                  let pathComponents = SafetyLimits.posixPathComponents(absolutePath),
+                  let component = pathComponents.last else { continue }
             guard SafetyLimits.isSafePathComponent(
                 component, maxUTF8Bytes: SafetyLimits.maxNameUTF8Bytes
             ), hasExactAppExtension(component) else { continue }
-            let parent = app.url.deletingLastPathComponent().path
-            guard SafetyLimits.isSafeAbsolutePath(parent) else { continue }
+            let parentComponents = pathComponents.dropLast()
+            let parent = parentComponents.isEmpty
+                ? "/"
+                : "/" + parentComponents.joined(separator: "/")
             let name = stripAppExtension(component)
             guard !name.isEmpty else { continue }
             guard let directoryPlan = planAppDirectory(parent: parent,
@@ -867,12 +886,12 @@ public enum AppScanner {
     private static func planAppDirectory(parent: String,
                                          directoryIds: [CatalogNodeKey: CatalogNode],
                                          rootID: Int32?) -> CatalogDirectoryPlan? {
-        let standardized = URL(fileURLWithPath: parent, isDirectory: true).standardizedFileURL.path
-        guard SafetyLimits.isSafeAbsolutePath(standardized) else { return nil }
-
-        let components = standardized == "/"
-            ? []
-            : Array(URL(fileURLWithPath: standardized, isDirectory: true).pathComponents.dropFirst())
+        guard SafetyLimits.isSafeAbsolutePath(parent),
+              let components = SafetyLimits.posixPathComponents(parent) else { return nil }
+        // Rebuild lexically from already-validated POSIX components. Sending a hostile 1–4 KiB
+        // synthetic path through `URL(fileURLWithPath:)` truncates it near Darwin `PATH_MAX` on
+        // older Foundation releases, which could turn a rejected parent into a different valid one.
+        let standardized = components.isEmpty ? "/" : "/" + components.joined(separator: "/")
         var missingDirectories = rootID == nil ? 1 : 0
         var missingDirectoryBytes = rootID == nil ? 1 : 0 // `/` root arena bytes
         var firstMissing = 0
