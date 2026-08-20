@@ -8,7 +8,7 @@ below runs with the stock Xcode toolchain.
 ```bash
 git clone https://github.com/linjiw/jbar.git
 cd jbar
-make test      # 306 unit tests, ~45 s
+make test      # 332 unit tests, ~50 s
 make install   # build JBar.app and install it to /Applications
 ```
 
@@ -17,8 +17,13 @@ make install   # build JBar.app and install it to /Applications
 - **No third-party dependencies.** System frameworks only (AppKit, Carbon, CoreServices,
   ServiceManagement, Foundation, os). This keeps the app small, fast to build, and free of
   supply-chain risk.
-- **`JBarCore` stays UI-free.** All indexing, matching and ranking logic lives in `JBarCore`
-  with no AppKit import, so it is unit-testable. `JBar` is the thin AppKit shell.
+- **Three targets.** `JBarCore` holds all indexing, matching and ranking logic with no AppKit import.
+  `JBarApp` is the AppKit layer — a *library* so tests can `@testable import` it (an executable target
+  cannot be imported, which is why the UI once had zero coverage). `JBar` is a three-line executable
+  shim that calls `runJBar()`.
+- **UI logic belongs in testable helpers.** Panel geometry, row modelling, badges and Tab autocomplete
+  are static functions covered by `Tests/JBarAppTests`; keep new UI decisions out of view callbacks so
+  they can be tested headlessly. `docs/UX-TESTS.md` is the manual checklist for what cannot be.
 - **Tests come with the change.** `JBarCore` sits at 90 %+ line coverage; new logic needs
   tests, and ranking changes need a golden test that pins the expected order.
 - **Measure performance claims.** `JBar --benchmark` and `JBar --bench-index` produce the

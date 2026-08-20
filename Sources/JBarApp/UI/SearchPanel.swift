@@ -18,6 +18,8 @@ final class SearchPanel: NSPanel, NSTextFieldDelegate {
         /// "mouse" | "main" | "active" — which screen the panel appears on.
         var screen = "mouse"
         var restoreQueryOnReopen = false
+        /// Show frecency recents when the query is empty (else just the hint row).
+        var showRecentsOnEmpty = true
         var hotkeyDisplay = "⌥Space"
 
         init() {}
@@ -27,6 +29,7 @@ final class SearchPanel: NSPanel, NSTextFieldDelegate {
             appsFirstCap = max(0, config.appsFirstCap)
             screen = config.screen
             restoreQueryOnReopen = config.restoreQueryOnReopen
+            showRecentsOnEmpty = config.showRecentsOnEmpty
             self.hotkeyDisplay = hotkeyDisplay
         }
     }
@@ -56,6 +59,9 @@ final class SearchPanel: NSPanel, NSTextFieldDelegate {
     var onOpenConfig: (() -> Void)?
     /// Show the shortcuts hint row when the query is empty and there are no recents.
     var showsHintWhenEmpty = true
+    /// Non-nil while the index is still being built — shown instead of "No matches", which during the
+    /// first crawl is both wrong and indistinguishable from a broken app.
+    var indexingNote: String?
 
     private let background = PanelBackgroundView(frame: .zero)
     private let searchIcon = NSImageView()
@@ -137,8 +143,27 @@ final class SearchPanel: NSPanel, NSTextFieldDelegate {
         }
         let nc = NotificationCenter.default
         observers.append(nc.addObserver(forName: NSWindow.didResignKeyNotification, object: self, queue: .main) { [weak self] _ in
-            self?.hide()
+            self?.handleResignKey(modifiers: NSEvent.modifierFlags)
         })
+    }
+
+    /// Input-source switchers can briefly take key status while Control is held. Defer the decision so a
+    /// responder transition back to this panel does not look like a crash, and never tear down active IME
+    /// marked text merely because its candidate/input-source UI appeared.
+    private func handleResignKey(modifiers: NSEvent.ModifierFlags) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            if Self.shouldHideAfterResign(isVisible: isVisible, isKeyWindow: isKeyWindow,
+                                          hasMarkedText: field.hasMarkedText, modifiers: modifiers) {
+                hide()
+            }
+        }
+    }
+
+    static func shouldHideAfterResign(isVisible: Bool, isKeyWindow: Bool, hasMarkedText: Bool,
+                                      modifiers: NSEvent.ModifierFlags) -> Bool {
+        let flags = modifiers.intersection(.deviceIndependentFlagsMask)
+        return isVisible && !isKeyWindow && !hasMarkedText && !flags.contains(.control)
     }
 
     // MARK: - Show / hide
@@ -159,9 +184,18 @@ final class SearchPanel: NSPanel, NSTextFieldDelegate {
     /// Hide the panel; clears the query unless `restoreQueryOnReopen`.
     func hide() {
         guard isVisible else { return }
-        orderOut(nil)
+        if settings.restoreQueryOnReopen {
+            field.commitMarkedText()
+        } else {
+            // Discard composition while the field editor is still attached to a visible window. Clearing
+            // after `orderOut` lets older AppKit/IME versions re-enter with a stale marked range.
+            _ = field.abortEditing()
+            clearQuery()
+        }
+        // Ending/committing composition may synchronously send a text-change notification. Cancel after
+        // that transition too so no newly queued search keeps running for a panel that is about to hide.
         loadingWork?.cancel()
-        if !settings.restoreQueryOnReopen { clearQuery() }
+        orderOut(nil)
         Log.panel.notice("panel hidden")
     }
 
@@ -171,7 +205,9 @@ final class SearchPanel: NSPanel, NSTextFieldDelegate {
     }
 
     private func clearQuery() {
-        field.stringValue = ""
+        // Keep the NSTextField and its field editor in sync, and safely terminate any active IME marked
+        // text before clearing. This matters when Ctrl+Space changes input source while the panel resigns.
+        field.setText("")
         currentMode = .empty
         pathBadge.isHidden = true
         results.setRows([])
@@ -196,7 +232,7 @@ final class SearchPanel: NSPanel, NSTextFieldDelegate {
     /// visible frame (so a large `visibleRows`, or a small display, cannot push it off-screen —
     /// the extra rows simply scroll instead).
     private func maxPanelHeight(on screen: NSScreen?) -> CGFloat {
-        let wanted = Self.inputRowHeight + Self.rowHeight * CGFloat(results.maxVisible) + Self.bottomPadding
+        let wanted = Self.height(forVisibleRows: results.maxVisible, peeking: true)
         guard let vf = screen?.visibleFrame else { return wanted }
         return min(wanted, max(Self.inputRowHeight + Self.bottomPadding, vf.height - 32))
     }
@@ -215,9 +251,15 @@ final class SearchPanel: NSPanel, NSTextFieldDelegate {
         setFrame(NSRect(x: (vf.midX - width / 2).rounded(), y: top - h, width: width, height: h), display: false)
     }
 
+    /// Sliver of the next row left showing when more results exist below the fold. Without it the list
+    /// looks complete — overlay scrollers are invisible until you already started scrolling — so nobody
+    /// discovers that there is anything to scroll to.
+    static let peekHeight: CGFloat = 16
+
     /// Height needed for `n` rows, ignoring any cap (callers clamp to `maxPanelHeight(on:)`).
-    static func height(forVisibleRows n: Int) -> CGFloat {
-        inputRowHeight + rowHeight * CGFloat(max(0, n)) + bottomPadding
+    /// `peeking` adds the sliver that reveals there are more rows below.
+    static func height(forVisibleRows n: Int, peeking: Bool = false) -> CGFloat {
+        inputRowHeight + rowHeight * CGFloat(max(0, n)) + (peeking ? peekHeight : 0) + bottomPadding
     }
 
     /// How many rows actually fit in `height` (used to keep `visibleRows` honest on small screens).
@@ -226,7 +268,8 @@ final class SearchPanel: NSPanel, NSTextFieldDelegate {
     }
 
     private func applyHeight() {
-        let h = min(Self.height(forVisibleRows: results.visibleRowCount), maxPanelHeight(on: targetScreen()))
+        let h = min(Self.height(forVisibleRows: results.visibleRowCount, peeking: results.hasHiddenRows),
+                    maxPanelHeight(on: targetScreen()))
         var f = frame
         if topEdge == 0 { topEdge = f.maxY }
         f.origin.y = topEdge - h
@@ -247,7 +290,9 @@ final class SearchPanel: NSPanel, NSTextFieldDelegate {
             fieldRight = pathBadge.frame.minX - 12
         }
         field.frame = NSRect(x: 58, y: (rowH - 32) / 2, width: max(0, fieldRight - 58), height: 32)
-        let listH = Self.rowHeight * CGFloat(results.visibleRowCount)
+        // The list gets the whole area between the input row and the bottom padding, so when the panel is
+        // peeking the extra sliver belongs to the list and cuts the next row in half.
+        let listH = max(0, background.bounds.height - rowH - Self.bottomPadding)
         divider.frame = NSRect(x: 16, y: rowH - 1, width: w - 32, height: 1)
         divider.isHidden = results.rowCount == 0
         results.scrollView.frame = NSRect(x: 0, y: rowH, width: w, height: listH)
@@ -285,6 +330,14 @@ final class SearchPanel: NSPanel, NSTextFieldDelegate {
 
     private func runSearch() {
         let q = field.stringValue
+        // `showRecentsOnEmpty: false` means an empty query shows nothing but the hint row.
+        if !settings.showRecentsOnEmpty, q.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            loadingWork?.cancel()
+            let hint = indexingNote ?? (showsHintWhenEmpty ? Self.hintText(hotkeyDisplay: settings.hotkeyDisplay) : nil)
+            results.setRows(hint.map { [PanelRow.hint($0)] } ?? [])
+            applyHeight()
+            return
+        }
         let limit = settings.maxResults
         let cap = settings.appsFirstCap
         let provider = self.provider
@@ -319,20 +372,25 @@ final class SearchPanel: NSPanel, NSTextFieldDelegate {
         currentMode = r.mode
         let inPath: Bool = { if case .path = r.mode { return true }; return false }()
         pathBadge.isHidden = !inPath
-        results.setRows(Self.panelRows(for: r, hint: showsHintWhenEmpty ? Self.hintText(hotkeyDisplay: settings.hotkeyDisplay) : nil))
+        results.setRows(Self.panelRows(for: r,
+                                       hint: showsHintWhenEmpty ? Self.hintText(hotkeyDisplay: settings.hotkeyDisplay) : nil,
+                                       indexing: indexingNote))
         applyHeight()
         Log.panel.debug("applied \(r.rows.count) rows for \"\(r.query, privacy: .public)\" in \(Int(r.elapsed * 1000)) ms (id=\(r.requestId))")
     }
 
     /// Map a response to table rows, adding the empty-state or hint row when there are no results.
-    static func panelRows(for r: SearchResponse, hint: String?) -> [PanelRow] {
+    static func panelRows(for r: SearchResponse, hint: String?, indexing: String? = nil) -> [PanelRow] {
         if !r.rows.isEmpty { return r.rows.map(PanelRow.result) }
         switch r.mode {
         case .empty:
-            return hint.map { [.hint($0)] } ?? []
+            return indexing.map { [.hint($0)] } ?? hint.map { [.hint($0)] } ?? []
         case .search, .path, .extensionOnly:
             let q = r.query.trimmingCharacters(in: .whitespacesAndNewlines)
-            return q.isEmpty ? [] : [.empty(query: q)]
+            guard !q.isEmpty else { return [] }
+            // Still indexing → say so; "No matches" here would be a lie the user cannot act on.
+            if let indexing { return [.hint(indexing)] }
+            return [.empty(query: q)]
         }
     }
 
@@ -403,6 +461,11 @@ final class SearchPanel: NSPanel, NSTextFieldDelegate {
     /// Local monitor: ⌘-shortcuts that must win over the field editor (⌘1–8, ⌘↩, ⌘C, ⌘,, ⌘Q).
     private func handleKeyDown(_ event: NSEvent) -> NSEvent? {
         guard isVisible, event.window === self else { return event }
+        if Self.shouldCloseForKey(keyCode: event.keyCode, hasMarkedText: field.hasMarkedText,
+                                  modifiers: event.modifierFlags) {
+            hide()
+            return nil
+        }
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
         guard flags.contains(.command), !flags.contains(.control), !flags.contains(.option) else { return event }
         if Int(event.keyCode) == kVK_Return || Int(event.keyCode) == kVK_ANSI_KeypadEnter {
@@ -426,16 +489,33 @@ final class SearchPanel: NSPanel, NSTextFieldDelegate {
         }
     }
 
+    /// Only a physical Escape closes the panel. Delete (key code 51) and an IME's logical
+    /// `cancelOperation:` must remain owned by the standard field editor.
+    static func shouldCloseForKey(keyCode: UInt16, hasMarkedText: Bool,
+                                  modifiers: NSEvent.ModifierFlags = []) -> Bool {
+        let flags = modifiers.intersection(.deviceIndependentFlagsMask)
+        let commandModifiers: NSEvent.ModifierFlags = [.command, .control, .option]
+        return Int(keyCode) == kVK_Escape && !hasMarkedText && flags.intersection(commandModifiers).isEmpty
+    }
+
     /// Keys reaching the panel when the field editor is not first responder (e.g. after a click on the list).
     override func keyDown(with event: NSEvent) {
         switch Int(event.keyCode) {
-        case kVK_Escape: hide()
+        case kVK_Escape:
+            if Self.shouldCloseForKey(keyCode: event.keyCode, hasMarkedText: field.hasMarkedText,
+                                      modifiers: event.modifierFlags) {
+                hide()
+            } else {
+                super.keyDown(with: event)
+            }
         case kVK_UpArrow: results.moveSelection(by: -1, wrap: true)
         case kVK_DownArrow: results.moveSelection(by: 1, wrap: true)
         case kVK_Return, kVK_ANSI_KeypadEnter: openSelected()
         default:
             makeFirstResponder(field)
-            if let editor = field.currentEditor() { editor.keyDown(with: event) } else { super.keyDown(with: event) }
+            // `interpretKeyEvents` routes through NSTextInputContext; invoking the field editor's
+            // `keyDown` directly can bypass marked-text handling for Korean and other IMEs.
+            if let editor = field.currentEditor() { editor.interpretKeyEvents([event]) } else { super.keyDown(with: event) }
         }
     }
 
@@ -458,7 +538,9 @@ final class SearchPanel: NSPanel, NSTextFieldDelegate {
         case #selector(NSResponder.moveToEndOfDocument(_:)): results.selectEdge(first: false)
         case #selector(NSResponder.insertNewline(_:)): openSelected()
         case #selector(NSResponder.insertTab(_:)): autocomplete()
-        case #selector(NSResponder.cancelOperation(_:)): hide()
+        // `cancelOperation:` is also emitted by input methods and bindings such as Ctrl-G; a physical
+        // Escape with no active composition is handled by the local key monitor above.
+        case #selector(NSResponder.cancelOperation(_:)): return false
         default: return false
         }
         return true

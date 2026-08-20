@@ -23,8 +23,6 @@ public struct Config: Codable, Equatable, Sendable {
     public var includeHidden: Bool = false
     public var maxDepth: Int = 12
     public var maxIndexedItems: Int = 1_000_000
-    /// Optional time-boxed Spotlight "more results" source (off by default in v1).
-    public var useSpotlightFallback: Bool = false
 
     public init() {}
     public static let `default` = Config()
@@ -51,7 +49,7 @@ public struct Config: Codable, Equatable, Sendable {
     public enum CodingKeys: String, CodingKey, CaseIterable {
         case hotkey, launchAtLogin, maxResults, visibleRows, appsFirstCap, screen, restoreQueryOnReopen, showRecentsOnEmpty
         case appDirectories, fileRoots, excludePaths, excludeNames, downrankNames, includeHidden, maxDepth
-        case maxIndexedItems, useSpotlightFallback
+        case maxIndexedItems
     }
 
     /// Decode leniently: every key is optional and falls back to its default; unknown keys are ignored by `JSONDecoder`.
@@ -84,7 +82,6 @@ public struct Config: Codable, Equatable, Sendable {
         includeHidden = try c.decodeIfPresent(Bool.self, forKey: .includeHidden) ?? d.includeHidden
         maxDepth = try c.decodeIfPresent(Int.self, forKey: .maxDepth) ?? d.maxDepth
         maxIndexedItems = try c.decodeIfPresent(Int.self, forKey: .maxIndexedItems) ?? d.maxIndexedItems
-        useSpotlightFallback = try c.decodeIfPresent(Bool.self, forKey: .useSpotlightFallback) ?? d.useSpotlightFallback
     }
 
     /// Encode every key (so the written file documents all options). Paths are written exactly as stored (`~` kept).
@@ -106,7 +103,6 @@ public struct Config: Codable, Equatable, Sendable {
         try c.encode(includeHidden, forKey: .includeHidden)
         try c.encode(maxDepth, forKey: .maxDepth)
         try c.encode(maxIndexedItems, forKey: .maxIndexedItems)
-        try c.encode(useSpotlightFallback, forKey: .useSpotlightFallback)
     }
 
     // MARK: - Load / save

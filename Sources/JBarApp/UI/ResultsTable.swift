@@ -20,6 +20,17 @@ final class ResultsTableView: NSTableView {
     /// Suppress hover selection until the pointer moves again.
     func armHover() { armedPoint = NSEvent.mouseLocation }
 
+    /// Called as the mouse goes DOWN, with the row under the pointer at that instant.
+    var onPressRow: ((Int) -> Void)?
+
+    override func mouseDown(with event: NSEvent) {
+        // `super.mouseDown` runs a nested tracking loop that pumps the main run loop until mouse-up, so
+        // a newer search response can replace the row model mid-click. Capture what the user actually
+        // pressed first; the action then verifies the click finished on the same row.
+        onPressRow?(row(at: convert(event.locationInWindow, from: nil)))
+        super.mouseDown(with: event)
+    }
+
     override var acceptsFirstResponder: Bool { false }
 
     override func updateTrackingAreas() {
@@ -62,6 +73,8 @@ final class ResultsController: NSObject, NSTableViewDataSource, NSTableViewDeleg
 
     /// Current rows (results and informational rows).
     private(set) var rows: [PanelRow] = []
+    /// The row captured at mouse-down, so a click opens what was pressed (see `tableClicked`).
+    private var pressed: (index: Int, row: ResultRow)?
     /// Called when the user clicks a result row.
     var onOpen: ((ResultRow) -> Void)?
 
@@ -88,6 +101,10 @@ final class ResultsController: NSObject, NSTableViewDataSource, NSTableViewDeleg
         table.target = self
         table.action = #selector(tableClicked(_:))
         table.onHover = { [weak self] r in self?.hover(r) }
+        table.onPressRow = { [weak self] i in
+            guard let self else { return }
+            pressed = (i >= 0 && i < rows.count) ? rows[i].result.map { (i, $0) } ?? nil : nil
+        }
 
         scrollView.documentView = table
         scrollView.hasVerticalScroller = true
@@ -115,6 +132,7 @@ final class ResultsController: NSObject, NSTableViewDataSource, NSTableViewDeleg
     /// Replace all rows, select the first result and scroll to the top.
     func setRows(_ newRows: [PanelRow]) {
         rows = newRows
+        pressed = nil
         table.reloadData()
         table.armHover()
         if let first = rows.firstIndex(where: { $0.isSelectable }) {
@@ -122,7 +140,15 @@ final class ResultsController: NSObject, NSTableViewDataSource, NSTableViewDeleg
         } else {
             table.deselectAll(nil)
         }
-        table.scrollRowToVisible(0)
+        // `scrollRowToVisible(0)` is outside the table's valid range when the model is empty. Recent
+        // AppKit versions happen to ignore it, but older releases can raise an NSRangeException — notably
+        // when an input-source switch resigns the panel and clearQuery() installs an empty model.
+        if rows.isEmpty {
+            scrollView.contentView.scroll(to: .zero)
+            scrollView.reflectScrolledClipView(scrollView.contentView)
+        } else {
+            table.scrollRowToVisible(0)
+        }
     }
 
     /// Currently selected result, if any.
@@ -190,9 +216,12 @@ final class ResultsController: NSObject, NSTableViewDataSource, NSTableViewDeleg
     }
 
     @objc private func tableClicked(_ sender: Any?) {
-        let i = table.clickedRow
-        guard i >= 0, i < rows.count, let r = rows[i].result else { return }
-        onOpen?(r)
+        // Open exactly what was under the pointer when the button went down, and only if the click
+        // completed on that same row (a drag to another row, or a result list that changed underneath
+        // during the nested tracking loop, must not silently open a different item).
+        guard let pressed, pressed.index == table.clickedRow else { self.pressed = nil; return }
+        self.pressed = nil
+        onOpen?(pressed.row)
     }
 
     // MARK: - NSTableViewDataSource / Delegate
@@ -226,9 +255,11 @@ final class ResultsController: NSObject, NSTableViewDataSource, NSTableViewDeleg
         return cell
     }
 
-    /// A hairline is drawn above the first non-app result that follows an app result.
+    /// A hairline is drawn at every app↔file boundary — including file→app, which `Ranking.group`
+    /// produces when it backfills leftover apps after the file group (common now that the result pool
+    /// is far larger than the visible rows). Marking only app→file glued those trailing apps to the files.
     static func needsSeparator(_ rows: [PanelRow], at index: Int) -> Bool {
         guard index > 0, index < rows.count, let cur = rows[index].result, let prev = rows[index - 1].result else { return false }
-        return prev.isApp && !cur.isApp
+        return prev.isApp != cur.isApp
     }
 }

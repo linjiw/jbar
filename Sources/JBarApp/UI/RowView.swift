@@ -175,13 +175,18 @@ final class ResultCellView: NSTableCellView {
         let rightEdge = bounds.width - 16
         var cursor = rightEdge
         if !badge.isHidden {
-            let bs = badge.intrinsicContentSize
+            // Clamp the badge so a name like "v1.2.some-very-long-thing" cannot eat the row.
+            var bs = badge.intrinsicContentSize
+            bs.width = min(bs.width, max(44, bounds.width * 0.22))
             badge.frame = NSRect(x: cursor - bs.width, y: (h - bs.height) / 2, width: bs.width, height: bs.height)
             cursor -= bs.width + 10
         }
         let available = max(0, cursor - textX)
         if !parentLabel.isHidden && !parentLabel.stringValue.isEmpty {
-            let wanted = ceil(parentLabel.attributedStringValue.size().width) + 2
+            // `attributedStringValue.size()` measures the glyphs only and comes out ~4–5 pt short of what
+            // the field actually needs for its border/padding, which head-truncated short paths that had
+            // room to spare ("/Applications" → "…pplications"). `fittingSize` asks the cell.
+            let wanted = ceil(parentLabel.fittingSize.width)
             let pw = min(wanted, floor(available * Self.maxParentFraction))
             let ph = ceil(parentLabel.font?.pointSize ?? 12) + 6
             parentLabel.frame = NSRect(x: cursor - pw, y: (h - ph) / 2, width: pw, height: ph)
@@ -200,7 +205,11 @@ final class ResultCellView: NSTableCellView {
         case .folder: return "FOLDER"
         default:
             let ext = (row.name as NSString).pathExtension
-            return ext.isEmpty ? "" : ext.uppercased()
+            guard !ext.isEmpty else { return "" }
+            // A "extension" is only a useful label when it is short; anything longer is just a dot in the
+            // file name ("report.final draft v2") and would render as a giant badge.
+            guard ext.count <= 6 else { return "" }
+            return ext.uppercased()
         }
     }
 

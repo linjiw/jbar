@@ -56,7 +56,7 @@ final class CrawlerTests: XCTestCase {
 
     private func crawl(_ root: URL, exclusions: Exclusions? = nil, maxItems: Int = 1_000_000, maxDepth: Int? = nil,
                        onBatch: ((IndexBuilder) -> Void)? = nil,
-                       shouldCancel: () -> Bool = { false }) -> (store: IndexStore, stats: CrawlStats) {
+                       shouldCancel: @escaping () -> Bool = { false }) -> (store: IndexStore, stats: CrawlStats) {
         var ex = exclusions ?? Exclusions.defaults(home: tempHome.path)
         if let md = maxDepth { ex.maxDepth = md }
         let crawler = Crawler(roots: [CrawlRoot(path: root.path)], exclusions: ex, maxItems: maxItems)
@@ -460,4 +460,57 @@ final class CrawlerTests: XCTestCase {
         // A non-permission error is not misclassified.
         XCTAssertFalse(Crawler.isPermissionError(NSError(domain: NSCocoaErrorDomain, code: NSFileNoSuchFileError)))
     }
+
+    /// Regression: the multi-root (parallel) crawl hands `shouldCancel` and `onBatch` to
+    /// `DispatchQueue.async`. Wrapping them in `withoutActuallyEscaping` trapped at runtime
+    /// ("closure argument was escaped in withoutActuallyEscaping block", SIGTRAP) because the async
+    /// block could still hold the closure when the enclosing scope exited — crashing the very first
+    /// crawl on launch. It passed intermittently before it failed every time, so pin it.
+    func testParallelCrawlAcceptsEscapingCallbacks() throws {
+        let a = tempDir.appendingPathComponent("par-a", isDirectory: true)
+        let b = tempDir.appendingPathComponent("par-b", isDirectory: true)
+        for i in 0..<40 {
+            try write(a.appendingPathComponent("a\(i).txt"))
+            try write(b.appendingPathComponent("b\(i).txt"))
+        }
+        let crawler = Crawler(roots: [CrawlRoot(path: a.path), CrawlRoot(path: b.path)],
+                              exclusions: Exclusions.defaults(home: tempHome.path))
+        let builder = IndexBuilder()
+        let batches = Counter()
+        let cancels = Counter()
+        let stats = crawler.crawl(into: builder,
+                                  onBatch: { _ in batches.bump() },
+                                  shouldCancel: { cancels.bump(); return false })
+        let store = builder.build(generation: 1)
+        XCTAssertEqual(stats.items, store.count)
+        XCTAssertGreaterThanOrEqual(store.count, 80, "both roots must be merged")
+        XCTAssertFalse(stats.cancelled)
+        XCTAssertGreaterThan(batches.value, 0, "onBatch fires once per merged root")
+    }
+
+    /// Cancelling from another thread stops the parallel crawl without tripping the escaping check.
+    func testParallelCrawlHonoursCancellation() throws {
+        let a = tempDir.appendingPathComponent("cancel-a", isDirectory: true)
+        let b = tempDir.appendingPathComponent("cancel-b", isDirectory: true)
+        let filesPerRoot = Crawler.cancelPollInterval + 200
+        for i in 0..<filesPerRoot {
+            try write(a.appendingPathComponent("a\(i).txt"))
+            try write(b.appendingPathComponent("b\(i).txt"))
+        }
+        let crawler = Crawler(roots: [CrawlRoot(path: a.path), CrawlRoot(path: b.path)],
+                              exclusions: Exclusions.defaults(home: tempHome.path))
+        let builder = IndexBuilder()
+        let stats = crawler.crawl(into: builder, onBatch: nil, shouldCancel: { true })
+        XCTAssertTrue(stats.cancelled)
+        XCTAssertLessThan(builder.count, filesPerRoot * 2 + 2,
+                          "an always-true cancel must cut the crawl short")
+    }
+}
+
+/// Thread-safe counter for callbacks invoked from the crawl's worker queues.
+private final class Counter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var n = 0
+    func bump() { lock.lock(); n += 1; lock.unlock() }
+    var value: Int { lock.lock(); defer { lock.unlock() }; return n }
 }

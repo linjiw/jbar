@@ -71,7 +71,7 @@ final class ConfigTests: XCTestCase {
         c.hotkey = "ctrl+option+space"; c.launchAtLogin = false; c.maxResults = 10; c.appsFirstCap = 3; c.screen = "main"
         c.restoreQueryOnReopen = true; c.showRecentsOnEmpty = false; c.appDirectories = ["/Applications"]
         c.fileRoots = ["~/Documents", "/Volumes/Data"]; c.excludePaths = ["~/Library"]; c.excludeNames = ["node_modules"]
-        c.downrankNames = ["build"]; c.includeHidden = true; c.maxDepth = 5; c.maxIndexedItems = 1234; c.useSpotlightFallback = true
+        c.downrankNames = ["build"]; c.includeHidden = true; c.maxDepth = 5; c.maxIndexedItems = 1234
         let back = try Config.decode(try c.jsonData())
         XCTAssertEqual(back, c)
         XCTAssertNotEqual(back, Config.default)

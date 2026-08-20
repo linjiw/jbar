@@ -30,8 +30,15 @@ final class QueryField: NSTextField {
 
     /// Replace the text and put the caret at the end (used by Tab autocomplete).
     func setText(_ text: String) {
+        let editor = currentEditor()
+        if let textView = editor as? NSTextView, textView.hasMarkedText() {
+            // Replacing the query while an IME (for example Korean 2-Set) owns marked text must end
+            // composition first. Otherwise the field editor can later apply its marked range to the new,
+            // shorter string when the panel hides or Delete empties the query.
+            textView.unmarkText()
+        }
         stringValue = text
-        if let editor = currentEditor() {
+        if let editor {
             // While the field is being edited (always, when the panel is open) the field editor owns the
             // visible string; assigning `stringValue` alone can leave the old text on screen. Push the new
             // text into the editor too, then put the caret at the end. This is the path Tab-autocomplete
@@ -39,6 +46,17 @@ final class QueryField: NSTextField {
             editor.string = text
             editor.selectedRange = NSRange(location: (text as NSString).length, length: 0)
         }
+    }
+
+    /// Whether an input method currently owns uncommitted composition text in this field.
+    var hasMarkedText: Bool { (currentEditor() as? NSTextView)?.hasMarkedText() == true }
+
+    /// Commit an active composition before the panel temporarily leaves the screen. This preserves the
+    /// query when `restoreQueryOnReopen` is enabled without leaving AppKit with a stale marked range.
+    func commitMarkedText() {
+        guard let editor = currentEditor() as? NSTextView, editor.hasMarkedText() else { return }
+        editor.unmarkText()
+        stringValue = editor.string
     }
 
     /// True when the field editor has a non-empty selection (⌘C then copies text, not the path).

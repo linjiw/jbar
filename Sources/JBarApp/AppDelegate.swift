@@ -55,6 +55,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let path = Runtime.snapshotPath { scheduleSnapshot(to: path) }
     }
 
+    /// Text for the panel while the index is still being built, or nil once it is ready.
+    /// Shown in place of "No matches", which during the first crawl is misleading.
+    static func indexingNote(for status: IndexStatus) -> String? {
+        switch status.phase {
+        case .idle:
+            return nil
+        case .failed(let message):
+            return "⚠ Index unavailable — \(message)"
+        case .scanningApps, .loadingSnapshot:
+            return "Indexing… apps are searchable now"
+        case .crawling(let n):
+            return n > 0 ? "Indexing… \(n.formatted()) files so far — results will fill in"
+                         : "Indexing… results will fill in shortly"
+        case .updating:
+            return status.itemCount > 0 ? nil : "Updating index…"
+        }
+    }
+
     /// Debug aid (`JBAR_SNAPSHOT_PATH`): wait for the index, run a query, render the panel to PNG, quit.
     private func scheduleSnapshot(to path: String) {
         let query = Runtime.snapshotQuery
@@ -168,7 +186,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             Log.index.debug("store generation \(store.generation) with \(store.count) items")
         }
         c.onStatusChanged = { [weak self] status in
-            self?.statusMenu.update(status: status)
+            guard let self else { return }
+            statusMenu.update(status: status)
+            // While the first crawl runs, an empty result set means "not indexed yet", not "no such file".
+            panel.indexingNote = AppDelegate.indexingNote(for: status)
         }
         coordinator = c
         c.start()

@@ -140,8 +140,13 @@ public final class Crawler {
     /// Crawl all roots into `builder`. `onBatch(builder)` is called every ~5000 items (caller may `build()` a partial
     /// store). `shouldCancel()` is polled every ~1000 entries. Returns stats. Runs synchronously on the caller's queue
     /// (caller uses a utility-QoS queue).
+    /// `shouldCancel` must be `@escaping`: the parallel path hands it to `DispatchQueue.async`, and even
+    /// though `group.wait()` bounds the work, the block holding it can still be alive when the enclosing
+    /// scope exits — `withoutActuallyEscaping` detects exactly that and traps ("closure argument was
+    /// escaped"), crashing the first crawl. This was intermittent until it wasn't.
     @discardableResult
-    public func crawl(into builder: IndexBuilder, onBatch: ((IndexBuilder) -> Void)? = nil, shouldCancel: () -> Bool = { false }) -> CrawlStats {
+    public func crawl(into builder: IndexBuilder, onBatch: ((IndexBuilder) -> Void)? = nil,
+                      shouldCancel: @escaping () -> Bool = { false }) -> CrawlStats {
         let start = Date()
         // A single root (or a tiny cap, used by tests) is crawled serially, streaming partial results as
         // each ~5k items land. Multiple real roots are crawled concurrently — each into its own thread-local
@@ -150,11 +155,9 @@ public final class Crawler {
         // wall-clock roughly in half. Both paths produce an identical store (item order across roots aside).
         var s: CrawlStats
         if roots.count <= 1 {
-            s = withoutActuallyEscaping(shouldCancel) { cancel -> CrawlStats in
-                let ctx = Context(builder: builder, onBatch: onBatch, shouldCancel: cancel)
-                for root in roots { if ctx.stopped { break }; crawlRoot(root, ctx: ctx) }
-                return ctx.stats
-            }
+            let ctx = Context(builder: builder, onBatch: onBatch, shouldCancel: shouldCancel)
+            for root in roots { if ctx.stopped { break }; crawlRoot(root, ctx: ctx) }
+            s = ctx.stats
         } else {
             s = crawlParallel(into: builder, onBatch: onBatch, shouldCancel: shouldCancel)
         }
@@ -166,51 +169,50 @@ public final class Crawler {
     /// finishes. `onBatch` is invoked from the merge queue after each root is merged (completion order, so
     /// small roots publish first). Concurrency is capped at the active core count. Determinism note: the
     /// only cross-root nondeterminism is item index order, which ranking uses solely as a final tie-break.
-    private func crawlParallel(into builder: IndexBuilder, onBatch: ((IndexBuilder) -> Void)?, shouldCancel: () -> Bool) -> CrawlStats {
+    private func crawlParallel(into builder: IndexBuilder, onBatch: ((IndexBuilder) -> Void)?,
+                               shouldCancel: @escaping () -> Bool) -> CrawlStats {
         let debugTiming = ProcessInfo.processInfo.environment["JBAR_CRAWL_TIMING"] != nil
-        return withoutActuallyEscaping(shouldCancel) { cancel in
-            withoutActuallyEscaping(onBatch ?? { _ in }) { batch -> CrawlStats in
-                let cancelled = AtomicFlag()
-                // Seed with items already in the shared builder (e.g. AppScanner apps) so the global cap counts them.
-                let globalCount = AtomicInt(builder.count)
-                let group = DispatchGroup()
-                let crawlQ = DispatchQueue(label: "com.linji.jbar.crawl", attributes: .concurrent)
-                let mergeQ = DispatchQueue(label: "com.linji.jbar.crawl.merge")
-                let sem = DispatchSemaphore(value: max(2, ProcessInfo.processInfo.activeProcessorCount - 1))
-                var merged = CrawlStats()
-                for root in roots {
-                    group.enter()
-                    crawlQ.async {
-                        sem.wait()
-                        defer { sem.signal(); group.leave() }
-                        if cancelled.value { return }
-                        let t0 = Date()
-                        let b = IndexBuilder()
-                        let ctx = Context(builder: b, onBatch: nil, shouldCancel: { cancelled.value || cancel() }, sharedCount: globalCount)
-                        self.crawlRoot(root, ctx: ctx)
-                        let st = ctx.stats
-                        if debugTiming {
-                            FileHandle.standardError.write("  root \(root.path): \(b.count) items in \(String(format: "%.2f", Date().timeIntervalSince(t0)))s\n".data(using: .utf8)!)
-                        }
-                        mergeQ.sync {
-                            // Every item in `b` already claimed a global slot, so appending them all keeps the
-                            // merged store within maxItems; no items are dropped at merge time.
-                            builder.append(b)
-                            merged.items += st.items
-                            merged.dirs += st.dirs
-                            merged.skippedExcluded += st.skippedExcluded
-                            merged.deniedPaths.append(contentsOf: st.deniedPaths)
-                            merged.cappedDirs.append(contentsOf: st.cappedDirs)
-                            if st.cancelled { merged.cancelled = true; cancelled.set(true) }
-                            if st.hitItemCap { merged.hitItemCap = true }   // authoritative per-root flag
-                            batch(builder)
-                        }
-                    }
+        let cancel = shouldCancel
+        let batch = onBatch ?? { _ in }
+        let cancelled = AtomicFlag()
+        // Seed with items already in the shared builder (e.g. AppScanner apps) so the global cap counts them.
+        let globalCount = AtomicInt(builder.count)
+        let group = DispatchGroup()
+        let crawlQ = DispatchQueue(label: "com.linji.jbar.crawl", attributes: .concurrent)
+        let mergeQ = DispatchQueue(label: "com.linji.jbar.crawl.merge")
+        let sem = DispatchSemaphore(value: max(2, ProcessInfo.processInfo.activeProcessorCount - 1))
+        var merged = CrawlStats()
+        for root in roots {
+            group.enter()
+            crawlQ.async {
+                sem.wait()
+                defer { sem.signal(); group.leave() }
+                if cancelled.value { return }
+                let t0 = Date()
+                let b = IndexBuilder()
+                let ctx = Context(builder: b, onBatch: nil, shouldCancel: { cancelled.value || cancel() }, sharedCount: globalCount)
+                self.crawlRoot(root, ctx: ctx)
+                let st = ctx.stats
+                if debugTiming {
+                    FileHandle.standardError.write("  root \(root.path): \(b.count) items in \(String(format: "%.2f", Date().timeIntervalSince(t0)))s\n".data(using: .utf8)!)
                 }
-                group.wait()
-                return merged
+                mergeQ.sync {
+                    // Every item in `b` already claimed a global slot, so appending them all keeps the
+                    // merged store within maxItems; no items are dropped at merge time.
+                    builder.append(b)
+                    merged.items += st.items
+                    merged.dirs += st.dirs
+                    merged.skippedExcluded += st.skippedExcluded
+                    merged.deniedPaths.append(contentsOf: st.deniedPaths)
+                    merged.cappedDirs.append(contentsOf: st.cappedDirs)
+                    if st.cancelled { merged.cancelled = true; cancelled.set(true) }
+                    if st.hitItemCap { merged.hitItemCap = true }   // authoritative per-root flag
+                    batch(builder)
+                }
             }
         }
+        group.wait()
+        return merged
     }
 
     /// Crawl ONE directory (absolute path, must be under a root) into `builder`, non-recursively if `recursive` is

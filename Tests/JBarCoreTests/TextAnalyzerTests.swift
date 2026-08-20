@@ -8,6 +8,32 @@ final class TextAnalyzerTests: XCTestCase {
         XCTAssertEqual(TextAnalyzer.fold("微信"), "微信")
     }
 
+    func testFoldCanonicalizesDecomposedKorean() {
+        let precomposed = "한글"
+        let decomposed = precomposed.decomposedStringWithCanonicalMapping
+
+        XCTAssertNotEqual(Array(precomposed.utf8), Array(decomposed.utf8), "fixture must exercise distinct UTF-8 encodings")
+        XCTAssertEqual(TextAnalyzer.fold(decomposed), TextAnalyzer.fold(precomposed))
+
+        let precomposedAnalysis = TextAnalyzer.analyze(precomposed)
+        let decomposedAnalysis = TextAnalyzer.analyze(decomposed)
+        XCTAssertEqual(decomposedAnalysis.folded, precomposedAnalysis.folded)
+        XCTAssertEqual(decomposedAnalysis.folded, Array(TextAnalyzer.fold(decomposed).utf8))
+        XCTAssertEqual(decomposedAnalysis.bonus, precomposedAnalysis.bonus)
+        XCTAssertEqual(decomposedAnalysis.mask, precomposedAnalysis.mask)
+    }
+
+    func testKoreanCanonicalMatchMapsBackToOriginalCharacters() {
+        let display = "한글".decomposedStringWithCanonicalMapping
+        let text = TextAnalyzer.analyze(display)
+        let query = TextAnalyzer.analyze("글")
+
+        let positions = Scorer.matchPositions(query: query.folded[...], text: text.folded[...], bonus: text.bonus[...])
+        XCTAssertEqual(positions.count, query.folded.count)
+        XCTAssertEqual(TextAnalyzer.characterIndices(display: display, matchedFoldedByteOffsets: positions), [1])
+        XCTAssertLessThan(1, display.count, "highlight index must be valid in the original decomposed display string")
+    }
+
     func testInitials() {
         XCTAssertEqual(TextAnalyzer.unpackInitials(TextAnalyzer.analyze("Visual Studio Code").initials), Array("vsc".utf8))
         XCTAssertEqual(TextAnalyzer.unpackInitials(TextAnalyzer.analyze("Google Chrome").initials), Array("gc".utf8))

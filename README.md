@@ -10,7 +10,7 @@
 [![Swift](https://img.shields.io/badge/Swift-5.9%2B-orange.svg)](https://swift.org)
 [![No dependencies](https://img.shields.io/badge/dependencies-none-brightgreen.svg)](#design)
 
-[Benchmark](https://linjiw.github.io/jbar/) · [Design](docs/DESIGN.md) · [Why not Spotlight?](docs/DIAGNOSIS.md) · [Comparison](docs/COMPARISON.md)
+[Benchmark](https://linjiw.github.io/jbar/) · [Design](docs/DESIGN.md) · [Why not Spotlight?](docs/DIAGNOSIS.md) · [Comparison](docs/COMPARISON.md) · [UX tests](docs/UX-TESTS.md)
 
 <img src="docs/images/jbar-panel.png" alt="JBar's search panel showing apps grouped above files, with matched characters highlighted" width="820">
 
@@ -76,7 +76,7 @@ Press **⌥Space** and start typing:
 
 | Key | Action |
 |---|---|
-| `↑ ↓` / `⌃N ⌃P` | move selection (scrolls past the visible rows) |
+| `↑ ↓` / `⌃N ⌃P` | move selection — scrolls past the visible rows |
 | `Return` | open |
 | `⌘Return` | reveal in Finder |
 | `⌘C` | copy path |
@@ -128,14 +128,14 @@ Full architecture, the verified-API table, and the ranking spec: [`docs/DESIGN.m
 ## Development
 
 ```bash
-make test                       # 306 unit tests (~45 s)
+make test                       # 332 unit tests (~50 s)
 make test-release               # with optimization — enforces perf budgets
 make cli Q="visual studio"      # headless search with timings
 make bench                      # index size / build time / RSS
 build/JBar.app/Contents/MacOS/JBar --benchmark    # head-to-head vs Spotlight
 ```
 
-See [`CONTRIBUTING.md`](CONTRIBUTING.md). Performance claims need measurements — one proposed optimization in this repo was rejected because it benchmarked *slower* than the code it replaced.
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) and the UX checklist in [`docs/UX-TESTS.md`](docs/UX-TESTS.md). Performance claims need measurements — one proposed optimization in this repo was rejected because it benchmarked *slower* than the code it replaced.
 
 ## Uninstall
 

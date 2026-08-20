@@ -38,9 +38,13 @@ public enum BonusConstants {
     public static let consecutive: UInt8 = 6
     /// Multiplier for the bonus of the first matched character.
     public static let firstMult: Int16 = 2
-    /// Stable hash of the constants, mixed into snapshot headers.
+    /// Folded-byte representation version. Bump when `TextAnalyzer.fold` changes so an index
+    /// containing bytes produced by an older normaliser is rebuilt instead of silently reused.
+    private static let foldedRepresentationVersion: UInt64 = 1
+    /// Stable hash of the constants and folded-byte representation, mixed into snapshot headers.
     public static var hash: UInt64 {
         UInt64(white) | UInt64(delim) << 8 | UInt64(boundary) << 16 | UInt64(camel) << 24 | UInt64(nonword) << 32 | UInt64(consecutive) << 40
+            | foldedRepresentationVersion << 48
     }
 
     /// Bonus for a character of class `cur` preceded by a character of class `prev`.
@@ -86,9 +90,31 @@ public enum Mask {
 
 /// Text normalisation + pre-analysis shared by the indexer (items, app aliases) and the engine (queries).
 public enum TextAnalyzer {
-    /// Case-, diacritic- and width-insensitive folding. CJK is preserved (multi-byte UTF-8).
+    /// Case-, diacritic- and width-insensitive folding. The result is NFC-normalised so canonically
+    /// equivalent text (notably precomposed Hangul and the decomposed form common in macOS file
+    /// names) produces identical searchable bytes. CJK is preserved (multi-byte UTF-8).
     @inlinable public static func fold(_ s: String) -> String {
-        s.folding(options: [.caseInsensitive, .diacriticInsensitive, .widthInsensitive], locale: nil)
+        canonicalizedIfNeeded(
+            s.folding(options: [.caseInsensitive, .diacriticInsensitive, .widthInsensitive], locale: nil)
+        )
+    }
+
+    /// NFC quick check for the only sequences that can still require canonical composition after
+    /// Foundation folding: combining marks and modern/extended Hangul Jamo. Canonical singleton
+    /// mappings are already resolved by `String.folding`. Avoiding an unconditional NSString
+    /// normalisation here keeps the ASCII-heavy index path essentially unchanged.
+    @usableFromInline
+    @inline(__always) static func canonicalizedIfNeeded(_ s: String) -> String {
+        for scalar in s.unicodeScalars {
+            let v = scalar.value
+            if scalar.properties.canonicalCombiningClass.rawValue != 0
+                || (v >= 0x1100 && v <= 0x11FF)
+                || (v >= 0xA960 && v <= 0xA97F)
+                || (v >= 0xD7B0 && v <= 0xD7FF) {
+                return s.precomposedStringWithCanonicalMapping
+            }
+        }
+        return s
     }
 
     /// Maximum number of initials packed into the `initials` word (8 × 8 bits).
@@ -101,15 +127,19 @@ public enum TextAnalyzer {
     /// - mask: presence bits of all folded bytes
     /// - initials: lowercase ASCII first byte of each word token (see `isTokenStart`), max 8, packed
     public static func analyze(_ s: String) -> SearchString {
+        // Normalise once before walking characters. NFC preserves grapheme count/order, which lets
+        // `characterIndices` perform the same walk while avoiding a normalisation allocation for
+        // every ASCII character in every indexed file name.
+        let canonical = canonicalizedIfNeeded(s)
         var folded: [UInt8] = []
         var bonus: [UInt8] = []
-        folded.reserveCapacity(s.utf8.count)
-        bonus.reserveCapacity(s.utf8.count)
+        folded.reserveCapacity(canonical.utf8.count)
+        bonus.reserveCapacity(canonical.utf8.count)
         var mask: UInt64 = 0
         var initials: UInt64 = 0
         var nInitials = 0
         var prev: CharClass = .white
-        for ch in s {
+        for ch in canonical {
             // Class from the original character (first scalar), bonus computed before folding.
             let cur = CharClass.of(ch.unicodeScalars.first!)
             let b = BonusConstants.bonus(prev: prev, cur: cur)
@@ -189,7 +219,9 @@ public enum TextAnalyzer {
         let wanted = Set(matchedFoldedByteOffsets)
         var result: [Int] = []
         var byteOff = 0
-        for (ci, ch) in display.enumerated() {
+        // Canonical composition cannot add/remove extended grapheme clusters, so these indices are
+        // also valid in the original display string even when its UTF-8 storage is decomposed.
+        for (ci, ch) in canonicalizedIfNeeded(display).enumerated() {
             let n = fold(String(ch)).utf8.count
             for k in 0..<n where wanted.contains(byteOff + k) { result.append(ci); break }
             byteOff += n
