@@ -1,0 +1,422 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>JBar — a launcher that finds your files in 1.5 ms</title>
+<meta name="description" content="A keyboard-first macOS launcher for apps and files. Owns its own index: ~1.5 ms warm search, about 360× faster than Spotlight. Swift/AppKit, zero dependencies, MIT.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>">
+<meta property="og:title" content="JBar — a launcher that finds your files in 1.5 ms">
+<meta property="og:description" content="Keyboard-first macOS launcher for apps and files. ~360× faster than Spotlight, because it owns its own index.">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://linjiw.github.io/jbar/">
+<meta property="og:image" content="https://linjiw.github.io/jbar/images/jbar-panel.png">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@600;700;800&family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+  :root{
+    --bg:#eef1f6; --panel:#fff; --panel-2:#f6f8fb; --line:#dde3ec;
+    --ink:#0d1220; --muted:#5a6474; --faint:#8a93a3;
+    --jbar:#1e5bff; --jbar-soft:#dbe5ff; --spot:#9aa6b6; --amber:#cf7a2e; --good:#1f9d63;
+    --shadow:0 1px 2px rgba(13,18,32,.05),0 14px 34px -14px rgba(13,18,32,.20);
+    --mono:'IBM Plex Mono',ui-monospace,SFMono-Regular,Menlo,monospace;
+    --sans:'IBM Plex Sans',system-ui,-apple-system,sans-serif;
+    --disp:'Archivo','IBM Plex Sans',system-ui,sans-serif;
+  }
+  @media (prefers-color-scheme:dark){
+    :root:not([data-theme="light"]){
+      --bg:#080b12; --panel:#131b28; --panel-2:#0f1621; --line:#243141;
+      --ink:#e9edf4; --muted:#9aa6b6; --faint:#69748a;
+      --jbar:#5488ff; --jbar-soft:#1d2c4d; --spot:#6b7788; --amber:#e0954a; --good:#38b981;
+      --shadow:0 1px 2px rgba(0,0,0,.4),0 20px 44px -18px rgba(0,0,0,.65);
+    }
+  }
+  :root[data-theme="dark"]{
+    --bg:#080b12; --panel:#131b28; --panel-2:#0f1621; --line:#243141;
+    --ink:#e9edf4; --muted:#9aa6b6; --faint:#69748a;
+    --jbar:#5488ff; --jbar-soft:#1d2c4d; --spot:#6b7788; --amber:#e0954a; --good:#38b981;
+    --shadow:0 1px 2px rgba(0,0,0,.4),0 20px 44px -18px rgba(0,0,0,.65);
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);font-size:16px;
+    line-height:1.6;-webkit-font-smoothing:antialiased;}
+  a{color:var(--jbar);text-decoration:none}
+  a:hover{text-decoration:underline}
+  a:focus-visible,button:focus-visible{outline:2px solid var(--jbar);outline-offset:3px;border-radius:4px}
+  .wrap{max-width:1000px;margin:0 auto;padding:0 clamp(18px,4vw,40px)}
+  code{font-family:var(--mono);font-size:.9em;background:var(--panel-2);border:1px solid var(--line);
+    padding:1px 6px;border-radius:5px}
+
+  /* nav */
+  nav{border-bottom:1px solid var(--line);background:color-mix(in srgb,var(--bg) 85%,transparent);
+    position:sticky;top:0;z-index:20;backdrop-filter:blur(10px)}
+  nav .wrap{display:flex;align-items:center;gap:22px;height:58px}
+  .brand{font-family:var(--disp);font-weight:800;font-size:19px;letter-spacing:-.02em;color:var(--ink)}
+  .brand:hover{text-decoration:none}
+  .brand .z{color:var(--jbar)}
+  nav .links{margin-left:auto;display:flex;gap:20px;font-size:14px;flex-wrap:wrap}
+  nav .links a{color:var(--muted)}
+  nav .links a:hover{color:var(--jbar)}
+
+  /* hero */
+  header{padding:clamp(44px,7vw,86px) 0 0}
+  .eyebrow{font-family:var(--mono);font-size:12px;letter-spacing:.14em;text-transform:uppercase;
+    color:var(--jbar);font-weight:600;display:flex;align-items:center;gap:10px}
+  .eyebrow::before{content:"";width:26px;height:2px;background:var(--jbar);border-radius:2px}
+  h1{font-family:var(--disp);font-weight:800;font-size:clamp(34px,6.4vw,58px);line-height:1.03;
+    letter-spacing:-.025em;margin:18px 0 0;text-wrap:balance;max-width:17ch}
+  h1 .em{color:var(--jbar)}
+  .lede{color:var(--muted);font-size:clamp(16px,2.1vw,19px);max-width:62ch;margin:18px 0 0}
+  .cta{display:flex;flex-wrap:wrap;gap:12px;margin-top:26px;align-items:center}
+  .btn{display:inline-flex;align-items:center;gap:8px;font-weight:600;font-size:14.5px;
+    padding:11px 18px;border-radius:9px;border:1px solid var(--line);background:var(--panel);
+    color:var(--ink);box-shadow:var(--shadow);cursor:pointer}
+  .btn:hover{text-decoration:none;border-color:var(--jbar)}
+  .btn.primary{background:var(--jbar);border-color:var(--jbar);color:#fff}
+  .btn.primary:hover{filter:brightness(1.08)}
+  .install{display:flex;align-items:center;gap:10px;font-family:var(--mono);font-size:13.5px;
+    background:var(--panel);border:1px solid var(--line);border-radius:9px;padding:10px 12px;
+    box-shadow:var(--shadow);color:var(--ink)}
+  .install .p{color:var(--faint)}
+  .install button{font-family:var(--sans);font-size:12px;font-weight:600;border:1px solid var(--line);
+    background:var(--panel-2);color:var(--muted);border-radius:6px;padding:4px 9px;cursor:pointer}
+  .install button:hover{color:var(--jbar);border-color:var(--jbar)}
+  .shot{margin:clamp(30px,5vw,52px) 0 0;border-radius:14px;overflow:hidden;border:1px solid var(--line);
+    box-shadow:var(--shadow);background:var(--panel-2);line-height:0}
+  .shot img{width:100%;height:auto;display:block}
+  .shot-cap{font-family:var(--mono);font-size:12px;color:var(--faint);margin-top:10px;line-height:1.5}
+
+  /* sections */
+  section{margin-top:clamp(52px,8vw,88px)}
+  h2{font-family:var(--disp);font-weight:700;font-size:clamp(22px,3.2vw,30px);letter-spacing:-.015em;margin:0 0 6px}
+  .sub{color:var(--muted);font-size:15px;margin:0 0 24px;max-width:66ch}
+
+  .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(158px,1fr));gap:14px}
+  .stat{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:18px;box-shadow:var(--shadow)}
+  .stat .n{font-family:var(--disp);font-weight:800;font-size:clamp(25px,3.6vw,32px);letter-spacing:-.02em;line-height:1}
+  .stat .n.j{color:var(--jbar)}
+  .stat .n span{font-size:.5em;font-weight:700}
+  .stat .k{font-family:var(--mono);font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--faint);margin-top:9px}
+  .stat .d{font-size:13px;color:var(--muted);margin-top:5px}
+
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:16px;box-shadow:var(--shadow);
+    padding:clamp(18px,3vw,26px)}
+  .legend{display:flex;gap:18px;font-family:var(--mono);font-size:12px;color:var(--muted);
+    margin-bottom:16px;flex-wrap:wrap;align-items:center}
+  .swatch{display:inline-flex;align-items:center;gap:7px}
+  .swatch i{width:12px;height:12px;border-radius:3px;display:inline-block}
+  .axis{position:relative;height:15px;margin-left:96px;border-bottom:1px solid var(--line)}
+  .axis .t{position:absolute;top:0;transform:translateX(-50%);font-family:var(--mono);font-size:10.5px;color:var(--faint);white-space:nowrap}
+  .row{display:grid;grid-template-columns:96px 1fr;align-items:center;padding:9px 0;border-bottom:1px dashed var(--line)}
+  .row:last-child{border-bottom:0}
+  .row .q{font-family:var(--mono);font-size:13px;font-weight:500}
+  .row .q small{color:var(--faint);font-weight:400;font-size:10.5px;display:block;margin-top:1px}
+  .track{position:relative;height:34px}
+  .bar{position:absolute;height:13px;border-radius:0 4px 4px 0;left:0;width:0;
+    transition:width .9s cubic-bezier(.2,.7,.2,1)}
+  .bar.j{top:2px;background:var(--jbar)}
+  .bar.s{top:19px;background:var(--spot)}
+  .bar.slow{background:linear-gradient(90deg,var(--spot),var(--amber))}
+  .bar .v{position:absolute;left:calc(100% + 7px);top:50%;transform:translateY(-50%);
+    font-family:var(--mono);font-size:11px;white-space:nowrap;color:var(--muted)}
+  .bar.j .v{color:var(--jbar);font-weight:600}
+  .chart-note{font-family:var(--mono);font-size:12px;color:var(--faint);margin-top:14px;line-height:1.6}
+
+  .tbl-wrap{overflow-x:auto}
+  table{width:100%;border-collapse:collapse;font-size:14.5px}
+  th,td{text-align:left;padding:11px 12px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{font-family:var(--mono);font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--faint);font-weight:500}
+  td.n{font-family:var(--mono);text-align:right;font-variant-numeric:tabular-nums}
+  .j{color:var(--jbar);font-weight:600}
+
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:14px}
+  .feat{background:var(--panel);border:1px solid var(--line);border-radius:13px;padding:18px 20px;box-shadow:var(--shadow)}
+  .feat h3{font-family:var(--disp);font-size:15.5px;margin:0 0 6px;font-weight:700}
+  .feat p{margin:0;font-size:13.5px;color:var(--muted)}
+  .feat .kbd{font-family:var(--mono);font-size:12px;color:var(--jbar)}
+
+  .why{background:var(--panel);border:1px solid var(--line);border-left:3px solid var(--amber);
+    border-radius:0 14px 14px 0;padding:22px 24px;box-shadow:var(--shadow)}
+  .why p{margin:0 0 12px}
+  .why p:last-child{margin-bottom:0}
+  .why .log{font-family:var(--mono);font-size:12px;color:var(--muted);background:var(--panel-2);
+    border:1px solid var(--line);border-radius:9px;padding:12px 14px;overflow-x:auto;white-space:pre;margin:14px 0}
+
+  pre{font-family:var(--mono);font-size:13px;background:var(--panel);border:1px solid var(--line);
+    border-radius:11px;padding:16px 18px;overflow-x:auto;box-shadow:var(--shadow);line-height:1.7}
+  pre .c{color:var(--faint)}
+
+  footer{margin-top:clamp(56px,8vw,96px);padding:26px 0 60px;border-top:1px solid var(--line);
+    font-family:var(--mono);font-size:12.5px;color:var(--faint);display:flex;flex-wrap:wrap;gap:8px 20px;
+    justify-content:space-between}
+  @media (prefers-reduced-motion:reduce){.bar{transition:none}}
+</style>
+</head>
+<body>
+
+<nav><div class="wrap">
+  <a class="brand" href="#top">J<span class="z">Bar</span></a>
+  <div class="links">
+    <a href="#benchmark">Benchmark</a>
+    <a href="#install">Install</a>
+    <a href="#why">Why</a>
+    <a href="#how">How it works</a>
+    <a href="https://github.com/linjiw/jbar">GitHub</a>
+  </div>
+</div></nav>
+
+<div class="wrap" id="top">
+
+<header>
+  <div class="eyebrow">macOS launcher · Swift + AppKit · MIT</div>
+  <h1>Your files, found in <span class="em">1.5 ms</span>.</h1>
+  <p class="lede">JBar is a keyboard-first launcher for macOS apps and files. It builds and searches
+    its <strong>own index</strong>, so it stays instant and complete even when Spotlight's index is
+    mid-rebuild — measured at about <strong>360× faster</strong> than Spotlight on the same machine
+    and the same queries.</p>
+  <div class="cta">
+    <a class="btn primary" href="#install">Install</a>
+    <a class="btn" href="https://github.com/linjiw/jbar">View source</a>
+    <div class="install">
+      <span class="p">$</span><span id="cmd">git clone https://github.com/linjiw/jbar &amp;&amp; cd jbar &amp;&amp; make install</span>
+      <button id="copy" type="button">Copy</button>
+    </div>
+  </div>
+
+  <div class="shot">
+    <img src="images/jbar-panel.png" width="1360" height="904"
+         alt="JBar's search panel: the query 's' shows Safari, Visual Studio Code and System Settings grouped as apps above a divider, then DESIGN.md, DIAGNOSIS.md, Package.swift, Info.plist and build-app.sh as files — each row with an icon, the matched letter highlighted, a shortened path, and a type badge.">
+  </div>
+  <p class="shot-cap">⌥Space → type → Return. Apps group above files; matched characters are highlighted;
+    ⌘Return reveals in Finder, ⌘C copies the path.</p>
+</header>
+
+<section id="numbers">
+  <h2>The numbers</h2>
+  <p class="sub">Measured on an Apple Silicon MacBook Air (10 cores, 16 GB, macOS 26.5.2) — after
+    Spotlight had fully rebuilt its index, so this is Spotlight at its best, not mid-rebuild.</p>
+  <div class="stats">
+    <div class="stat"><div class="n j">1.5<span> ms</span></div><div class="k">Warm search, median</div><div class="d">Spotlight: 556 ms</div></div>
+    <div class="stat"><div class="n">2.3<span> s</span></div><div class="k">Cold index build</div><div class="d">182k files, all cores</div></div>
+    <div class="stat"><div class="n">82<span> MB</span></div><div class="k">Resident memory</div><div class="d">~0 idle CPU</div></div>
+    <div class="stat"><div class="n">0</div><div class="k">Permissions needed</div><div class="d">no Accessibility / FDA</div></div>
+    <div class="stat"><div class="n">0</div><div class="k">Dependencies</div><div class="d">system frameworks only</div></div>
+    <div class="stat"><div class="n">297</div><div class="k">Unit tests</div><div class="d">90%+ core coverage</div></div>
+  </div>
+</section>
+
+<section id="benchmark">
+  <h2>JBar vs Spotlight, per query</h2>
+  <p class="sub">Warm p50 over 300 iterations against JBar's engine, and <code>NSMetadataQuery</code>
+    against Spotlight, in the same process. The axis is logarithmic — the gap spans three orders of
+    magnitude, so a linear scale would hide JBar entirely.</p>
+  <div class="card">
+    <div class="legend">
+      <span class="swatch"><i style="background:var(--jbar)"></i> JBar</span>
+      <span class="swatch"><i style="background:var(--spot)"></i> Spotlight</span>
+      <span class="swatch"><i style="background:linear-gradient(90deg,var(--spot),var(--amber))"></i> Spotlight &gt; 1 s</span>
+      <span style="margin-left:auto;color:var(--faint)">log scale · milliseconds</span>
+    </div>
+    <div class="axis" id="axis"></div>
+    <div id="chart"></div>
+    <p class="chart-note">Every JBar keystroke lands inside one 60 fps frame (16 ms). Spotlight's cost
+      grows with the number of matches: a single character costs it three seconds.</p>
+  </div>
+</section>
+
+<section id="compare">
+  <h2>Side by side</h2>
+  <p class="sub">Two tools with different jobs. JBar is a launcher that owns a fresh index of your apps
+    and files; Spotlight is a whole-Mac content search running as a system service.</p>
+  <div class="card tbl-wrap">
+    <table>
+      <thead><tr><th>Dimension</th><th>JBar</th><th>Spotlight</th></tr></thead>
+      <tbody>
+        <tr><td>Median warm latency</td><td class="n j">1.5 ms</td><td class="n">556 ms</td></tr>
+        <tr><td>Worst query (single char <code>x</code>)</td><td class="n j">2.0 ms</td><td class="n">3,004 ms</td></tr>
+        <tr><td>Index build / refresh</td><td class="n j">2.3 s</td><td class="n">minutes–hours</td></tr>
+        <tr><td>Warm start</td><td class="n j">0.1–0.4 s</td><td class="n">—</td></tr>
+        <tr><td>Ranking for launching</td><td>apps-first · acronyms · pinyin · frecency</td><td>opaque substring</td></tr>
+        <tr><td>Chinese / pinyin (<code>wx</code> → 微信)</td><td class="j">yes</td><td>partial</td></tr>
+        <tr><td>Searches file <em>contents</em></td><td>no — names + metadata</td><td class="j">yes</td></tr>
+        <tr><td>Scope</td><td>configured home roots</td><td>whole Mac</td></tr>
+        <tr><td>Idle CPU</td><td class="n j">~0</td><td class="n">200–400% while reindexing</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="sub" style="margin-top:14px">Full methodology, coverage analysis and the honest limitations:
+    <a href="https://github.com/linjiw/jbar/blob/main/docs/COMPARISON.md">docs/COMPARISON.md</a>.</p>
+</section>
+
+<section id="why">
+  <h2>Why this exists</h2>
+  <p class="sub">Not because Spotlight is badly built — because a whole-Mac content index is fragile in
+    ways a launcher can't tolerate.</p>
+  <div class="why">
+    <p>On <strong>2026-08-19</strong>, Spotlight on the development machine could not find a single one
+      of the <strong>1,101 files in <code>~/Downloads</code></strong>. An unclean shutdown had caused
+      macOS to throw away an index that had been silently corrupt since 03:27, and it spent the next two
+      hours rebuilding 1.77 million records:</p>
+    <div class="log">14:11:07  CIMetaInfoOpenAndLock failed 68 → Index shut down → Creating New Index
+14:11:10  *** PRESCAN SCAN STARTED fullScan:1 bootCacheUUIDMismatch:1 ***
+14:14:26  SyncScanComplete result:0 fullScan:1 (import records:1,767,279)</div>
+    <p>Meanwhile <strong>34%</strong> of everything it had indexed under the home directory was
+      <code>node_modules</code>, and <code>mds</code> burned 160–400% CPU for over an hour importing
+      dependency trees while the user's documents waited in the queue.</p>
+    <p>That is a failure mode no amount of Spotlight tuning prevents. So JBar owns its index, refreshes
+      it in ~2.3 s, keeps it current with FSEvents, and excludes the junk by default — which is why its
+      index is 182k items where Spotlight's is 2 million.
+      <a href="https://github.com/linjiw/jbar/blob/main/docs/DIAGNOSIS.md">Read the full forensic write-up →</a></p>
+  </div>
+</section>
+
+<section id="features">
+  <h2>What it does</h2>
+  <div class="grid">
+    <div class="feat"><h3>Acronyms &amp; fuzzy</h3><p><span class="kbd">vsc</span> → Visual Studio Code,
+      <span class="kbd">xc</span> → Xcode. An fzf-style Smith-Waterman scorer with word-boundary and
+      camelCase bonuses, behind a 64-bit character-mask prefilter.</p></div>
+    <div class="feat"><h3>Chinese &amp; pinyin</h3><p><span class="kbd">wx</span>, <span class="kbd">weixin</span>
+      and <span class="kbd">微信</span> all find WeChat. Pinyin (with heteronym overrides) is precomputed
+      at index time for every CJK name.</p></div>
+    <div class="feat"><h3>Learns what you open</h3><p>Mozilla-style frecency with a 7-day half-life, plus
+      per-query learning — the thing you picked last time for this exact query comes back first.</p></div>
+    <div class="feat"><h3>Path browsing</h3><p>Type <span class="kbd">~/Dow</span> and press Tab to walk
+      the filesystem live, listing every entry in a directory — including ones Spotlight hasn't indexed.</p></div>
+    <div class="feat"><h3>Knows what's junk</h3><p><code>node_modules</code>, <code>.venv</code>,
+      <code>vendor/</code>, conda, <code>go/pkg</code> and build output are never crawled; <code>build/</code>,
+      <code>dist/</code> and friends are indexed but de-ranked.</p></div>
+    <div class="feat"><h3>Keyboard only</h3><p>Return opens, ⌘Return reveals in Finder, ⌘C copies the path,
+      ⌘1–8 jump to a row, Esc closes. No mouse, no Dock icon — just a menu-bar item.</p></div>
+    <div class="feat"><h3>No scary permissions</h3><p>The hotkey uses Carbon's
+      <code>RegisterEventHotKey</code>, so JBar never asks for Accessibility, Input Monitoring or Full
+      Disk Access — only the standard folder prompts.</p></div>
+    <div class="feat"><h3>Stays out of the way</h3><p>~82 MB resident, ~0 idle CPU (FSEvents, no polling),
+      and a binary snapshot that makes a warm start ~0.1 s.</p></div>
+  </div>
+</section>
+
+<section id="install">
+  <h2>Install</h2>
+  <p class="sub">Requires macOS 13+ and the Xcode command-line tools. No <code>sudo</code>.</p>
+<pre><span class="c"># build a release JBar.app, install it to /Applications, register a login item, launch it</span>
+git clone https://github.com/linjiw/jbar.git
+cd jbar
+make install</pre>
+  <p class="sub" style="margin-top:16px">Press <strong>⌥Space</strong>. On your first search macOS asks
+    to let JBar read Desktop, Documents and Downloads — allow them; that is the only permission it needs.
+    To remove it: <code>make uninstall</code> (add <code>PURGE=1</code> to delete config and cache too).</p>
+</section>
+
+<section id="how">
+  <h2>How it works</h2>
+  <p class="sub">Two targets, zero dependencies, system frameworks only.</p>
+<pre>Hotkey (Carbon)  →  NSPanel + NSTableView  →  SearchEngine (actor)
+                                                     ↓ reads
+                       IndexStore  ←  Indexer: AppScanner · Crawler · FSEvents · Snapshot</pre>
+  <div class="grid" style="margin-top:16px">
+    <div class="feat"><h3>Flat, cache-linear index</h3><p>Parallel arrays plus one lowercase UTF-8 name
+      arena — about 60 bytes per item. Paths are reconstructed on demand from a directory table rather
+      than stored per file.</p></div>
+    <div class="feat"><h3>Mask prefilter, then DP</h3><p>Each item carries a 64-bit character-presence
+      mask; a query rejects 75–92% of candidates with one AND before the fuzzy scorer runs on the
+      survivors.</p></div>
+    <div class="feat"><h3>Parallel crawl</h3><p>Every root is crawled concurrently into its own builder
+      and merged — 182k files in 2.3 s, with the autorelease pool drained per directory to keep peak
+      memory bounded.</p></div>
+    <div class="feat"><h3>Incremental, not periodic</h3><p>One FSEvents stream covers every root;
+      changed directories are re-listed and the index is rebuilt as an immutable generation and swapped
+      atomically.</p></div>
+  </div>
+  <p class="sub" style="margin-top:16px">Architecture, data model, the verified-API table and the full
+    ranking spec: <a href="https://github.com/linjiw/jbar/blob/main/docs/DESIGN.md">docs/DESIGN.md</a>.</p>
+</section>
+
+<section id="limits">
+  <h2>Where Spotlight wins</h2>
+  <div class="card">
+    <p style="margin:0 0 10px"><strong>Spotlight searches file contents. JBar does not.</strong> If you
+      need to find a phrase inside a PDF or a Pages document, Spotlight is the right tool — JBar (v1)
+      indexes names and metadata only.</p>
+    <p style="margin:0 0 10px">Spotlight also covers the whole Mac; JBar covers the roots you configure
+      (your home directory minus dependency trees, by default).</p>
+    <p style="margin:0">And the coverage figure is honest: on a random sample of 120 real files, JBar
+      surfaced the exact file in its top 50 for 92% of them. The other 8% are common filenames like
+      <code>index.js</code> with hundreds of copies — indexed, but out-ranked by their namesakes. A
+      launcher shows the best few on purpose.</p>
+  </div>
+</section>
+
+<footer>
+  <span>JBar · MIT · <a href="https://github.com/linjiw/jbar">github.com/linjiw/jbar</a></span>
+  <span>Built in Swift + AppKit for macOS 13+</span>
+</footer>
+
+</div>
+
+<script>
+  // Measured data: [query, note, JBar p50 (ms), Spotlight (ms)]
+  var data = [
+    ["vsc","app acronym",3.40,480],
+    ["code","app word",3.91,1217],
+    ["xc","app acronym",1.31,788],
+    ["chrome","app exact",0.76,141],
+    ["wx","pinyin 微信",0.35,145],
+    ["term","app prefix",3.73,364],
+    ["report","file word",1.53,365],
+    ["report pdf","multi-term",0.19,122],
+    ["readme","common file",1.97,816],
+    ["index","hot token",0.48,1510],
+    ["x","single char",2.05,3005]
+  ];
+  var LO = Math.log10(0.01), HI = Math.log10(4000), SPAN = HI - LO;
+  function pos(ms){ return Math.max(0, Math.min(100, (Math.log10(ms) - LO) / SPAN * 100)); }
+  function fmt(ms){ return ms >= 1000 ? (ms/1000).toFixed(2) + "s" : (ms < 10 ? ms.toFixed(2) : Math.round(ms)) + "ms"; }
+
+  var axis = document.getElementById("axis");
+  [0.1, 1, 10, 100, 1000].forEach(function(v){
+    var t = document.createElement("span");
+    t.className = "t"; t.style.left = pos(v) + "%";
+    t.textContent = v >= 1000 ? (v/1000) + "s" : v + "ms";
+    axis.appendChild(t);
+  });
+
+  var chart = document.getElementById("chart");
+  data.forEach(function(d){
+    var row = document.createElement("div");
+    row.className = "row";
+    row.innerHTML =
+      '<div class="q">' + d[0] + '<small>' + d[1] + '</small></div>' +
+      '<div class="track">' +
+        '<div class="bar j" data-w="' + pos(d[2]) + '"><span class="v">' + fmt(d[2]) + '</span></div>' +
+        '<div class="bar ' + (d[3] > 1000 ? 'slow' : 's') + '" data-w="' + pos(d[3]) + '"><span class="v">' + fmt(d[3]) + '</span></div>' +
+      '</div>';
+    chart.appendChild(row);
+  });
+
+  function grow(){
+    document.querySelectorAll(".bar").forEach(function(b, i){
+      setTimeout(function(){ b.style.width = b.dataset.w + "%"; }, 40 + i * 20);
+    });
+  }
+  if ("IntersectionObserver" in window) {
+    var io = new IntersectionObserver(function(es){
+      es.forEach(function(e){ if (e.isIntersecting) { grow(); io.disconnect(); } });
+    }, { threshold: 0.15 });
+    io.observe(document.getElementById("benchmark"));
+  } else { grow(); }
+
+  var copyBtn = document.getElementById("copy");
+  copyBtn.addEventListener("click", function(){
+    var text = document.getElementById("cmd").textContent;
+    navigator.clipboard.writeText(text).then(function(){
+      copyBtn.textContent = "Copied";
+      setTimeout(function(){ copyBtn.textContent = "Copy"; }, 1600);
+    }, function(){ copyBtn.textContent = "Press ⌘C"; });
+  });
+</script>
+</body>
+</html>
