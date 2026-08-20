@@ -35,7 +35,9 @@ final class SearchPanel: NSPanel, NSTextFieldDelegate {
     static let inputRowHeight: CGFloat = 60
     static let bottomPadding: CGFloat = 8
     static let rowHeight = ResultsController.rowHeight
-    static let maxHeight: CGFloat = 452 // 60 + 8 × 48 + 8
+    /// Height with the default 8 visible rows (60 + 8 × 48 + 8). The live maximum follows
+    /// `visibleRows` and the screen — see `maxPanelHeight(on:)`.
+    static let maxHeight: CGFloat = 452
     /// Delay before a "Loading…" row replaces stale content while a slow (path-mode) query runs.
     static let loadingRowDelay: TimeInterval = 0.3
 
@@ -190,26 +192,41 @@ final class SearchPanel: NSPanel, NSTextFieldDelegate {
         }
     }
 
+    /// Tallest the panel may grow with the configured `visibleRows`, never exceeding the screen's
+    /// visible frame (so a large `visibleRows`, or a small display, cannot push it off-screen —
+    /// the extra rows simply scroll instead).
+    private func maxPanelHeight(on screen: NSScreen?) -> CGFloat {
+        let wanted = Self.inputRowHeight + Self.rowHeight * CGFloat(results.maxVisible) + Self.bottomPadding
+        guard let vf = screen?.visibleFrame else { return wanted }
+        return min(wanted, max(Self.inputRowHeight + Self.bottomPadding, vf.height - 32))
+    }
+
     /// Centre horizontally on the target screen, input-row centre 1/3 down the visible frame.
     private func placeOnScreen() {
         guard let screen = targetScreen() else { return }
         let vf = screen.visibleFrame
         let width = min(Self.panelWidth, max(320, vf.width - 40))
+        let maxH = maxPanelHeight(on: screen)
         var top = (vf.maxY - vf.height / 3 + Self.inputRowHeight / 2).rounded()
         top = min(top, vf.maxY - 8)
-        if top - Self.maxHeight < vf.minY { top = min(vf.maxY - 8, vf.minY + Self.maxHeight + 8) }
+        if top - maxH < vf.minY { top = min(vf.maxY - 8, vf.minY + maxH + 8) }
         topEdge = top
         let h = frame.height
         setFrame(NSRect(x: (vf.midX - width / 2).rounded(), y: top - h, width: width, height: h), display: false)
     }
 
-    /// Height for the current row count; the top edge stays where `placeOnScreen()` put it.
+    /// Height needed for `n` rows, ignoring any cap (callers clamp to `maxPanelHeight(on:)`).
     static func height(forVisibleRows n: Int) -> CGFloat {
-        min(maxHeight, inputRowHeight + rowHeight * CGFloat(max(0, n)) + bottomPadding)
+        inputRowHeight + rowHeight * CGFloat(max(0, n)) + bottomPadding
+    }
+
+    /// How many rows actually fit in `height` (used to keep `visibleRows` honest on small screens).
+    static func rowsThatFit(in height: CGFloat) -> Int {
+        max(0, Int((height - inputRowHeight - bottomPadding) / rowHeight))
     }
 
     private func applyHeight() {
-        let h = Self.height(forVisibleRows: results.visibleRowCount)
+        let h = min(Self.height(forVisibleRows: results.visibleRowCount), maxPanelHeight(on: targetScreen()))
         var f = frame
         if topEdge == 0 { topEdge = f.maxY }
         f.origin.y = topEdge - h
