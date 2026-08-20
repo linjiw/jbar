@@ -81,6 +81,7 @@ private enum DirectorySafetyError: Error {
     case notDirectory
     case identityChanged
     case outsideRoot
+    case malformedEntry
 
     var errorCode: Int32? {
         if case .system(let code) = self { return code }
@@ -175,6 +176,11 @@ private final class OpenDirectory {
     func entries(limit: Int, includeHidden: Bool, rootBoundary: String? = nil,
                  claimCrawlBudget: () -> Bool = { true }) throws -> PhysicalDirectoryListing {
         if let rootBoundary { try requireInside(rootBoundary) }
+        guard let recordLengthOffset = MemoryLayout<dirent>.offset(of: \.d_reclen),
+              let nameLengthOffset = MemoryLayout<dirent>.offset(of: \.d_namlen),
+              let nameOffset = MemoryLayout<dirent>.offset(of: \.d_name) else {
+            throw DirectorySafetyError.malformedEntry
+        }
         let duplicate = dup(fd)
         guard duplicate >= 0 else { throw DirectorySafetyError.system(errno) }
         guard let stream = fdopendir(duplicate) else {
@@ -193,16 +199,29 @@ private final class OpenDirectory {
                 if errno != 0 { throw DirectorySafetyError.system(errno) }
                 break
             }
-            var raw = pointer.pointee.d_name
-            let length = Int(pointer.pointee.d_namlen)
-            let cName: [CChar] = withUnsafePointer(to: &raw) { tuple in
-                tuple.withMemoryRebound(to: CChar.self, capacity: length + 1) {
-                    var bytes = Array(UnsafeBufferPointer(start: $0, count: length))
-                    bytes.append(0)
-                    return bytes
-                }
+            // Darwin `readdir` records are variable length even though Swift imports `dirent.d_name`
+            // as a fixed 1,024-byte tuple. Materializing that tuple can read beyond a short record.
+            // Read only fixed header fields, prove the name and its terminator are inside d_reclen,
+            // and retain exactly the raw bytes the descriptor-relative calls must address.
+            let rawRecord = UnsafeRawPointer(pointer)
+            let recordLength = Int(rawRecord.load(fromByteOffset: recordLengthOffset,
+                                                   as: UInt16.self))
+            let nameLength = Int(rawRecord.load(fromByteOffset: nameLengthOffset,
+                                                 as: UInt16.self))
+            guard recordLength > nameOffset,
+                  nameLength <= SafetyLimits.maxNameUTF8Bytes,
+                  nameLength < Int(MAXPATHLEN),
+                  nameLength < recordLength - nameOffset,
+                  rawRecord.load(fromByteOffset: nameOffset + nameLength,
+                                 as: UInt8.self) == 0 else {
+                throw DirectorySafetyError.malformedEntry
             }
-            let name = String(decoding: cName.dropLast().map { UInt8(bitPattern: $0) }, as: UTF8.self)
+            let rawName = UnsafeRawBufferPointer(start: rawRecord.advanced(by: nameOffset),
+                                                  count: nameLength)
+            guard !rawName.contains(0) else { throw DirectorySafetyError.malformedEntry }
+            var cName = rawName.map { CChar(bitPattern: $0) }
+            cName.append(0)
+            let name = String(decoding: rawName, as: UTF8.self)
             if name == "." || name == ".." { continue }
             // Count every non-dot directory name, not only visible/fstat-successful entries. Otherwise
             // millions of hidden or concurrently vanishing names could keep memory bounded yet bypass
