@@ -227,17 +227,17 @@ scripts/benchmark-release.sh 100
 JBAR_BENCHMARK_INCLUDE_REAL=1 scripts/benchmark-release.sh 100
 ```
 
-The current local release-mode record uses report schema 1, workload 2, and fixture generator 2. It ran 300k, 500k, and 1M fixtures in three sequential independent processes per size with 100 observations per full-scan/sequence/supersession cell. The opt-in real crawl was disabled for this formal campaign. Every response expected to complete had to be complete and non-cancelled; deliberately superseded older requests had to cancel. Repeated queries across cold/warm/typing/deletion/supersession had to preserve the complete ordered rows and exact total. The harness also required cross-process corpus/history/config/workload identity plus source/tool/binary/checksum manifests.
+The current local release-mode record uses report schema 1, workload 2, and fixture generator 2. It was generated at 2026-08-21T00:20:08Z from clean candidate commit `183fc3c2e526e21dccc7976203e5f00ba371426c` and ran 300k, 500k, and 1M fixtures in three sequential independent processes per size with 100 observations per full-scan/sequence/supersession cell. The opt-in real crawl was disabled for this formal campaign. Every response expected to complete had to be complete and non-cancelled; deliberately superseded older requests had to cancel. Repeated queries across cold/warm/typing/deletion/supersession had to preserve the complete ordered rows and exact total. The harness also required cross-process corpus/history/config/workload identity plus source/tool/binary/checksum manifests.
 
 On the recorded Apple M4 Mac16,12 / 16 GiB / macOS 26.5.2 machine, the synthetic ranges were:
 
 | items | cold `x` p50 range | serial typing `r` p50 range | newest supersession p50 range | cancellation correctness |
 |---:|---:|---:|---:|---:|
-| 300k | 42.730–44.183 ms | 66.936–70.446 ms | 10.750–12.500 ms | older 300/300 cancelled; newest 0 unexpected |
-| 500k | 75.180–76.676 ms | 117.441–119.675 ms | 19.473–21.937 ms | older 300/300 cancelled; newest 0 unexpected |
-| 1M | 154.645–155.734 ms | 240.641–241.884 ms | 43.461–44.741 ms | older 300/300 cancelled; newest 0 unexpected |
+| 300k | 43.689–55.232 ms | 71.341–84.240 ms | 13.419–14.085 ms | older 300/300 cancelled; newest 0 unexpected |
+| 500k | 90.123–90.996 ms | 132.956–143.578 ms | 22.625–24.058 ms | older 300/300 cancelled; newest 0 unexpected |
+| 1M | 171.521–181.592 ms | 251.063–269.888 ms | 40.284–45.404 ms | older 300/300 cancelled; newest 0 unexpected |
 
-The complete p95/p99/max distributions and retained high-tail samples live in the evidence reports; do not reduce the table to a best process. Older real-corpus figures are not current evidence because they used a different binary. These are local observational engine timings, not key-to-paint UI latency or a cross-machine SLA. The current evidence manifest is `c603de43…f43425`, and its immutable benchmark binary is `d8471508…03dbc`.
+The complete p95/p99/max distributions and retained high-tail samples live in the evidence reports; do not reduce the table to a best process. Older real-corpus figures are not current evidence because they used a different binary. These are local development observations of engine timing, not key-to-paint UI latency, a cross-machine SLA, or evidence for a notarized release artifact. The current evidence manifest is `7a64cb87…0de6ab`, and its immutable benchmark binary is `ec449660…356654f`.
 
 For a two-hour soak, repeatedly open/hide, type/delete, switch input sources, rebuild, edit config atomically/in place, sleep/wake, attach/detach displays, and open items. Record peak/steady RSS, CPU/energy while idle and indexing, index generation/count, responsiveness, crash/hang reports, and state-file validity after force quit/relaunch. Define acceptance numbers before interpreting the output.
 

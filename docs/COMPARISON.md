@@ -40,21 +40,21 @@ The script and `--benchmark` implementation:
 ## Evidence currently recorded
 
 The current PASS bundle is local at
-`/private/tmp/jbar-benchmark-evidence.w5olzPe4`. It was recorded on 2026-08-20 on a Mac16,12 with an
-Apple M4, 10 active processors, 16 GiB physical memory, arm64, and macOS 26.5.2 (25F84). This is an
-optimized development binary from a **dirty working tree** at HEAD
-`35971405e81dbaae1fe7888c859a3b3e2726b0de`; the evidence is not reconstructible from that commit
-alone and is not a signed/notarized release artifact.
+`/private/tmp/jbar-benchmark-evidence.lf1nUyeT`. It was generated at 2026-08-21T00:20:08Z on a
+Mac16,12 with an Apple M4, 10 active processors, 16 GiB physical memory, arm64, and macOS 26.5.2
+(25F84), using Xcode 26.2 (17C52) and Swift 6.2.3. This is an optimized development binary from the
+**clean candidate commit** `183fc3c2e526e21dccc7976203e5f00ba371426c`; it is not a
+signed/notarized release artifact.
 
 | Evidence identity | Recorded value |
 |---|---|
 | report / workload / fixture generator | schema v1 / workload v2 / generator v2 |
-| release-mode binary SHA-256, unchanged before/after | `d8471508097313d62215113f6c3626c77ae4e73c10b0f0e77735189952303dbc` |
+| release-mode binary SHA-256, unchanged before/after | `ec4496606f09e30f3ac5ea65b8fcdd16a7c77d8e21b1402f508b73d93356654f` |
 | `scripts/benchmark-release.sh` SHA-256 | `13cd7e53b116bf939fe51b895cffd4c3c94022be9b7d3808f88a98499fe30842` |
 | `benchmark-report-gate.rb` SHA-256 | `6c0436e2a15241d5679a4560e370ae3018b4d6851241f642ecaa13b2141fe6e7` |
-| source-manifest file SHA-256, identical before/after | `f3104027fdf9f5e2c03e6fc2dd1257bbb04625ec42f4a59098e59b8bc3168657` |
+| source-manifest file SHA-256, identical before/after | `7da3d07f27a0da2b128c3acc38876fcf8f5136b9a9626e246ee878a0915fdead` |
 | tooling-manifest file SHA-256, identical before/after | `7b78ccb538ef93e6cc237b1069a37f8d2946a18154b911fbd102499058c8590f` |
-| final `SHA256SUMS` SHA-256 | `c603de43d4f900b4454a80f410e002ff48ed3149d8c31e291f89e58260f43425` |
+| final `SHA256SUMS` SHA-256 | `7a64cb87f45e11a04b116be1a05c78e6da3077e9cf5f422fcd23a86c070de6ab` |
 
 All nine synthetic executions exited successfully, their report gates and repeat-identity checks
 returned zero, the scratch directory was removed, and the terminal result was `PASS` with the
@@ -79,9 +79,9 @@ processes, not a range.
 
 | Items | engine-cache-cold `x`: p50 / p95 / p99 / worst max (ms) | typing `r`: p50 / p95 / p99 / worst max (ms) | supersession newest `chrome`: p50 / p95 / p99 / worst max (ms) |
 |---:|---:|---:|---:|
-| 300,000 | 42.730–44.183 / 44.059–45.226 / 44.602–45.813 / 46.473 | 66.936–70.446 / 68.288–73.462 / 69.197–74.320 / 81.400 | 10.750–12.500 / 11.352–13.501 / 11.626–13.703 / 14.052 |
-| 500,000 | 75.180–76.676 / 77.937–79.656 / 78.405–84.464 / 88.837 | 117.441–119.675 / 122.530–123.165 / 125.831–131.816 / 148.940 | 19.473–21.937 / 19.959–22.847 / 20.154–23.495 / 23.562 |
-| 1,000,000 | 154.645–155.734 / 157.762–161.791 / 158.794–166.821 / 168.427 | 240.641–241.884 / 245.731–252.300 / 247.862–278.193 / 289.969 | 43.461–44.741 / 46.102–46.654 / 46.529–46.907 / 48.124 |
+| 300,000 | 43.689–55.232 / 49.349–57.592 / 49.470–59.391 / 59.413 | 71.341–84.240 / 76.207–92.882 / 77.723–98.259 / 100.719 | 13.419–14.085 / 14.770–16.891 / 14.867–17.316 / 23.740 |
+| 500,000 | 90.123–90.996 / 96.980–97.031 / 98.619–98.682 / 99.343 | 132.956–143.578 / 148.162–156.551 / 156.403–172.096 / 181.244 | 22.625–24.058 / 25.698–27.505 / 26.353–28.802 / 29.407 |
+| 1,000,000 | 171.521–181.592 / 178.376–188.499 / 179.651–189.826 / 193.135 | 251.063–269.888 / 268.004–291.179 / 270.453–306.044 / 320.136 | 40.284–45.404 / 47.079–50.047 / 48.457–52.138 / 53.612 |
 
 For **each** size, all 300 older superseded scans cancelled as intended and zero of the 300 newest
 scans cancelled unexpectedly. High-tail samples are deliberately preserved rather than discarded

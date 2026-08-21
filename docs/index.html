@@ -183,8 +183,8 @@
   <div class="stats">
     <div class="stat"><div class="n j">3 × 100</div><div class="k">Processes × samples</div><div class="d">for each synthetic size</div></div>
     <div class="stat"><div class="n">1<span> M</span></div><div class="k">Largest fixed fixture</div><div class="d">schema 1 · workload 2</div></div>
-    <div class="stat"><div class="n">155–156<span> ms</span></div><div class="k">1M cold-x p50</div><div class="d">range across three processes</div></div>
-    <div class="stat"><div class="n">241–242<span> ms</span></div><div class="k">1M serial-typing r p50</div><div class="d">engine call, not key-to-paint</div></div>
+    <div class="stat"><div class="n">172–182<span> ms</span></div><div class="k">1M cold-x p50</div><div class="d">range across three processes</div></div>
+    <div class="stat"><div class="n">251–270<span> ms</span></div><div class="k">1M serial-typing r p50</div><div class="d">engine call, not key-to-paint</div></div>
     <div class="stat"><div class="n">900/900</div><div class="k">Older scans cancelled</div><div class="d">newest unexpected: 0</div></div>
     <div class="stat"><div class="n">Pending</div><div class="k">Release matrix</div><div class="d">physical IME, Intel, notarization</div></div>
   </div>
@@ -202,8 +202,9 @@
       temporary isolated snapshot and then runs a semantically different same-root Spotlight reference.</p>
 <pre>scripts/benchmark-release.sh 100
 JBAR_BENCHMARK_INCLUDE_REAL=1 scripts/benchmark-release.sh 100</pre>
-    <p class="evidence-note">The current local campaign passed nine synthetic processes; its evidence
-      manifest is <code>c603de43…f43425</code>. The opt-in real crawl was not part of this run. Publication still requires the
+    <p class="evidence-note">The current local campaign passed nine synthetic processes from clean candidate
+      commit <code>183fc3c2e526e21dccc7976203e5f00ba371426c</code>; its evidence manifest is
+      <code>7a64cb87…0de6ab</code>. The opt-in real crawl was not part of this run. Publication still requires the
       supported OS/CPU matrix, exact signed artifact checksum, and separately stated cache/system load.</p>
   </div>
 </section>
