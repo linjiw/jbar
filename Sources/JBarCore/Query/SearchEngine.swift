@@ -41,8 +41,12 @@ public struct SearchResponse: Sendable {
 /// - Multi-term: every term must match (AND, any order); score = sum of per-term best scores; an "extension term"
 ///   (equals the item's ext, or alias jpeg~jpg / doc~docx) is satisfied by the ext and sets `extMatched`.
 /// - Trailing-space (lastTermComplete) → last term must be a contiguous substring.
+/// - Candidate accelerator: a cache-cold search starts from the least-populated bitset for any required character;
+///   the normal mask check still validates every remaining bit. Apps occur in every bitset because aliases can
+///   contain characters absent from the bundle name.
 /// - Incremental cache: when the new query extends the previous one (same terms prefix-extended), rescan only the
-///   previous candidate set; otherwise full scan.
+///   previous matching candidate set; otherwise use the character-bitset accelerator (or a full scan when no
+///   term can safely constrain names, such as an extension-only satisfiable term).
 /// - Cancellation: each `search` bumps `requestId`; worker chunks poll `latestRequestId` and bail early.
 /// - `.empty` → `recents` (frecency paths that still exist, mapped to rows; itemIndex = -1 if not in the store).
 /// - `.path` → stream the directory into a bounded top-K; prefix before fuzzy, folders on equal group/score,
@@ -82,9 +86,14 @@ public actor SearchEngine {
     /// Candidate count above which the scan is split into parallel chunks. Measured sweet spot: below this,
     /// thread-dispatch overhead of concurrentPerform exceeds the tiny per-candidate work (mask + rare DP),
     /// so the common warm/type-more rescan (~few-thousand candidates) is fastest single-threaded.
-    public static let parallelThreshold = 20_000
-    /// Candidates per parallel chunk (fixed; measured better than finer adaptive splits for large scans).
-    public static let chunkSize = 8_192
+    public static let parallelThreshold = 32_768
+    /// Minimum candidates per parallel chunk before the bounded fan-out is balanced across the
+    /// candidate domain. This amortizes the per-chunk 300-item heap and final merge.
+    public static let chunkSize = 32_768
+    /// Bound parallel fan-out. Each chunk owns a 300-item heap, and letting `concurrentPerform` spill
+    /// dozens of memory-heavy chunks across efficiency cores increased both p50 and tail latency on
+    /// million-item scans. Four balanced chunks saturate the tested Apple-Silicon performance cores.
+    public static let maxParallelChunks = 4
     /// Extension aliases (both directions): a term equal to any member satisfies an item with any other member.
     public static let extensionAliases: [String: [String]] = [
         "jpg": ["jpeg"], "jpeg": ["jpg"],
@@ -205,7 +214,7 @@ public actor SearchEngine {
             let terms = prepareTerms(parsed)
             let epoch = storeEpoch
             let cached = cachedCandidates(parsed: parsed, terms: terms)
-            let candidates: CandidateSet = cached.map { .list($0) } ?? .all(store.count)
+            let candidates: CandidateSet = cached.map { .list($0) } ?? initialCandidates(terms: terms)
             let ctx = makeContext(parsed: parsed, terms: terms, limit: safeLimit,
                                   appsFirstCap: safeAppsFirstCap, now: now, rid: rid,
                                   candidates: candidates)
@@ -320,6 +329,20 @@ public actor SearchEngine {
         return c.candidates
     }
 
+    /// Cold-query candidate set. Terms satisfiable by extension cannot constrain the filename: a
+    /// `pdf` item may match even when its name lacks p/d/f. For all other terms, choosing the
+    /// least-populated one-character bitset is a safe superset and lets the existing combined-mask check
+    /// reject remaining false positives cheaply.
+    private func initialCandidates(terms: [PreparedTerm]) -> CandidateSet {
+        var requiredMask: UInt64 = 0
+        for term in terms where term.extIds.isEmpty { requiredMask |= term.mask }
+        guard let selected = store.rarestMaskBitset(requiredMask: requiredMask) else {
+            return .all(store.count)
+        }
+        return .bitset(words: selected.words, upperBound: store.count,
+                       candidateCount: selected.candidateCount)
+    }
+
     // MARK: - Worker bridge
 
     private static func onWorker<T: Sendable>(_ body: @escaping @Sendable () -> T) async -> T {
@@ -334,7 +357,7 @@ public actor SearchEngine {
     private static func scanSearch(ctx: ScanContext) -> ScanOutcome {
         let n = ctx.candidates.count
         guard n > 0 else { return ScanOutcome(rows: [], matched: [], totalMatches: 0, cancelled: false) }
-        let chunks = chunkRanges(count: n)
+        let chunks = chunkRanges(candidates: ctx.candidates)
         let results: [ChunkResult]
         if chunks.count == 1 {
             results = [runChunk(index: 0, range: chunks[0], ctx: ctx)]
@@ -391,14 +414,50 @@ public actor SearchEngine {
     /// Split `0..<count` into parallel chunks (one chunk when below `parallelThreshold`).
     static func chunkRanges(count: Int) -> [Range<Int>] {
         guard count > parallelThreshold else { return [0..<count] }
+        let desiredChunks = min(maxParallelChunks, max(1, (count + chunkSize - 1) / chunkSize))
+        let balancedChunkSize = max(1, (count + desiredChunks - 1) / desiredChunks)
         var out: [Range<Int>] = []
         var start = 0
         while start < count {
-            let end = min(count, start + chunkSize)
+            let end = min(count, start + balancedChunkSize)
             out.append(start..<end)
             start = end
         }
         return out
+    }
+
+    /// Candidate ranges use item/list positions normally and 64-item words for the packed cold-query
+    /// accelerator. Bitset chunking is still based on the number of actual candidates, so a sparse
+    /// posting does not pay parallel-dispatch overhead merely because the store itself is large.
+    static func chunkRanges(candidates: CandidateSet) -> [Range<Int>] {
+        switch candidates {
+        case .bitset(let words, _, let candidateCount):
+            guard !words.isEmpty else { return [] }
+            guard candidateCount > parallelThreshold else { return [0..<words.count] }
+            // Partition by SET-bit population, not merely word count. Index order can cluster a
+            // character by root/file type; equal word ranges would then make the barrier wait for
+            // one dense straggler. This one cheap popcount pass also keeps the number of top-K
+            // heaps bounded for sparse postings.
+            let desiredChunks = min(maxParallelChunks,
+                                    max(1, (candidateCount + chunkSize - 1) / chunkSize))
+            let candidatesPerChunk = max(1, (candidateCount + desiredChunks - 1) / desiredChunks)
+            var ranges: [Range<Int>] = []
+            ranges.reserveCapacity(desiredChunks)
+            var start = 0
+            var population = 0
+            for wordIndex in words.indices {
+                population += words[wordIndex].nonzeroBitCount
+                if population >= candidatesPerChunk && ranges.count + 1 < desiredChunks {
+                    ranges.append(start..<(wordIndex + 1))
+                    start = wordIndex + 1
+                    population = 0
+                }
+            }
+            if start < words.count { ranges.append(start..<words.count) }
+            return ranges
+        case .all, .list:
+            return chunkRanges(count: candidates.count)
+        }
     }
 
     /// Score one chunk of candidates with its own scratch and bounded heap.
@@ -670,12 +729,25 @@ struct IncrementalCache: Sendable {
 enum CandidateSet: Sendable {
     case all(Int)
     case list([Int32])
+    /// Packed membership over `0..<upperBound`. Direct set-bit enumeration avoids allocating a
+    /// large, short-lived Int32 list for every cache-cold query; `candidateCount` drives chunking.
+    case bitset(words: [UInt64], upperBound: Int, candidateCount: Int)
     var count: Int {
-        switch self { case .all(let n): return n; case .list(let l): return l.count }
+        switch self {
+        case .all(let n): return n
+        case .list(let l): return l.count
+        case .bitset(_, _, let candidateCount): return candidateCount
+        }
     }
-    /// Item index of the k-th candidate.
+    /// Item index at scan position `k` for dense/list candidates. Bitsets are enumerated a word at a
+    /// time by `ChunkWorker` so excluded positions never enter the loop.
     @inline(__always) func item(at k: Int) -> Int {
-        switch self { case .all: return k; case .list(let l): return Int(l[k]) }
+        switch self {
+        case .all: return k
+        case .list(let l): return Int(l[k])
+        case .bitset:
+            preconditionFailure("bitset candidates must be enumerated by word")
+        }
     }
 }
 
@@ -949,7 +1021,7 @@ struct ChunkWorker {
 
     init(ctx: ScanContext) { self.ctx = ctx }
 
-    /// Scan `range` of `ctx.candidates`, polling for cancellation every 2048 items.
+    /// Scan `range` of `ctx.candidates`, polling for cancellation every 2,048 list/store positions.
     mutating func run(range: Range<Int>) {
         let cands = ctx.candidates
         let store = ctx.store
@@ -960,14 +1032,35 @@ struct ChunkWorker {
         // whose lifetime cannot escape either closure.
         store.foldedArena.withUnsafeBufferPointer { foldedArena in
             store.bonusArena.withUnsafeBufferPointer { bonusArena in
-                for k in range {
-                    if k & 2047 == 0 && ctx.isStale { cancelled = true; return }
-                    visited += 1
-                    let i = cands.item(at: k)
-                    guard let s = evaluate(i, foldedArena: foldedArena, bonusArena: bonusArena) else { continue }
-                    total += 1
-                    matched.append(Int32(i))
-                    top.insert(s)
+                switch cands {
+                case .bitset(let words, let upperBound, _):
+                    for wordIndex in range {
+                        // 32 words cover 2,048 item positions, matching the dense scan's polling cadence.
+                        if wordIndex & 31 == 0 && ctx.isStale { cancelled = true; return }
+                        var bits = words[wordIndex]
+                        while bits != 0 {
+                            let i = wordIndex * UInt64.bitWidth + bits.trailingZeroBitCount
+                            bits &= bits &- 1
+                            guard i < upperBound else { continue }
+                            visited += 1
+                            guard let s = evaluate(i, foldedArena: foldedArena,
+                                                   bonusArena: bonusArena) else { continue }
+                            total += 1
+                            matched.append(Int32(i))
+                            top.insert(s)
+                        }
+                    }
+                case .all, .list:
+                    for k in range {
+                        if k & 2047 == 0 && ctx.isStale { cancelled = true; return }
+                        visited += 1
+                        let i = cands.item(at: k)
+                        guard let s = evaluate(i, foldedArena: foldedArena,
+                                               bonusArena: bonusArena) else { continue }
+                        total += 1
+                        matched.append(Int32(i))
+                        top.insert(s)
+                    }
                 }
             }
         }

@@ -209,6 +209,35 @@ JBAR_BENCHMARK_INCLUDE_REAL=1 scripts/benchmark-release.sh 100</pre>
   </div>
 </section>
 
+<section id="performance">
+  <h2>Cold-search optimization preview</h2>
+  <p class="sub">A reviewed development patch makes cache-cold name searches start from the rarest
+    safe character posting instead of walking the entire index. The official evidence above remains
+    unchanged until the complete multi-process release campaign is rerun.</p>
+  <div class="stats">
+    <div class="stat"><div class="n j">~10<span> ms</span></div><div class="k">300K cold x</div><div class="d">previous recorded p50 range: 43.7–55.2 ms</div></div>
+    <div class="stat"><div class="n j">~16<span> ms</span></div><div class="k">300K first r</div><div class="d">previous recorded p50 range: 71.3–84.2 ms</div></div>
+    <div class="stat"><div class="n j">~34<span> ms</span></div><div class="k">1M cold x</div><div class="d">previous recorded p50 range: 171.5–181.6 ms</div></div>
+    <div class="stat"><div class="n j">~54<span> ms</span></div><div class="k">1M first r</div><div class="d">previous recorded p50 range: 251.1–269.9 ms</div></div>
+  </div>
+  <div class="card" style="margin-top:14px">
+    <p style="margin-top:0">The fast path adds 38 packed character-presence bitsets—about 4.75 bytes per
+      indexed item—plus a one-pass scorer for the broad first character and at most four balanced scan
+      workers. Apps remain in every posting so aliases cannot disappear; extension-like queries fall
+      back whenever a filename filter would be unsafe.</p>
+    <p><strong>File-content search is a separate project, not a hidden switch.</strong> For a bounded,
+      supported text corpus, JBar can reasonably target lower warm-query latency than Spotlight with a
+      standalone inverted index. It should not claim to beat Spotlight across the whole Mac, every
+      document format, OCR, semantic search, or initial ingestion.</p>
+    <p style="margin-bottom:0">The proposed architecture, privacy boundaries, benchmark gates, and next
+      optimization queue are in the
+      <a href="https://github.com/linjiw/jbar/blob/main/docs/PERFORMANCE.md">performance program →</a></p>
+    <p class="evidence-note">These are few-sample local spot checks from the same M4 development machine
+      and deterministic fixtures on 2026-08-21—not replacement release evidence or an SLA. Ordered rows,
+      totals, and fingerprints remained stable; the full clean-candidate campaign is still required.</p>
+  </div>
+</section>
+
 <section id="compare">
   <h2>Side by side</h2>
   <p class="sub">Two tools with different jobs. JBar is a launcher that maintains a bounded local index
@@ -289,18 +318,28 @@ JBAR_BENCHMARK_INCLUDE_REAL=1 scripts/benchmark-release.sh 100</pre>
 </section>
 
 <section id="install">
-  <h2>Development install</h2>
-  <p class="sub">Requires macOS 13+ and Xcode command-line tools. The current source flow produces an
-    ad-hoc-signed development app, not a notarized public release.</p>
+  <h2>Install</h2>
+  <p class="sub">JBar is a free developer preview. GitHub Releases and npm both use the same ad-hoc-signed
+    Universal 2 ZIP; Apple Silicon Macs run the native arm64 slice. macOS may ask you to approve its first launch.</p>
+<pre><span class="c"># GitHub Release</span>
+curl -fsSL https://raw.githubusercontent.com/linjiw/jbar/main/scripts/install-from-github.sh | bash
+
+<span class="c"># npm (Node 18+)</span>
+npm install --global @linjiw/jbar
+jbar
+
+<span class="c"># Or run once without installing globally</span>
+npx --yes @linjiw/jbar</pre>
+  <h3>Build from source</h3>
+  <p class="sub">The best option if you prefer not to approve an unsigned preview. Requires macOS 13+
+    and Xcode command-line tools.</p>
 <pre><span class="c"># Build, validate, stage, and install the development app.</span>
 git clone https://github.com/linjiw/jbar.git
 cd jbar
 make install</pre>
   <p class="sub" style="margin-top:16px">Press <strong>⌥Space</strong>. On your first search macOS asks
-    for protected-folder access as needed by configured roots. Do not strip quarantine from a downloaded
-    build. A Homebrew Cask becomes appropriate only after the exact Universal 2 ZIP is Developer ID
-    signed, notarized/stapled, and clean-machine validated. npm or a language rewrite would not bypass
-    macOS signing, TCC, architecture, or minimum-OS requirements.</p>
+    for protected-folder access as needed by configured roots. The prebuilt installers verify the
+    release checksum and preserve quarantine metadata; do not disable Gatekeeper or remove quarantine.</p>
 </section>
 
 <section id="how">
@@ -313,9 +352,9 @@ make install</pre>
     <div class="feat"><h3>Flat, bounded index</h3><p>Parallel arrays plus UTF-8 name
       arenas. Paths are reconstructed on demand from a directory table rather
       than stored per file.</p></div>
-    <div class="feat"><h3>Mask prefilter, then DP</h3><p>Each item carries a 64-bit character-presence
-      mask; impossible candidates are rejected before the fuzzy scorer runs. A bounded rerank window
-      limits later path/frecency work.</p></div>
+    <div class="feat"><h3>Packed postings, mask, then DP</h3><p>A cache-cold query enters through the
+      rarest safe one of 38 packed character postings; each remaining item still carries a full 64-bit
+      mask before fuzzy scoring. A bounded rerank window limits later path/frecency work.</p></div>
     <div class="feat"><h3>Shared hard cap</h3><p>Application scan, full crawl, and incremental updates
       share the configured item budget. Invalid or oversized generations fail closed instead of being
       published.</p></div>

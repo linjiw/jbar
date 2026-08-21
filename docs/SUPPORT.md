@@ -10,9 +10,9 @@ claim can be tested and maintained:
   string is translated.
 
 macOS 12 and older are outside this contract. JBar uses `SMAppService` and has a macOS 13 deployment
-target; changing that would be a separate compatibility project, not a packaging workaround. npm,
-Homebrew, Electron, or another implementation language cannot bypass the operating-system APIs,
-code signing, notarization, or architecture requirements.
+target; changing that would be a separate compatibility project, not a packaging workaround. npm is
+only an installer entry point and cannot bypass the operating-system APIs, code signing, notarization,
+or architecture requirements.
 
 ## Evidence levels
 
@@ -57,8 +57,9 @@ terminates cleanly, and emits no new crash report during the bounded run. The sm
 the real workspace, hotkey, index, history, login item, or input method. The local build can be
 assembled as Universal 2 with a macOS 13 minimum version.
 
-That is not yet release proof. Synthetic events are not a physical keyboard or IME, and an ad-hoc
-packaged clone is not a Developer ID release. Before v1, the project still needs the physical matrix
-above, Developer ID credentials, Hardened Runtime signing, Apple notarization and stapling,
-Gatekeeper verification on a clean Mac, and a published Homebrew Cask that installs the same
-notarized ZIP. See the open GitHub issues for the live implementation and evidence checklist.
+That is not proof of a trusted public release. Synthetic events are not a physical keyboard or IME,
+and the current ad-hoc developer preview is not a Developer ID release. Before a fully trusted v1,
+the project still needs the physical matrix above, Developer ID credentials, Hardened Runtime signing,
+Apple notarization and stapling, and Gatekeeper verification on a clean Mac. The preview GitHub and
+npm channels publish the same checksum-verified Universal 2 ZIP; see the open GitHub issues for the
+live implementation and evidence checklist.

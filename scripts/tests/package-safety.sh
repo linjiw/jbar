@@ -4,7 +4,6 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd -P)"
 PACKAGER="$ROOT/scripts/package-app.sh"
-RENDER_SAFETY="$ROOT/scripts/tests/render-homebrew-cask-safety.sh"
 SOURCE_APP="${JBAR_PACKAGE_TEST_SOURCE_APP:-$ROOT/build/JBar.app}"
 TEST_PARENT="$(cd "${TMPDIR:-/tmp}" && pwd -P)"
 TEST_ROOT="$(/usr/bin/mktemp -d "$TEST_PARENT/jbar-package-tests.XXXXXXXX")"
@@ -312,8 +311,5 @@ GUARDED="$TEST_ROOT/guarded.zip"
 expect_failure test-override-guard env JBAR_PACKAGE_TEST_FAIL_AT=after_archive \
   "$PACKAGER" "$SOURCE_APP" "$GUARDED"
 [ ! -e "$GUARDED" ] && [ ! -L "$GUARDED" ] || fail "unguarded test override created an output"
-
-[ -x "$RENDER_SAFETY" ] || fail "renderer safety test is not executable"
-"$RENDER_SAFETY"
 
 echo "PASS: $TESTS_RUN isolated package safety cases"

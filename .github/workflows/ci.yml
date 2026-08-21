@@ -64,6 +64,9 @@ jobs:
           ruby -c scripts/tests/coverage-gate.rb
           ruby -c scripts/tests/benchmark-report-gate.rb
 
+      - name: Test the npm installer wrapper
+        run: npm test
+
   debug_tests:
     name: Full test suite (debug)
     runs-on: macos-15
@@ -487,6 +490,11 @@ jobs:
         env:
           JBAR_PACKAGE_TEST_SOURCE_APP: ${{ runner.temp }}/jbar-app-build/JBar.app
         run: scripts/tests/package-safety.sh
+
+      - name: Exercise no-toolchain prebuilt installer
+        env:
+          JBAR_PREBUILT_INSTALL_SOURCE_APP: ${{ runner.temp }}/jbar-app-build/JBar.app
+        run: scripts/tests/prebuilt-installer-safety.sh
 
       - name: Exercise transactional install safety
         env:
