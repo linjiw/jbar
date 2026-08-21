@@ -30,7 +30,7 @@ The script and `--benchmark` implementation:
   total across every workload, separately require deliberately superseded older requests to cancel,
   and use fingerprints only as report identities;
 - report caller-observed wall-time distributions with nearest-rank p50/p95/p99/max and no best-of-N selection;
-- cap expensive full scans at 100 samples and Spotlight gathers at 5 samples, while printing those actual counts;
+- cap expensive cache-cold candidate scans at 100 samples and Spotlight gathers at 5 samples, while printing those actual counts;
 - scope Spotlight to existing minimal roots derived from JBar's configured file/app roots;
 - keep Spotlight timeouts, exact misses, and ranking misses separate; and
 - write status files and a self-verifying SHA-256 manifest to a private evidence directory.

@@ -112,7 +112,7 @@ The normal pipeline is:
 
 The stage-one rerank window is 300 items. Consequently a highly frecent path outside the best 300 text candidates cannot be promoted into the final result, and scored normal/extension searches cannot return more than 300 rows even though configuration validation permits `maxResults` up to 500. This is a deliberate bounded-work tradeoff; empty-history and path modes have their own bounds.
 
-Extending every term can reuse the prior matched-candidate list. Deletion or an incompatible edit forces a full scan. New queries cancel older scans; cancelled responses contain no rows and must not repaint the panel.
+Extending every term can reuse the prior matched-candidate list. A cache-cold query, deletion, or incompatible edit starts from the least-populated bitset for any required character and validates the full combined mask; apps are conservatively present in every bitset because aliases may contain characters absent from the bundle name. Queries whose terms can all be satisfied by extension fall back to the full extension/name candidate space. New queries cancel older scans; cancelled responses contain no rows and must not repaint the panel.
 
 The ranking order is deterministic: exact/prefix application tiers precede general matches, then score and tie-break facts apply. `appsFirstCap` reserves predictable application placement before file rows; the total normal request is bounded by `maxResults`.
 

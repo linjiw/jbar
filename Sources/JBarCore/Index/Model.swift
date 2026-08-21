@@ -109,7 +109,10 @@ public struct DirEntry: Hashable, Codable, Sendable {
 /// store and swap the reference atomically (`IndexStore` is a final class so the swap is one
 /// pointer assignment and in-flight searches keep their generation alive).
 ///
-/// Memory: ~60–85 bytes per item plus names. 400k items ≈ 30 MB, 1M ≈ 80 MB.
+/// Memory: the core arrays use ~60–85 bytes per item plus names. The derived character-mask
+/// accelerator adds 38 bits per item (~4.75 bytes; apps are conservatively present in every bitset
+/// so aliases cannot be missed). It is rebuilt with each immutable generation and is not persisted
+/// in the snapshot.
 public final class IndexStore: @unchecked Sendable {
     public let count: Int
 
@@ -141,6 +144,18 @@ public final class IndexStore: @unchecked Sendable {
     public let appInfo: [Int32: AppInfo]         // item index -> extra app data
     public let appItems: [Int32]                 // all item indices with kind == .app (sorted)
 
+    // Derived search accelerator. There are only 38 meaningful mask bits (a-z, 0-9,
+    // punctuation, non-ASCII). Packed bitsets avoid storing the same four-byte item id once per
+    // distinct character; cold-query workers enumerate set bits directly without a candidate list.
+    let maskBitsets: [[UInt64]]
+    let maskBitCounts: [Int]
+
+    /// Fixed-width payload of the derived accelerator (excludes small Swift container overhead).
+    public var derivedSearchAcceleratorByteCount: Int {
+        maskBitsets.reduce(0) { $0 + $1.count * MemoryLayout<UInt64>.stride }
+            + maskBitCounts.count * MemoryLayout<Int>.stride
+    }
+
     /// Monotonic generation number (for UI "is this result stale?" checks and snapshot headers).
     public let generation: UInt64
     /// FSEvents last event id the store is consistent with (0 = unknown → full recrawl on next start).
@@ -165,7 +180,58 @@ public final class IndexStore: @unchecked Sendable {
         self.foldedArena = foldedArena; self.bonusArena = bonusArena; self.displayArena = displayArena
         self.dirs = dirs; self.dirArena = dirArena
         self.extensions = extensions; self.appInfo = appInfo; self.appItems = appItems
+        (self.maskBitsets, self.maskBitCounts) = Self.buildMaskBitsets(mask: mask, kind: kind)
         self.generation = generation; self.fsEventId = fsEventId; self.builtAt = builtAt
+    }
+
+    /// The least-populated bitset for any bit required by `requiredMask`. Every possible non-app name
+    /// match must occur in this set; every app is also included because it may match through an
+    /// alias whose characters are absent from the bundle name. nil means no useful mask filter.
+    func rarestMaskBitset(requiredMask: UInt64) -> (words: [UInt64], candidateCount: Int)? {
+        var bits = requiredMask & Self.searchMaskBits
+        guard bits != 0, maskBitsets.count == Self.searchMaskBitCount,
+              maskBitCounts.count == Self.searchMaskBitCount else { return nil }
+        var bestBit = -1
+        var bestCount = Int.max
+        while bits != 0 {
+            let bit = bits.trailingZeroBitCount
+            if maskBitCounts[bit] < bestCount {
+                bestBit = bit
+                bestCount = maskBitCounts[bit]
+            }
+            bits &= bits &- 1
+        }
+        guard bestBit >= 0 else { return nil }
+        return (maskBitsets[bestBit], bestCount)
+    }
+
+    private static let searchMaskBitCount = 38
+    private static let searchMaskBits = (UInt64(1) << UInt64(searchMaskBitCount)) - 1
+
+    /// Build the fixed-size bitsets while an immutable generation is produced/decoded, never in the
+    /// per-keystroke search loop. The nested arrays allocate a predictable 38 × ceil(items / 64)
+    /// words with no posting-list growth slack.
+    private static func buildMaskBitsets(mask: [UInt64], kind: [UInt8]) -> ([[UInt64]], [Int]) {
+        guard mask.count == kind.count, mask.count <= Int(Int32.max) else { return ([], []) }
+        let wordCount = (mask.count + UInt64.bitWidth - 1) / UInt64.bitWidth
+        var bitsets: [[UInt64]] = []
+        bitsets.reserveCapacity(searchMaskBitCount)
+        for _ in 0..<searchMaskBitCount {
+            bitsets.append([UInt64](repeating: 0, count: wordCount))
+        }
+        var counts = [Int](repeating: 0, count: searchMaskBitCount)
+        for i in mask.indices {
+            var bits = kind[i] == ItemKind.app.rawValue ? searchMaskBits : (mask[i] & searchMaskBits)
+            let word = i / UInt64.bitWidth
+            let itemBit = UInt64(1) << UInt64(i & (UInt64.bitWidth - 1))
+            while bits != 0 {
+                let bit = bits.trailingZeroBitCount
+                bitsets[bit][word] |= itemBit
+                counts[bit] += 1
+                bits &= bits &- 1
+            }
+        }
+        return (bitsets, counts)
     }
 
     /// An empty store (used before the first crawl / snapshot load).

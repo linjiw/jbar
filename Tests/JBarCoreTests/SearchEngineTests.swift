@@ -527,7 +527,7 @@ final class SearchEngineTests: XCTestCase {
             ["r", "re", "rep", "report", "report ", "report p", "report pd", "report pdf", "report pdf "],
             ["c", "ch", "chr", "chrome", "chrome ", "chrome c"],
             ["m", "me", "memo", "memo h", "memo ht", "memo htm", "memo html"],
-            ["vsc", "vs", "v"],            // deletions → full scans
+            ["vsc", "vs", "v"],            // deletions → cache-cold accelerated scans
             ["holiday j", "holiday jp", "holiday jpg", "holiday jpgx"],
         ]
         for seq in sequences {
@@ -605,20 +605,28 @@ final class SearchEngineTests: XCTestCase {
     }
 
     func testParallelScanEqualsSerialScan() async {
-        // 60k candidates → parallel chunks; the incremental rescan of a small candidate list → single chunk.
+        // The common 'e' posting still exceeds the parallel threshold; extending "eee" to "eeee"
+        // reuses a much smaller matched set and therefore takes the serial path.
         let e = await makeEngine(store: Self.largeStore)
+        let coldCandidates = try! XCTUnwrap(
+            Self.largeStore.rarestMaskBitset(requiredMask: Mask.of(Array("eeee".utf8)))
+        )
+        XCTAssertGreaterThan(coldCandidates.candidateCount, SearchEngine.parallelThreshold)
         let parallelWork = SearchScanWorkObserver()
         await e.setScanWorkObserver(parallelWork)
-        let parallel = await e.search("vas screaming", now: Fixture.now)   // full scan, chunked
+        let parallel = await e.search("eeee", now: Fixture.now)
         let parallelSnapshot = parallelWork.snapshot
         XCTAssertEqual(parallelSnapshot.chunkScansStarted,
-                       SearchEngine.chunkRanges(count: Self.largeStore.count).count)
-        XCTAssertEqual(parallelSnapshot.visitedCandidates, Self.largeStore.count)
+                       SearchEngine.chunkRanges(candidates: .bitset(
+                        words: coldCandidates.words, upperBound: Self.largeStore.count,
+                        candidateCount: coldCandidates.candidateCount
+                       )).count)
+        XCTAssertEqual(parallelSnapshot.visitedCandidates, coldCandidates.candidateCount)
         let cold = await makeEngine(store: Self.largeStore)
-        _ = await cold.search("vas screamin", now: Fixture.now)
+        _ = await cold.search("eee", now: Fixture.now)
         let serialWork = SearchScanWorkObserver()
         await cold.setScanWorkObserver(serialWork)
-        let serial = await cold.search("vas screaming", now: Fixture.now)  // cached candidate list, one chunk
+        let serial = await cold.search("eeee", now: Fixture.now)
         let serialSnapshot = serialWork.snapshot
         XCTAssertEqual(serialSnapshot.chunkScansStarted, 1,
                        "a small incremental candidate set must run as one chunk")
@@ -630,7 +638,7 @@ final class SearchEngineTests: XCTestCase {
         // Small counts stay one chunk; larger counts split into a contiguous partition of [0, count).
         XCTAssertEqual(SearchEngine.chunkRanges(count: 10).count, 1)
         XCTAssertEqual(SearchEngine.chunkRanges(count: SearchEngine.parallelThreshold).count, 1)
-        for count in [SearchEngine.parallelThreshold + 1, 30_000, 100_000, 182_000] {
+        for count in [SearchEngine.parallelThreshold + 1, 60_000, 100_000, 182_000] {
             let ranges = SearchEngine.chunkRanges(count: count)
             XCTAssertGreaterThan(ranges.count, 1, "count \(count) should be chunked")
             XCTAssertEqual(ranges.first?.lowerBound, 0)
@@ -746,10 +754,16 @@ final class SearchEngineTests: XCTestCase {
         XCTAssertTrue(broad.totalMatchesIsComplete)
         XCTAssertGreaterThan(broad.totalMatches, broad.rows.count)
         XCTAssertLessThanOrEqual(broad.rows.count, 8)
-        XCTAssertEqual(fullObserver.snapshot.visitedCandidates, store.count,
-                       "the initial query must exercise every item in the 300k fixture")
+        let xCandidates = try! XCTUnwrap(store.rarestMaskBitset(requiredMask: Mask.of(Array("x".utf8))))
+        XCTAssertLessThan(xCandidates.candidateCount, store.count,
+                          "a selective first character should avoid a full-store scan")
+        XCTAssertEqual(fullObserver.snapshot.visitedCandidates, xCandidates.candidateCount,
+                       "the initial query must scan exactly its smallest safe posting")
         XCTAssertEqual(fullObserver.snapshot.chunkScansStarted,
-                       SearchEngine.chunkRanges(count: store.count).count)
+                       SearchEngine.chunkRanges(candidates: .bitset(
+                        words: xCandidates.words, upperBound: store.count,
+                        candidateCount: xCandidates.candidateCount
+                       )).count)
 
         let incrementalObserver = SearchScanWorkObserver()
         await e.setScanWorkObserver(incrementalObserver)

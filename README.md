@@ -10,7 +10,7 @@
 [![Swift](https://img.shields.io/badge/Swift-5.9%2B-orange.svg)](https://swift.org)
 [![No dependencies](https://img.shields.io/badge/dependencies-none-brightgreen.svg)](#design)
 
-[Evidence](docs/COMPARISON.md) · [Design](docs/DESIGN.md) · [Support matrix](docs/SUPPORT.md) · [Privacy](docs/PRIVACY.md) · [Why not Spotlight?](docs/DIAGNOSIS.md) · [UX tests](docs/UX-TESTS.md)
+[Evidence](docs/COMPARISON.md) · [Design](docs/DESIGN.md) · [Performance program](docs/PERFORMANCE.md) · [Support matrix](docs/SUPPORT.md) · [Privacy](docs/PRIVACY.md) · [Why not Spotlight?](docs/DIAGNOSIS.md) · [UX tests](docs/UX-TESTS.md)
 
 <img src="docs/images/jbar-panel.png" alt="JBar's search panel showing apps grouped above files, with matched characters highlighted" width="820">
 

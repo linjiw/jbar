@@ -551,8 +551,8 @@ enum Benchmark {
         await engine.setHome(NSHomeDirectory())
 
         do {
-            print("\n-- Engine cache cold / full-store work (n=\(plan.fullScan) per query) --")
-            print("cache state: SearchEngine cache is cleared before every sample; search/extension modes scan the store, while <empty> is a no-scan control; file pages and CPU caches may still be warm")
+            print("\n-- Engine cache cold / index-candidate work (n=\(plan.fullScan) per query) --")
+            print("cache state: SearchEngine cache is cleared before every sample; normal search starts from the least-populated safe character bitset, extension mode scans the extension column, and <empty> is a no-scan control; file pages and CPU caches may still be warm")
             let cold = try await measureQueries(queryCases, engine: engine, store: corpus.store, cfg: cfg,
                                                 samples: plan.fullScan, warmCache: false)
             printMeasurements(cold)
@@ -1385,7 +1385,7 @@ enum Benchmark {
                      environment.operatingSystemVersion, environment.activeProcessorCount,
                      Double(environment.physicalMemoryBytes) / 1_073_741_824))
         print("workload: v\(workloadVersion) · correctness: every measured response must be complete, non-cancelled, and stable")
-        print("samples: requested=\(plan.requested), warm=\(plan.warm), full-scan=\(plan.fullScan), sequence=\(plan.sequence), supersession=\(plan.supersession), Spotlight=\(plan.spotlight)")
+        print("samples: requested=\(plan.requested), warm=\(plan.warm), cache-cold=\(plan.fullScan), sequence=\(plan.sequence), supersession=\(plan.supersession), Spotlight=\(plan.spotlight)")
     }
 
     private static func printHistory(_ profile: HistoryProfile) {
@@ -2295,6 +2295,7 @@ enum Benchmark {
         add(store.dirId); add(store.nameStart); add(store.nameLen); add(store.displayStart); add(store.displayLen)
         add(store.mask); add(store.initials); add(store.mtime); add(store.kind); add(store.flags); add(store.depth); add(store.extId)
         add(store.foldedArena); add(store.bonusArena); add(store.displayArena); add(store.dirs); add(store.dirArena); add(store.appItems)
+        bytes &+= UInt64(store.derivedSearchAcceleratorByteCount)
         for ext in store.extensions { bytes &+= UInt64(ext.utf8.count) }
         return bytes
     }

@@ -152,6 +152,25 @@ public enum Scorer {
         if mFull > n || n > maxTextBytes { return nil }
         guard b.count == n else { assertionFailure("Scorer.score: bonus must parallel text"); return nil }
         guard let qp = q.baseAddress, let tp = t.baseAddress, let bp = b.baseAddress else { return nil }
+        // A one-byte query has no alignment transitions: every occurrence is a fresh local match,
+        // and gaps can never improve on the occurrence that started them. The general path would
+        // perform greedy, reverse-bound, DP, and maximum passes over the same short name. One pass
+        // is exactly equivalent and matters for the broad first keystroke, where every retained
+        // candidate reaches the scorer.
+        if mFull == 1 {
+            var first = -1
+            var best = ScoreConstants.neg
+            var j = 0
+            while j < n {
+                if tp[j] == qp[0] {
+                    if first < 0 { first = j }
+                    best = max(best, ScoreConstants.match &+ Int16(truncatingIfNeeded: bp[j]) &* BonusConstants.firstMult)
+                }
+                j &+= 1
+            }
+            guard first >= 0 else { return nil }
+            return ScoreResult(score: best, firstMatch: Int16(clamping: first))
+        }
         let m = min(mFull, maxQueryBytes)
         // Greedy pass: rejects non-subsequences and records each DP row's first reachable column.
         guard let first = greedyStarts(qp: qp, mFull: mFull, m: m, tp: tp, n: n, scratch: scratch) else { return nil }
