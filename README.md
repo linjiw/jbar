@@ -22,7 +22,7 @@ Press **⌥Space**, type, then press **Return**. JBar builds a bounded local ind
 
 JBar does not request Accessibility, Input Monitoring, or Full Disk Access. macOS can still show standard Files and Folders consent prompts when a configured root includes protected locations such as Desktop, Documents, or Downloads.
 
-> **Release status:** JBar is currently a development preview built from source. The intended contract is macOS 13+, Apple Silicon and Intel from one Universal 2 app, with any system language/input source and an English v1 interface. Automated regressions exist, but the required physical Mac/input-method matrix and the Developer ID notarized release gate are still pending. See [SUPPORT.md](docs/SUPPORT.md).
+> **Release status:** JBar is currently an ad-hoc-signed developer preview available through GitHub Releases and npm. The intended contract is macOS 13+, Apple Silicon and Intel from one Universal 2 app, with any system language/input source and an English v1 interface. Automated regressions exist, but the required physical Mac/input-method matrix and a Developer ID notarized release are still pending. See [SUPPORT.md](docs/SUPPORT.md).
 
 ## Why
 
@@ -70,9 +70,43 @@ scripts/benchmark-release.sh 100
 JBAR_BENCHMARK_INCLUDE_REAL=1 scripts/benchmark-release.sh 100
 ```
 
-## Development install
+## Install
 
-The current install path is for developers and requires macOS 13+ plus Xcode command-line tools:
+JBar is currently a free **developer preview**. The GitHub and npm paths download the same ad-hoc
+signed Universal 2 ZIP; neither requires Homebrew, Xcode, or Swift. Apple Silicon Macs run its
+native `arm64` slice. Because this preview is not Apple-notarized, macOS may ask the user to approve
+the first launch. Do not disable Gatekeeper or remove quarantine.
+
+### GitHub Release
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/linjiw/jbar/main/scripts/install-from-github.sh | bash
+```
+
+The installer verifies the release SHA-256, checks the bundle signature and both `arm64`/`x86_64`
+slices, then installs to `/Applications` or `~/Applications`. It preserves macOS quarantine metadata.
+
+### npm
+
+```bash
+npm install --global @linjiw/jbar
+jbar
+```
+
+Or run it once without a global install:
+
+```bash
+npx --yes @linjiw/jbar
+```
+
+The npm package requires Node 18 or later and is only a download launcher. It runs only when
+explicitly invoked, downloads the versioned GitHub Release, verifies its checksum, and installs the
+same native preview app.
+
+### Build from source
+
+Building from source is the best option when you prefer not to approve an unsigned preview; it
+requires macOS 13+ plus Xcode command-line tools:
 
 ```bash
 git clone https://github.com/linjiw/jbar.git
@@ -80,9 +114,12 @@ cd jbar
 make install
 ```
 
-This builds a Universal 2 release app by default, ad-hoc signs it, validates it in a same-volume staging location, then installs it in `/Applications` or `~/Applications`. An ad-hoc build is not a public release and must not be distributed as though it were notarized. Do not strip quarantine to bypass Gatekeeper.
+This builds a Universal 2 app by default, ad-hoc signs it, validates it in a same-volume staging
+location, then installs it in `/Applications` or `~/Applications`.
 
-A Homebrew Cask is the intended convenience channel after the exact ZIP is Developer ID signed, notarized, stapled, and clean-machine validated. npm or a rewrite in another language would not bypass macOS signing, TCC, architecture, or OS-version requirements; Swift/AppKit is the smallest native implementation for this app.
+Swift/AppKit remains the native app implementation; npm is only an installation entry point and does
+not change the macOS signing, TCC, architecture, or OS-version requirements. See
+[npm publishing setup](docs/NPM-PUBLISHING.md) for the maintainer steps.
 
 ## Usage
 

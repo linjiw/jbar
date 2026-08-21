@@ -1,0 +1,41 @@
+{
+  "name": "@linjiw/jbar",
+  "version": "0.1.0",
+  "description": "Installer for the native JBar macOS developer preview",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/linjiw/jbar.git"
+  },
+  "homepage": "https://github.com/linjiw/jbar",
+  "bugs": "https://github.com/linjiw/jbar/issues",
+  "keywords": [
+    "apple-silicon",
+    "launcher",
+    "macos",
+    "swift"
+  ],
+  "bin": {
+    "jbar": "npm/bin/jbar.js"
+  },
+  "files": [
+    "npm/bin"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "arm64",
+    "x64"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "scripts": {
+    "test": "node --test npm/test/*.test.js"
+  }
+}

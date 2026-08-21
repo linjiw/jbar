@@ -289,18 +289,28 @@ JBAR_BENCHMARK_INCLUDE_REAL=1 scripts/benchmark-release.sh 100</pre>
 </section>
 
 <section id="install">
-  <h2>Development install</h2>
-  <p class="sub">Requires macOS 13+ and Xcode command-line tools. The current source flow produces an
-    ad-hoc-signed development app, not a notarized public release.</p>
+  <h2>Install</h2>
+  <p class="sub">JBar is a free developer preview. GitHub Releases and npm both use the same ad-hoc-signed
+    Universal 2 ZIP; Apple Silicon Macs run the native arm64 slice. macOS may ask you to approve its first launch.</p>
+<pre><span class="c"># GitHub Release</span>
+curl -fsSL https://raw.githubusercontent.com/linjiw/jbar/main/scripts/install-from-github.sh | bash
+
+<span class="c"># npm (Node 18+)</span>
+npm install --global @linjiw/jbar
+jbar
+
+<span class="c"># Or run once without installing globally</span>
+npx --yes @linjiw/jbar</pre>
+  <h3>Build from source</h3>
+  <p class="sub">The best option if you prefer not to approve an unsigned preview. Requires macOS 13+
+    and Xcode command-line tools.</p>
 <pre><span class="c"># Build, validate, stage, and install the development app.</span>
 git clone https://github.com/linjiw/jbar.git
 cd jbar
 make install</pre>
   <p class="sub" style="margin-top:16px">Press <strong>⌥Space</strong>. On your first search macOS asks
-    for protected-folder access as needed by configured roots. Do not strip quarantine from a downloaded
-    build. A Homebrew Cask becomes appropriate only after the exact Universal 2 ZIP is Developer ID
-    signed, notarized/stapled, and clean-machine validated. npm or a language rewrite would not bypass
-    macOS signing, TCC, architecture, or minimum-OS requirements.</p>
+    for protected-folder access as needed by configured roots. The prebuilt installers verify the
+    release checksum and preserve quarantine metadata; do not disable Gatekeeper or remove quarantine.</p>
 </section>
 
 <section id="how">

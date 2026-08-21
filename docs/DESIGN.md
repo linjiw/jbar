@@ -227,9 +227,15 @@ Security boundaries currently enforced in core code include input/config allocat
 
 `scripts/build-app.sh` builds `arm64` and `x86_64` by default, checks both slices, validates bundle metadata/version, and strictly verifies the signature. Its default signature is ad-hoc for development. The current local gate verified both slices at minOS 13.0 plus native arm64 and Rosetta x86_64 CLI execution; Rosetta is not native Intel or macOS 13 runtime evidence. `scripts/package-app.sh` validates architecture, minimum OS, signature, version, archive structure, executable permission, and checksum.
 
-The public channel is intended to be one Developer ID signed, Hardened Runtime, notarized/stapled Universal 2 ZIP. A Homebrew Cask should install that exact ZIP. Homebrew formulae, npm packages, Electron, or a language rewrite do not remove macOS signing, Gatekeeper, TCC, minimum-OS, or CPU requirements. Swift/AppKit avoids a second runtime and is the simplest architecture for the native panel, text-input, LaunchServices, FSEvents, login-item, and hotkey APIs used here.
+The current public channel is an explicitly labelled ad-hoc Universal 2 developer-preview ZIP on
+GitHub Releases. The npm package is a Node-18+ launcher that downloads and verifies that exact ZIP;
+it does not bundle Node or change the native app. A future paid Developer ID release can replace the
+preview with a Hardened Runtime, notarized/stapled ZIP. Neither channel removes macOS signing,
+Gatekeeper, TCC, minimum-OS, or CPU requirements. Swift/AppKit avoids a second runtime and is the
+simplest architecture for the native panel, text-input, LaunchServices, FSEvents, login-item, and
+hotkey APIs used here.
 
-Until the release gate passes, `make install` is a source/development flow and downloaded ad-hoc artifacts must not be presented as a normal install. Do not instruct users to strip quarantine. Follow [RELEASING.md](RELEASING.md).
+The preview is intentionally presented as a developer install, not a trusted/notarized public release. `make install` remains the preferred path when a user wants to build from source. Do not instruct users to strip quarantine. Follow [RELEASING.md](RELEASING.md).
 
 ## 10. Validation model
 
