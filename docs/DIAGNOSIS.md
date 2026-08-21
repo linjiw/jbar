@@ -190,8 +190,8 @@ Then check the big-ticket items by hand: `~/Library/Caches`, downloaded installe
 This investigation is the design brief:
 
 - **Don't depend on Spotlight for a launcher.** Coverage can be incomplete for hours after any unclean shutdown or OS update, `mdfind` costs 70–140 ms per query (and seconds for common terms), and `kMDItemFSContentChangeDate` reads 1970 during a rebuild.
-- **Own the index.** JBar crawls its configured roots in ~2.5 s and keeps them fresh with FSEvents, so it has no rebuild hole.
-- **Exclude the junk by default.** The same trees that dominate Spotlight's rebuild — `node_modules`, `.venv`, `vendor/`, conda, `go/pkg`, build output — are JBar's default exclude list, which is why its index is 182 k items where Spotlight's is 2 M.
-- **Rank for launching, not for recall.** Returning every match unranked is what makes a common term cost seconds; a launcher wants the best eight, instantly.
+- **Own the index.** JBar crawls configured roots into an explicit local index and uses FSEvents to request refreshes instead of depending on Spotlight coverage. Current validated crawl/search evidence is recorded separately in [`COMPARISON.md`](COMPARISON.md); it remains local observational evidence, not a cross-machine SLA or a claim that every filesystem transition is gap-free.
+- **Exclude the junk by default.** The same trees that dominated the observed Spotlight rebuild — `node_modules`, `.venv`, `vendor/`, conda, `go/pkg`, and build output — are on JBar's default exclude list. In this investigation that produced roughly 182 k JBar items versus roughly 2 M Spotlight records; the ratio is corpus-specific.
+- **Rank for launching, not for exhaustive display.** A launcher keeps a bounded result pool, ranks it deterministically, and shows only the rows that fit the configured viewport. Current latency evidence and methodology are recorded separately rather than summarized as “instant.”
 
-See [`COMPARISON.md`](COMPARISON.md) for the head-to-head benchmark and [`DESIGN.md`](DESIGN.md) for the architecture that follows from this.
+See [`COMPARISON.md`](COMPARISON.md) for the current benchmark methodology and non-equivalent Spotlight reference, and [`DESIGN.md`](DESIGN.md) for the architecture that follows from this.

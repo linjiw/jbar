@@ -3,6 +3,7 @@ import AppKit
 /// Programmatic main menu for an `LSUIElement` app. It is never shown, but without it ⌘V/⌘A/⌘X/⌘Z
 /// would not reach the query field. There is deliberately NO Quit item, so ⌘Q inside the panel is
 /// ignored (DESIGN.md §7.3); quitting is done from the status-bar menu.
+@MainActor
 enum MainMenu {
     static func install(openConfig: Selector, target: AnyObject) {
         let main = NSMenu()

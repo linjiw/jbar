@@ -38,11 +38,10 @@ public struct Exclusions: Sendable, Equatable {
     /// Expand a leading `~` (alone or `~/…`) to `home`, and drop a trailing `/` (except for "/").
     /// Other paths are returned unchanged apart from the trailing-slash normalisation.
     public static func expandTilde(_ path: String, home: String) -> String {
-        let h = home.count > 1 && home.hasSuffix("/") ? String(home.dropLast()) : home
-        var p = path
-        if p == "~" { p = h } else if p.hasPrefix("~/") { p = h + p.dropFirst(1) }
-        while p.count > 1 && p.hasSuffix("/") { p.removeLast() }
-        return p
+        if path == "~" || SafetyLimits.hasTildeSlashPrefix(path) {
+            return SafetyLimits.expandingLeadingTilde(path, home: home) ?? path
+        }
+        return SafetyLimits.trimmingTrailingPathSlashes(path)
     }
 
     /// Default exclude names (lowercase) — exposed so Config can show/merge them.
@@ -107,7 +106,7 @@ public struct ExcludedPathMatcher: Sendable {
             let p = ExcludedPathMatcher.normalize(raw)
             guard !p.isEmpty else { continue }
             let last = p.lastComponent
-            if last.contains("*") {
+            if last.utf8.contains(0x2A) {
                 gl.append((ExcludedPathMatcher.parent(of: p), last))
             } else {
                 ex.insert(p)
@@ -131,22 +130,25 @@ public struct ExcludedPathMatcher: Sendable {
 
     /// Lowercase + strip trailing slashes (keep "/").
     static func normalize(_ s: String) -> String {
-        var p = s.lowercased()
-        while p.count > 1 && p.hasSuffix("/") { p.removeLast() }
-        return p
+        guard SafetyLimits.utf8Fits(s, maxBytes: SafetyLimits.maxPathUTF8Bytes) else { return "" }
+        let lowered = s.lowercased()
+        guard SafetyLimits.utf8Fits(lowered, maxBytes: SafetyLimits.maxPathUTF8Bytes) else { return "" }
+        return SafetyLimits.trimmingTrailingPathSlashes(lowered)
     }
 
     /// Parent directory string of a normalised path ("/" for top-level entries, "" for relative names).
     static func parent(of p: String) -> String {
-        guard let slash = p.lastIndex(of: "/") else { return "" }
-        return slash == p.startIndex ? "/" : String(p[..<slash])
+        let bytes = Array(p.utf8)
+        guard let slash = bytes.lastIndex(of: 0x2F) else { return "" }
+        return slash == 0 ? "/" : String(decoding: bytes[..<slash], as: UTF8.self)
     }
 }
 
 private extension String {
     var lastComponent: String {
-        guard let slash = lastIndex(of: "/") else { return self }
-        return String(self[index(after: slash)...])
+        let bytes = Array(utf8)
+        guard let slash = bytes.lastIndex(of: 0x2F) else { return self }
+        return String(decoding: bytes[(slash + 1)...], as: UTF8.self)
     }
 }
 

@@ -2,7 +2,7 @@ import XCTest
 @testable import JBarCore
 
 /// Engine tests: golden rankings on a synthetic store, modes (empty/path/extension-only), incremental cache,
-/// cancellation/request ids, row building and a release-mode perf test on a 300k-item store.
+/// cancellation/request ids, row building and deterministic semantics on a 300k-item store.
 final class SearchEngineTests: XCTestCase {
 
     // MARK: - Fixture
@@ -194,6 +194,34 @@ final class SearchEngineTests: XCTestCase {
         XCTAssertEqual(xc.rows.first?.tier, Tier.prefixApp)
     }
 
+    func testLocalizedFinderNameIsDisplayedAndHighlightedWhilePathKeepsBundleName() async {
+        let builder = IndexBuilder()
+        let apps = builder.addRoot("/Applications")
+        let displayName = "微信测试"
+        let info = AppInfo(bundleID: "com.test.localized", displayName: displayName,
+                           aliases: [TextAnalyzer.analyze(displayName), TextAnalyzer.analyze("weixin")])
+        builder.addItem(dir: apps, name: "InternalWeChat", analyzed: TextAnalyzer.analyze("InternalWeChat"),
+                        kind: .app, flags: [.appBundle], mtime: nil, depth: 1, ext: "app", app: info)
+        let engine = await makeEngine(store: builder.build(generation: 9))
+
+        let localized = await engine.search("微信", limit: 8, now: Fixture.now)
+
+        XCTAssertEqual(localized.rows.first?.name, displayName,
+                       "the label must match Finder's localized display name, not the bundle directory")
+        XCTAssertEqual(localized.rows.first?.path, "/Applications/InternalWeChat.app",
+                       "launching must still use the real bundle path")
+        let row = try? XCTUnwrap(localized.rows.first)
+        XCTAssertEqual(row.map {
+            TextAnalyzer.characterIndices(display: $0.name, matchedFoldedByteOffsets: $0.matchedByteOffsets)
+        }, [0, 1], "highlight offsets must be mapped against the displayed localized string")
+
+        let internalNameMatch = await engine.search("internal", limit: 8, now: Fixture.now)
+        XCTAssertEqual(internalNameMatch.rows.first?.name, displayName,
+                       "the filesystem name remains searchable but is not exposed as the primary label")
+        XCTAssertEqual(internalNameMatch.rows.first?.matchedByteOffsets, [],
+                       "a hidden alias must not create invalid highlight offsets in the display label")
+    }
+
     func testReportPdfExtensionTerm() async {
         let e = await makeEngine()
         let r = await e.search("report pdf", now: Fixture.now)
@@ -375,7 +403,9 @@ final class SearchEngineTests: XCTestCase {
     func testPathModeListing() async throws {
         let dir = try tempDir("pathmode")
         let fm = FileManager.default
-        for d in ["Zeta", "alpha", "Beta", ".hiddenDir"] { try fm.createDirectory(at: dir.appendingPathComponent(d), withIntermediateDirectories: true) }
+        for d in ["Zeta", "alpha", "Beta", ".hiddenDir", ".\u{0301}decoratedHidden"] {
+            try fm.createDirectory(at: dir.appendingPathComponent(d), withIntermediateDirectories: true)
+        }
         for f in ["b.txt", "a.pdf", "Archive.zip", ".secret", "Demo.app"] {
             if f.hasSuffix(".app") { try fm.createDirectory(at: dir.appendingPathComponent(f), withIntermediateDirectories: true) }
             else { try "x".write(to: dir.appendingPathComponent(f), atomically: true, encoding: .utf8) }
@@ -391,7 +421,7 @@ final class SearchEngineTests: XCTestCase {
         XCTAssertTrue(all.rows.allSatisfy { $0.itemIndex == -1 && $0.matchedByteOffsets.isEmpty })
         // Hidden only when the filter starts with ".".
         let hidden = await e.search(dir.path + "/.", now: Fixture.now)
-        XCTAssertEqual(names(hidden), [".hiddenDir", ".secret"])
+        XCTAssertEqual(Set(names(hidden)), Set([".hiddenDir", ".secret", ".\u{0301}decoratedHidden"]))
         // Prefix filter (case-insensitive) with highlight of the prefix.
         let pre = await e.search(dir.path + "/a", now: Fixture.now)
         XCTAssertEqual(names(pre).prefix(2), ["alpha", "a.pdf"], "\(names(pre))")   // prefix group: folder first, then file
@@ -422,6 +452,44 @@ final class SearchEngineTests: XCTestCase {
         XCTAssertEqual(r.rows.first?.path, dir.appendingPathComponent("Desktop").path)
     }
 
+    func testSetHomeRejectsOversizedAndUnsafePublicValues() async {
+        let engine = SearchEngine()
+        let fallback = QueryParser.normalizedHome(NSHomeDirectory())
+        let hostileHomes = [String(repeating: "h", count: 1_000_000),
+                            "relative", "/a/../b", "/bad\0\u{301}home"]
+        for hostile in hostileHomes {
+            await engine.setHome(hostile)
+            let stored = await engine.home
+            XCTAssertEqual(stored, fallback)
+            XCTAssertTrue(SafetyLimits.isSafeAbsolutePath(stored))
+        }
+    }
+
+    func testExtremePublicLimitsNeverOverflowOrAllocateUnboundedCapacity() async throws {
+        let e = await makeEngine()
+        let negative = await e.search("report", limit: Int.min, appsFirstCap: Int.max, now: Fixture.now)
+        XCTAssertTrue(negative.rows.isEmpty)
+        XCTAssertFalse(negative.totalMatchesIsComplete,
+                       "a zero-row request must return before scanning, not claim an exact zero")
+
+        let positive = await e.search("a", limit: Int.max, appsFirstCap: Int.max, now: Fixture.now)
+        XCTAssertLessThanOrEqual(positive.rows.count, SafetyLimits.maxResults.upperBound)
+
+        let dir = try tempDir("extreme-limit-path")
+        try "x".write(to: dir.appendingPathComponent("one.txt"), atomically: true, encoding: .utf8)
+        let path = await e.search(dir.path + "/", limit: Int.max, appsFirstCap: Int.min, now: Fixture.now)
+        XCTAssertEqual(path.rows.map(\.name), ["one.txt"])
+        XCTAssertEqual(path.totalMatches, 1)
+
+        let emptyPath = await e.search(dir.path + "/", limit: Int.min, now: Fixture.now)
+        XCTAssertTrue(emptyPath.rows.isEmpty)
+        XCTAssertFalse(emptyPath.totalMatchesIsComplete)
+
+        let hugeQuery = String(repeating: "a", count: SafetyLimits.maxQueryCharacters + 100_000)
+        let bounded = await e.search(hugeQuery, limit: 8, now: Fixture.now)
+        XCTAssertEqual(bounded.query.count, SafetyLimits.maxQueryCharacters)
+    }
+
     func testRowForPath() throws {
         let dir = try tempDir("rows")
         let fm = FileManager.default
@@ -443,6 +511,8 @@ final class SearchEngineTests: XCTestCase {
         XCTAssertEqual(root.kind, .folder); XCTAssertEqual(root.path, "/")
         XCTAssertEqual(SearchEngine.abbreviate(dir.path + "/Sub", home: dir.path), "~/Sub")
         XCTAssertEqual(SearchEngine.abbreviate(dir.path + "x", home: dir.path), dir.path + "x")
+        XCTAssertEqual(SearchEngine.abbreviate("/\u{301}目录", home: "/"), "~/\u{301}目录")
+        XCTAssertEqual(SearchEngine.abbreviate("/Users/Cafe\u{301}/文件", home: "/Users/Café"), "~/文件")
     }
 
     // MARK: - Incremental cache, request ids, cancellation, store swaps
@@ -537,10 +607,23 @@ final class SearchEngineTests: XCTestCase {
     func testParallelScanEqualsSerialScan() async {
         // 60k candidates → parallel chunks; the incremental rescan of a small candidate list → single chunk.
         let e = await makeEngine(store: Self.largeStore)
+        let parallelWork = SearchScanWorkObserver()
+        await e.setScanWorkObserver(parallelWork)
         let parallel = await e.search("vas screaming", now: Fixture.now)   // full scan, chunked
+        let parallelSnapshot = parallelWork.snapshot
+        XCTAssertEqual(parallelSnapshot.chunkScansStarted,
+                       SearchEngine.chunkRanges(count: Self.largeStore.count).count)
+        XCTAssertEqual(parallelSnapshot.visitedCandidates, Self.largeStore.count)
         let cold = await makeEngine(store: Self.largeStore)
         _ = await cold.search("vas screamin", now: Fixture.now)
+        let serialWork = SearchScanWorkObserver()
+        await cold.setScanWorkObserver(serialWork)
         let serial = await cold.search("vas screaming", now: Fixture.now)  // cached candidate list, one chunk
+        let serialSnapshot = serialWork.snapshot
+        XCTAssertEqual(serialSnapshot.chunkScansStarted, 1,
+                       "a small incremental candidate set must run as one chunk")
+        XCTAssertGreaterThan(serialSnapshot.visitedCandidates, 0)
+        XCTAssertLessThanOrEqual(serialSnapshot.visitedCandidates, SearchEngine.parallelThreshold)
         XCTAssertEqual(rowKeys(parallel), rowKeys(serial))
         XCTAssertEqual(parallel.totalMatches, serial.totalMatches)
         XCTAssertGreaterThan(parallel.totalMatches, 0)
@@ -556,6 +639,51 @@ final class SearchEngineTests: XCTestCase {
             for i in 1..<ranges.count { XCTAssertEqual(ranges[i].lowerBound, ranges[i-1].upperBound) }
             XCTAssertEqual(ranges.reduce(0) { $0 + $1.count }, count)
         }
+    }
+
+    func testStaleChunkReturnsBeforeFirstCandidateAndNextWorkMatchesFresh() {
+        let store = Self.largeStore
+        let parsed = QueryParser.parse("vas screaming", home: Fixture.home)
+        let terms = parsed.terms.map {
+            PreparedTerm(folded: $0.folded, mask: $0.mask, extIds: [])
+        }
+        func context(counter: RequestCounter, requestId: UInt64,
+                     observer: SearchScanWorkObserver? = nil) -> ScanContext {
+            ScanContext(store: store, parsed: parsed, terms: terms, weights: .default,
+                        frecency: nil, now: Fixture.now, limit: 8, appsFirstCap: 5,
+                        home: Fixture.home, requestId: requestId, counter: counter,
+                        candidates: .all(store.count), workObserver: observer)
+        }
+
+        let sharedCounter = RequestCounter()
+        let staleRequestId = sharedCounter.next()
+        _ = sharedCounter.next()
+        let staleObserver = SearchScanWorkObserver()
+        var stale = ChunkWorker(ctx: context(counter: sharedCounter, requestId: staleRequestId,
+                                             observer: staleObserver))
+        stale.run(range: 0..<store.count)
+        XCTAssertTrue(stale.cancelled)
+        XCTAssertEqual(stale.total, 0)
+        XCTAssertTrue(stale.matched.isEmpty)
+        XCTAssertTrue(stale.top.items.isEmpty)
+        XCTAssertEqual(staleObserver.snapshot,
+                       SearchScanWork(chunkScansStarted: 1, visitedCandidates: 0),
+                       "a stale chunk must stop at its first cancellation poll, before candidate access")
+
+        var live = ChunkWorker(ctx: context(counter: sharedCounter, requestId: sharedCounter.current))
+        live.run(range: 0..<store.count)
+        XCTAssertFalse(live.cancelled)
+
+        let freshCounter = RequestCounter()
+        let freshRequestId = freshCounter.next()
+        var fresh = ChunkWorker(ctx: context(counter: freshCounter, requestId: freshRequestId))
+        fresh.run(range: 0..<store.count)
+        XCTAssertFalse(fresh.cancelled)
+        XCTAssertEqual(live.total, fresh.total)
+        XCTAssertEqual(live.matched, fresh.matched)
+        XCTAssertEqual(live.top.items.map(\.item), fresh.top.items.map(\.item))
+        XCTAssertEqual(live.top.items.map(\.facts), fresh.top.items.map(\.facts))
+        XCTAssertEqual(live.top.items.map(\.kind), fresh.top.items.map(\.kind))
     }
 
     func testTopKKeepsBestByRankingKey() {
@@ -587,6 +715,7 @@ final class SearchEngineTests: XCTestCase {
         XCTAssertEqual(two.rows.prefix { $0.isApp }.count, 2)
         let zero = await e.search("a", limit: 0, now: Fixture.now)
         XCTAssertTrue(zero.rows.isEmpty)
+        XCTAssertFalse(zero.totalMatchesIsComplete)
     }
 
     func testPinyinInitialsHeuristic() {
@@ -605,37 +734,36 @@ final class SearchEngineTests: XCTestCase {
         XCTAssertEqual(c.next(), 1); XCTAssertEqual(c.next(), 2); XCTAssertEqual(c.current, 2)
     }
 
-    // MARK: - Performance (run in release: swift test -c release --filter SearchEngineTests/testPerf)
+    // MARK: - Large-store semantics (performance budgets belong to the versioned benchmark gate)
 
-    func testPerf300k() async {
+    func testScale300kFullAndIncrementalSearchSemantics() async {
         let store = Fixture.buildLarge(count: 300_000)
         let e = await makeEngine(store: store)
-        _ = await e.search("warmup", now: Fixture.now)
-        func time(_ q: String, reset: Bool = true) async -> (ms: Double, matches: Int) {
-            if reset { await e.update(store: store) }   // defeat the incremental cache → full scan
-            let t0 = DispatchTime.now().uptimeNanoseconds
-            let r = await e.search(q, now: Fixture.now)
-            let ms = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e6
-            XCTAssertFalse(r.cancelled)
-            return (ms, r.totalMatches)
-        }
-        var report: [String] = []
-        for q in ["vsc", "report", "x", "gc", "chrome", "report pdf", "visual studio"] {
-            var best = Double.infinity; var matches = 0
-            for _ in 0..<5 { let t = await time(q); best = min(best, t.ms); matches = t.matches }
-            report.append("\(q): \(String(format: "%.2f", best)) ms full scan, \(matches) matches")
-            // Debug builds are ~10× slower than release (unoptimised generics); only enforce the budget in release.
-            #if DEBUG
-            XCTAssertLessThan(best, 5_000, "query \(q) too slow (debug)")
-            #else
-            XCTAssertLessThan(best, 150, "query \(q) too slow")
-            #endif
-        }
-        // Incremental: "x" then "xr" (rescans only the "x" candidates).
-        await e.update(store: store)
-        _ = await e.search("x", now: Fixture.now)
-        let inc = await time("xr", reset: false)
-        report.append("xr (incremental after x): \(String(format: "%.2f", inc.ms)) ms, \(inc.matches) matches")
-        print("PERF 300k items (\(store.count)): " + report.joined(separator: " | "))
+        let fullObserver = SearchScanWorkObserver()
+        await e.setScanWorkObserver(fullObserver)
+        let broad = await e.search("x", now: Fixture.now)
+        XCTAssertFalse(broad.cancelled)
+        XCTAssertTrue(broad.totalMatchesIsComplete)
+        XCTAssertGreaterThan(broad.totalMatches, broad.rows.count)
+        XCTAssertLessThanOrEqual(broad.rows.count, 8)
+        XCTAssertEqual(fullObserver.snapshot.visitedCandidates, store.count,
+                       "the initial query must exercise every item in the 300k fixture")
+        XCTAssertEqual(fullObserver.snapshot.chunkScansStarted,
+                       SearchEngine.chunkRanges(count: store.count).count)
+
+        let incrementalObserver = SearchScanWorkObserver()
+        await e.setScanWorkObserver(incrementalObserver)
+        let incremental = await e.search("xr", now: Fixture.now)
+        XCTAssertFalse(incremental.cancelled)
+        XCTAssertTrue(incremental.totalMatchesIsComplete)
+        XCTAssertEqual(incrementalObserver.snapshot.visitedCandidates, broad.totalMatches,
+                       "an extended query must rescan exactly the prior query's matching candidates")
+
+        let cold = await makeEngine(store: store)
+        let reference = await cold.search("xr", now: Fixture.now)
+        XCTAssertFalse(reference.cancelled)
+        XCTAssertEqual(rowKeys(incremental), rowKeys(reference))
+        XCTAssertEqual(incremental.totalMatches, reference.totalMatches)
+        XCTAssertEqual(incremental.totalMatchesIsComplete, reference.totalMatchesIsComplete)
     }
 }

@@ -55,6 +55,10 @@ public enum QueryParser {
     /// - `lastTermComplete` = raw ends with whitespace (and is non-empty after trimming); `hasUppercase` = any uppercase
     ///   character in the trimmed query. Both are computed for every non-empty mode.
     public static func parse(_ raw: String, home: String = NSHomeDirectory()) -> ParsedQuery {
+        // A paste is an untrusted local input just like config. Bound all subsequent folding, splitting,
+        // and path work even when QueryParser is called without the UI. `prefix` walks at most the limit,
+        // so a multi-megabyte String does not first incur another full-size allocation.
+        let raw = boundedRaw(raw)
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
             return ParsedQuery(raw: raw, mode: .empty, terms: [], termStrings: [], wholeFolded: [], mask: 0,
@@ -63,8 +67,8 @@ public enum QueryParser {
         let lastComplete = raw.last.map { $0.isWhitespace } ?? false
         let upper = trimmed.contains { $0.isUppercase }
 
-        if trimmed.hasPrefix("/") || trimmed.hasPrefix("~") {
-            let (base, filter) = splitPath(trimmed, home: home)
+        if trimmed.utf8.first == 0x2F || trimmed.utf8.first == 0x7E {
+            let (base, filter) = splitPath(trimmed, home: normalizedHome(home))
             let termStrings = filter.isEmpty ? [] : [filter]
             let terms = termStrings.map { TextAnalyzer.analyze($0) }
             return ParsedQuery(raw: raw, mode: .path(base: base, filter: filter), terms: terms, termStrings: termStrings,
@@ -86,31 +90,76 @@ public enum QueryParser {
                            lastTermComplete: lastComplete, hasUppercase: upper)
     }
 
+    static func boundedRaw(_ raw: String) -> String {
+        // Limit UTF-8 first. A single extended grapheme may contain an arbitrary number of combining
+        // marks, so asking String for its first N Characters before this step would still permit work
+        // proportional to a multi-megabyte paste. Decoding a prefix also repairs a split UTF-8 scalar.
+        let bytes = raw.utf8
+        let byteLimited: String
+        if let end = bytes.index(bytes.startIndex, offsetBy: SafetyLimits.maxQueryUTF8Bytes,
+                                 limitedBy: bytes.endIndex), end < bytes.endIndex {
+            byteLimited = String(decoding: bytes[..<end], as: UTF8.self)
+        } else {
+            byteLimited = raw
+        }
+
+        guard let end = byteLimited.index(byteLimited.startIndex, offsetBy: SafetyLimits.maxQueryCharacters,
+                                          limitedBy: byteLimited.endIndex), end < byteLimited.endIndex else {
+            return byteLimited
+        }
+        return String(byteLimited[..<end])
+    }
+
     /// Split a path-mode query into (base directory, trailing filter segment), expanding a leading `~`.
     static func splitPath(_ q: String, home: String) -> (base: String, filter: String) {
-        var expanded = q
-        if q == "~" {
-            expanded = home + "/"
-        } else if q.hasPrefix("~/") {
-            expanded = home + q.dropFirst(1)
-        } else if q.hasPrefix("~") {
-            expanded = home + "/" + q.dropFirst(1)        // "~Dow" → "~/Dow" (leniency for a missed slash)
+        let home = normalizedHome(home)
+        let queryBytes = Array(boundedRaw(q).utf8)
+        let homeBytes = Array(home.utf8)
+        let expanded: [UInt8]
+        if queryBytes.first == 0x7E {
+            var suffix = Array(queryBytes.dropFirst())
+            if suffix.first != 0x2F { suffix.insert(0x2F, at: 0) }
+            // A root home already supplies the separator. Avoid producing `//foo`, which changes
+            // the parser's base and breaks home-relative browsing for embedded/test callers.
+            expanded = homeBytes == [0x2F] ? homeBytes + suffix.dropFirst() : homeBytes + suffix
+        } else {
+            expanded = queryBytes
         }
-        guard let slash = expanded.lastIndex(of: "/") else {
-            return ("/", expanded)                        // unreachable in practice (q starts with "/" or was expanded)
+        guard let slash = expanded.lastIndex(of: 0x2F) else {
+            return ("/", String(decoding: expanded, as: UTF8.self))
         }
-        var base = String(expanded[..<slash])
-        while base.count > 1 && base.hasSuffix("/") { base.removeLast() }
-        if base.isEmpty { base = "/" }
-        let filter = String(expanded[expanded.index(after: slash)...])
-        return (base, filter)
+        var baseBytes = Array(expanded[..<slash])
+        while baseBytes.count > 1 && baseBytes.last == 0x2F { baseBytes.removeLast() }
+        if baseBytes.isEmpty { baseBytes = [0x2F] }
+        let filterStart = expanded.index(after: slash)
+        return (String(decoding: baseBytes, as: UTF8.self),
+                String(decoding: expanded[filterStart...], as: UTF8.self))
+    }
+
+    static func normalizedHome(_ candidate: String) -> String {
+        if SafetyLimits.isSafeAbsolutePath(candidate) {
+            return SafetyLimits.trimmingTrailingPathSlashes(candidate)
+        }
+        let fallback = NSHomeDirectory()
+        return SafetyLimits.isSafeAbsolutePath(fallback)
+            ? SafetyLimits.trimmingTrailingPathSlashes(fallback) : "/"
     }
 
     /// `.pdf` → "pdf" if the trimmed query is a dot followed by 1–8 `[a-z0-9]` characters (case-insensitive); else nil.
     static func extensionOnly(_ trimmed: String) -> String? {
-        guard trimmed.hasPrefix("."), trimmed.count >= 2, trimmed.count <= maxExtensionLength + 1 else { return nil }
-        let ext = trimmed.dropFirst().lowercased()
-        let ok = ext.unicodeScalars.allSatisfy { ($0.value >= 0x61 && $0.value <= 0x7A) || ($0.value >= 0x30 && $0.value <= 0x39) }
-        return ok ? ext : nil
+        guard SafetyLimits.hasDotPrefix(trimmed),
+              SafetyLimits.utf8Fits(trimmed, maxBytes: maxExtensionLength + 1) else { return nil }
+        let bytes = Array(trimmed.utf8)
+        guard bytes.count >= 2 else { return nil }
+        var folded: [UInt8] = []
+        folded.reserveCapacity(bytes.count - 1)
+        for byte in bytes.dropFirst() {
+            switch byte {
+            case 0x30...0x39, 0x61...0x7A: folded.append(byte)
+            case 0x41...0x5A: folded.append(byte + 0x20)
+            default: return nil
+            }
+        }
+        return String(decoding: folded, as: UTF8.self)
     }
 }

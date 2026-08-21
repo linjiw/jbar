@@ -69,4 +69,124 @@ final class IndexBuilderAppendTests: XCTestCase {
         // Each item's ext id points at the right string.
         for i in 0..<s.count { XCTAssertEqual(s.ext(of: i), TextAnalyzer.fileExtension(of: s.name(of: i))) }
     }
+
+    func testExtensionTableStopsBeforeInt16IdentifiersAlias() throws {
+        let builder = IndexBuilder()
+        let root = builder.addRoot("/extensions")
+        let analyzed = TextAnalyzer.analyze("item")
+        for index in 0...(Int(Int16.max) + 1) {
+            builder.addItem(dir: root, name: "item", analyzed: analyzed, kind: .other,
+                            flags: [], mtime: nil, depth: 1,
+                            ext: "e" + String(index, radix: 36))
+        }
+        let store = builder.build(generation: 1)
+        XCTAssertEqual(store.extensions.count, Int(Int16.max) + 1)
+        XCTAssertEqual(store.extId[Int(Int16.max)], Int16.max)
+        XCTAssertEqual(store.extId[Int(Int16.max) + 1], -1,
+                       "a new extension must become unknown instead of aliasing Int16.max")
+        XCTAssertNoThrow(try Snapshot.encode(store, headerHash: 1))
+    }
+
+    func testBuilderRejectsUnsafePublicInputsWithoutMutatingItsStore() {
+        let builder = IndexBuilder()
+        let oversizedRoot = "/" + String(repeating: "r", count: SafetyLimits.maxPathUTF8Bytes)
+        XCTAssertEqual(builder.addRoot(oversizedRoot), -1)
+        XCTAssertEqual(builder.addRoot("/" + String(repeating: "/", count: 1_000_000)), -1,
+                       "the byte guard must reject before splitting an attacker-sized path")
+        XCTAssertEqual(builder.addRoot("/safe/../escape"), -1)
+        XCTAssertEqual(builder.addRoot("/safe/./child"), -1)
+        XCTAssertEqual(builder.addRoot("/safe/\u{301}/../escape"), -1)
+        XCTAssertEqual(builder.addDir(parent: Int32.max, name: "child"), -1)
+        XCTAssertEqual(builder.dirCount, 0)
+
+        let root = builder.addRoot("/safe")
+        for unsafeComponent in [".", "..", "a/b", "bad\0name"] {
+            XCTAssertEqual(builder.addDir(parent: root, name: unsafeComponent), -1)
+            XCTAssertEqual(builder.addItem(dir: root, name: unsafeComponent,
+                                           analyzed: TextAnalyzer.analyze("safe"), kind: .other,
+                                           flags: [], mtime: nil, depth: 1, ext: nil), -1)
+        }
+        let decoratedSlash = "nested/\u{301}child"
+        XCTAssertEqual(builder.addDir(parent: root, name: decoratedSlash), -1)
+        XCTAssertEqual(builder.addItem(dir: root, name: decoratedSlash,
+                                       analyzed: TextAnalyzer.analyze("safe"), kind: .other,
+                                       flags: [], mtime: nil, depth: 1, ext: nil), -1)
+        let oversizedName = String(repeating: "n", count: SafetyLimits.maxNameUTF8Bytes + 1)
+        XCTAssertEqual(builder.addItem(dir: root, name: oversizedName,
+                                       analyzed: TextAnalyzer.analyze("safe"), kind: .other,
+                                       flags: [], mtime: nil, depth: 1, ext: nil), -1)
+        let malformed = SearchString(folded: [1, 2], bonus: [1], mask: 0, initials: 0)
+        XCTAssertEqual(builder.addItem(dir: root, name: "safe", analyzed: malformed,
+                                       kind: .other, flags: [], mtime: nil, depth: 1,
+                                       ext: nil), -1)
+        let unsafeApp = AppInfo(bundleID: nil,
+                                displayName: String(repeating: "d", count: SafetyLimits.maxNameUTF8Bytes + 1),
+                                aliases: [])
+        XCTAssertEqual(builder.addItem(dir: root, name: "Safe", analyzed: TextAnalyzer.analyze("Safe"),
+                                       kind: .app, flags: [.appBundle], mtime: nil, depth: 1,
+                                       ext: "app", app: unsafeApp), -1)
+        XCTAssertEqual(builder.count, 0)
+    }
+
+    func testBuilderTreatsUnsafePublicExtensionsAsUnknown() throws {
+        for unsafeExtension in ["bad/\u{301}ext", "bad\0ext", ".", ".."] {
+            let builder = IndexBuilder()
+            let root = builder.addRoot("/safe")
+            XCTAssertGreaterThanOrEqual(builder.addItem(dir: root, name: "item",
+                                                         analyzed: TextAnalyzer.analyze("item"),
+                                                         kind: .document, flags: [], mtime: nil,
+                                                         depth: 1, ext: unsafeExtension), 0)
+            let store = builder.build(generation: 1)
+            XCTAssertEqual(store.extId, [-1], unsafeExtension)
+            XCTAssertNoThrow(try Snapshot.encode(store, headerHash: 1))
+        }
+    }
+
+    func testBuilderBoundsCumulativeAppSideTableAndAppendRootCount() {
+        let builder = IndexBuilder()
+        let root = builder.addRoot("/apps")
+        let largeAlias = SearchString(folded: [UInt8](repeating: 1, count: 4_096),
+                                      bonus: [UInt8](repeating: 0, count: 4_096),
+                                      mask: 1, initials: 0)
+        let info = AppInfo(bundleID: "com.example.large", displayName: "Large",
+                           aliases: [SearchString](repeating: largeAlias,
+                                                   count: SafetyLimits.maxSearchAliasesPerApp))
+        var accepted = 0
+        for index in 0..<100 {
+            let result = builder.addItem(dir: root, name: "App\(index)", analyzed: TextAnalyzer.analyze("App\(index)"),
+                                         kind: .app, flags: [.appBundle, .appCatalog], mtime: nil,
+                                         depth: 1, ext: "app", app: info)
+            if result < 0 { break }
+            accepted += 1
+        }
+        XCTAssertGreaterThan(accepted, 0)
+        XCTAssertLessThan(accepted, 100, "cumulative AppInfo payload must hit a hard side-table budget")
+        XCTAssertEqual(builder.count, accepted)
+
+        let roots = IndexBuilder()
+        for index in 0..<IndexStoreLimits.maxBuilderRoots {
+            XCTAssertGreaterThanOrEqual(roots.addRoot("/root-\(index)"), 0)
+        }
+        let overflow = IndexBuilder()
+        XCTAssertGreaterThanOrEqual(overflow.addRoot("/overflow"), 0)
+        let before = roots.dirCount
+        roots.append(overflow)
+        XCTAssertEqual(roots.dirCount, before, "append must not bypass the unique-root limit")
+    }
+
+    func testBuilderClampsNonFiniteDatesAndDepthToPersistableValues() throws {
+        let builder = IndexBuilder()
+        let root = builder.addRoot("/safe")
+        let analyzed = TextAnalyzer.analyze("item")
+        builder.addItem(dir: root, name: "nan", analyzed: analyzed, kind: .other,
+                        flags: [], mtime: Date(timeIntervalSinceReferenceDate: .nan),
+                        depth: Int.max, ext: nil)
+        builder.addItem(dir: root, name: "future", analyzed: analyzed, kind: .other,
+                        flags: [], mtime: Date(timeIntervalSinceReferenceDate: .infinity),
+                        depth: Int.min, ext: nil)
+        let store = builder.build(generation: 1)
+        XCTAssertEqual(store.mtime, [0, 0])
+        XCTAssertEqual(store.depth, [UInt8(SafetyLimits.maxDepth.upperBound), 0])
+        XCTAssertNoThrow(try Snapshot.encode(store, headerHash: 1))
+    }
 }

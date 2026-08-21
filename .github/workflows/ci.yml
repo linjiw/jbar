@@ -1,45 +1,555 @@
 name: CI
 
+permissions:
+  contents: read
+
 on:
   push:
     branches: [main]
   pull_request:
+  merge_group:
   workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-jobs:
-  test:
-    name: Build & test (macOS)
-    runs-on: macos-15
-    steps:
-      - uses: actions/checkout@v4
+defaults:
+  run:
+    shell: bash
 
-      - name: Show toolchain
+# The package has no remote Swift dependencies. Deliberately use isolated scratch directories
+# instead of restoring executable compiler output from an untrusted PR-controlled cache.
+jobs:
+  static_analysis:
+    name: Workflow and shell static analysis
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run pinned actionlint and ShellCheck
+        env:
+          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+          SHELLCHECK_SHA256: b7af85e41cc99489dcc21d66c6d5f3685138f06d34651e6d34b42ec6d54fe6f6
+        run: |
+          set -euo pipefail
+          umask 077
+          tools="$RUNNER_TEMP/jbar-static-analysis"
+          test ! -e "$tools" && test ! -L "$tools"
+          mkdir -m 0700 "$tools"
+          curl --fail --location --proto '=https' --tlsv1.2 --retry 3 \
+            --output "$tools/actionlint.tar.gz" \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz
+          curl --fail --location --proto '=https' --tlsv1.2 --retry 3 \
+            --output "$tools/shellcheck.tar.gz" \
+            https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellcheck-v0.11.0.linux.x86_64.tar.gz
+          printf '%s  %s\n' "$ACTIONLINT_SHA256" "$tools/actionlint.tar.gz" | sha256sum -c -
+          printf '%s  %s\n' "$SHELLCHECK_SHA256" "$tools/shellcheck.tar.gz" | sha256sum -c -
+          tar -xzf "$tools/actionlint.tar.gz" -C "$tools"
+          tar -xzf "$tools/shellcheck.tar.gz" -C "$tools"
+          actionlint="$tools/actionlint"
+          shellcheck="$tools/shellcheck-v0.11.0/shellcheck"
+          test "$("$actionlint" -version | sed -n '1p')" = 1.7.12
+          test "$($shellcheck --version | awk '/^version:/ {print $2}')" = 0.11.0
+          find scripts -type f -name '*.sh' -print0 | xargs -0 "$shellcheck" -S warning
+          "$actionlint" -shellcheck="$shellcheck" \
+            .github/workflows/ci.yml .github/workflows/release.yml
+          find scripts -type f -name '*.sh' -print0 | xargs -0 -n 1 bash -n
+          ruby -c scripts/tests/coverage-gate.rb
+          ruby -c scripts/tests/benchmark-report-gate.rb
+
+  debug_tests:
+    name: Full test suite (debug)
+    runs-on: macos-15
+    timeout-minutes: 35
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Show runner and toolchain
         run: |
           sw_vers
+          uname -m
           swift --version
           xcodebuild -version
 
-      - name: Build (debug)
-        run: swift build
+      - name: Run the complete debug suite
+        run: swift test -c debug --scratch-path "$RUNNER_TEMP/jbar-debug-tests"
 
-      - name: Run tests
-        run: swift test
-
-      - name: Build release + assemble app bundle
-        run: scripts/build-app.sh
-
-      - name: Verify the bundle launches headlessly
-        run: |
-          build/JBar.app/Contents/MacOS/JBar --version
-          build/JBar.app/Contents/MacOS/JBar --help
-
-      - name: Upload JBar.app
-        uses: actions/upload-artifact@v4
+  release_tests:
+    name: Full test suite (release)
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          name: JBar.app
-          path: build/JBar.app
+          persist-credentials: false
+
+      - name: Show runner and toolchain
+        run: |
+          sw_vers
+          uname -m
+          swift --version
+          xcodebuild -version
+
+      - name: Run the complete optimized suite
+        run: swift test -c release --scratch-path "$RUNNER_TEMP/jbar-release-tests"
+
+  strict_concurrency:
+    name: Strict concurrency (${{ matrix.configuration }})
+    runs-on: macos-15
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        configuration: [debug, release]
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Show runner and toolchain
+        run: |
+          sw_vers
+          uname -m
+          swift --version
+          xcodebuild -version
+
+      - name: Compile every source and test target with complete checking
+        env:
+          CONFIGURATION: ${{ matrix.configuration }}
+        run: |
+          swift build -c "$CONFIGURATION" --build-tests \
+            --scratch-path "$RUNNER_TEMP/jbar-strict-$CONFIGURATION" \
+            -Xswiftc -enable-testing \
+            -Xswiftc -strict-concurrency=complete \
+            -Xswiftc -warnings-as-errors
+
+  compatibility_smoke:
+    # macos-14 arm64 is scheduled to retire on 2026-11-02. Keep it mandatory while hosted,
+    # then replace it with a documented macOS 14 self-hosted/physical gate rather than dropping coverage.
+    name: CLI runtime (${{ matrix.label }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    needs: universal_package
+    permissions:
+      actions: read
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            label: macOS 14 / Apple Silicon
+            expected_major: "14"
+            expected_arch: arm64
+          - runner: macos-15
+            label: macOS 15 / Apple Silicon
+            expected_major: "15"
+            expected_arch: arm64
+          - runner: macos-15-intel
+            label: macOS 15 / Intel
+            expected_major: "15"
+            expected_arch: x86_64
+          - runner: macos-26
+            label: macOS 26 / Apple Silicon
+            expected_major: "26"
+            expected_arch: arm64
+    steps:
+      - name: Check out the exact candidate source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download the exact packaged candidate
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: JBar-development-universal
+          path: ${{ runner.temp }}/jbar-download
+
+      - name: Verify selected runtime
+        env:
+          EXPECTED_MAJOR: ${{ matrix.expected_major }}
+          EXPECTED_ARCH: ${{ matrix.expected_arch }}
+        run: |
+          sw_vers
+          uname -m
+          swift --version
+          xcodebuild -version
+          actual_major="$(sw_vers -productVersion | cut -d. -f1)"
+          actual_arch="$(uname -m)"
+          test "$actual_major" = "$EXPECTED_MAJOR"
+          test "$actual_arch" = "$EXPECTED_ARCH"
+
+      - name: Verify and extract the immutable package
+        env:
+          EXPECTED_ARCH: ${{ matrix.expected_arch }}
+        run: |
+          (cd "$RUNNER_TEMP/jbar-download" && \
+            shasum -a 256 -c JBar-ci-universal.zip.sha256)
+          mkdir -p "$RUNNER_TEMP/jbar-extracted"
+          ditto -x -k --rsrc --extattr --qtn --noacl \
+            "$RUNNER_TEMP/jbar-download/JBar-ci-universal.zip" \
+            "$RUNNER_TEMP/jbar-extracted"
+          app="$RUNNER_TEMP/jbar-extracted/JBar.app"
+          binary="$app/Contents/MacOS/JBar"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          actual_archs="$(lipo -archs "$binary")"
+          for required_arch in arm64 x86_64; do
+            case " $actual_archs " in
+              *" $required_arch "*) ;;
+              *) echo "error: packaged executable is missing $required_arch: $actual_archs" >&2; exit 1 ;;
+            esac
+          done
+          min_os="$(xcrun vtool -show-build -arch "$EXPECTED_ARCH" "$binary" | \
+            awk '$1 == "minos" { print $2; exit }')"
+          test "$min_os" = "13.0"
+
+      - name: Exercise the packaged CLI and multilingual Unicode config paths
+        run: |
+          binary="$RUNNER_TEMP/jbar-extracted/JBar.app/Contents/MacOS/JBar"
+          "$binary" --version | tee "$RUNNER_TEMP/jbar-version.txt"
+          grep -Eq '^JBar [0-9]+\.[0-9]+' "$RUNNER_TEMP/jbar-version.txt"
+          "$binary" --help | grep -F 'keyboard-first launcher'
+
+          # LANG is only a process-locale/config-path smoke here; it is not evidence that a real
+          # macOS system language, keyboard layout, or IME candidate window passed. Those remain
+          # physical gates in docs/SUPPORT.md and docs/UX-TESTS.md.
+          exercise_config_path() {
+            locale_name="$1"
+            config_home="$2"
+            evidence_name="$3"
+            first_output="$RUNNER_TEMP/jbar-hotkey-$evidence_name-first.txt"
+            second_output="$RUNNER_TEMP/jbar-hotkey-$evidence_name-second.txt"
+            env LANG="$locale_name" XDG_CONFIG_HOME="$config_home" \
+              "$binary" --print-hotkey | tee "$first_output"
+            test -s "$first_output"
+            config_file="$config_home/jbar/config.json"
+            test -s "$config_file"
+            test "$(stat -f '%Lp' "$config_file")" = "600"
+            ruby -rjson -e 'JSON.parse(File.binread(ARGV.fetch(0)))' "$config_file"
+            ruby -rjson -e '
+              path = ARGV.fetch(0)
+              value = JSON.parse(File.binread(path))
+              value["hotkey"] = "cmd+shift+k"
+              File.binwrite(path, JSON.generate(value))
+            ' "$config_file"
+            ruby -rjson -e 'JSON.parse(File.binread(ARGV.fetch(0)))' "$config_file"
+            configured_hash="$(shasum -a 256 "$config_file" | awk '{print $1}')"
+            env LANG="$locale_name" XDG_CONFIG_HOME="$config_home" \
+              "$binary" --print-hotkey | tee "$second_output"
+            grep -Fx '⇧⌘K' "$second_output" >/dev/null
+            test "$configured_hash" = "$(shasum -a 256 "$config_file" | awk '{print $1}')"
+            test "$(stat -f '%Lp' "$config_file")" = "600"
+          }
+
+          exercise_config_path en_US.UTF-8 "$RUNNER_TEMP/JBar English Config" en
+          exercise_config_path zh_CN.UTF-8 "$RUNNER_TEMP/JBar 中文 配置" zh
+          exercise_config_path ko_KR.UTF-8 "$RUNNER_TEMP/JBar 한글 구성" ko
+          exercise_config_path ja_JP.UTF-8 "$RUNNER_TEMP/JBar 日本語 設定" ja
+          exercise_config_path ar_SA.UTF-8 "$RUNNER_TEMP/JBar العربية إعداد" ar
+
+      - name: Exercise the packaged AppKit lifecycle
+        env:
+          EXPECTED_ARCH: ${{ matrix.expected_arch }}
+        run: |
+          # This is a synthetic in-process AppKit event/lifecycle gate over a private ad-hoc clone of
+          # the exact packaged candidate. It proves Control flagsChanged and Delete dispatch, focus and
+          # visibility retention, Down selection, Return/open routing, clean termination, and crash-diff
+          # collection. It does not prove a physical keyboard/IME, LaunchServices, Gatekeeper, or notarization.
+          scripts/tests/appkit-smoke.sh --self-test-supervisor
+          scripts/tests/appkit-smoke.sh \
+            "$RUNNER_TEMP/jbar-extracted/JBar.app" \
+            "$RUNNER_TEMP/jbar-appkit-smoke-evidence"
+          evidence="$RUNNER_TEMP/jbar-appkit-smoke-evidence/evidence.json"
+          test "$(/usr/bin/plutil -extract schemaVersion raw -o - "$evidence")" = "1"
+          test "$(/usr/bin/plutil -extract status raw -o - "$evidence")" = "PASS"
+          test "$(/usr/bin/plutil -extract processArchitecture raw -o - "$evidence")" = "$EXPECTED_ARCH"
+          test "$(/usr/bin/plutil -extract committedQuery raw -o - "$evidence")" = "ab"
+          test "$(/usr/bin/plutil -extract exercisedControlKey raw -o - "$evidence")" = "true"
+          test "$(/usr/bin/plutil -extract exercisedDeleteKey raw -o - "$evidence")" = "true"
+          test "$(/usr/bin/plutil -extract panelStayedVisibleUntilOpen raw -o - "$evidence")" = "true"
+          test "$(/usr/bin/plutil -extract panelHidden raw -o - "$evidence")" = "true"
+          test "$(/usr/bin/plutil -extract recordedOpenPath raw -o - "$evidence")" = \
+            "$(/usr/bin/plutil -extract expectedSecondPath raw -o - "$evidence")"
+          /usr/bin/plutil -extract scopeLimitations.0 raw -o - "$evidence" | \
+            grep -F 'Synthetic NSEvents do not prove a physical keyboard layout or hardware key path.'
+
+      - name: Upload packaged AppKit evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: JBar-appkit-smoke-macos-${{ matrix.expected_major }}-${{ matrix.expected_arch }}
+          path: ${{ runner.temp }}/jbar-appkit-smoke-evidence/
           if-no-files-found: error
+          retention-days: 14
+          compression-level: 9
+
+  sanitizers:
+    name: ${{ matrix.label }} sanitizer
+    runs-on: macos-15
+    timeout-minutes: 50
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - sanitizer: address
+            label: Address
+          - sanitizer: thread
+            label: Thread
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Show runner and toolchain
+        run: |
+          sw_vers
+          uname -m
+          swift --version
+          xcodebuild -version
+
+      - name: Run the instrumented suite without wall-clock assertions
+        env:
+          SANITIZER: ${{ matrix.sanitizer }}
+          ASAN_OPTIONS: abort_on_error=1:halt_on_error=1:detect_stack_use_after_return=1
+          TSAN_OPTIONS: abort_on_error=1:halt_on_error=1
+        run: |
+          # Loader failures and sanitizer findings are hard failures; there is no fallback execution.
+          # Uninstrumented debug/release jobs own the four wall-clock checks and the large 300k semantic
+          # scale case; sanitizer overhead is deliberately kept out of those expensive paths.
+          swift test -c debug --sanitize "$SANITIZER" \
+            --scratch-path "$RUNNER_TEMP/jbar-$SANITIZER-sanitizer" \
+            --skip '(ScorerTests/testPerf|PinyinTests/testPerformance1000Names|FrecencyTests/testSavePerformanceFor500Entries|SearchEngineTests/testScale300kFullAndIncrementalSearchSemantics|PathModeStreamingTests/testTwentyThousandEntriesBoundedTotalsAndSupersessionSmoke)'
+
+  coverage:
+    name: Coverage schema and artifact
+    runs-on: macos-15
+    timeout-minutes: 40
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run tests with LLVM coverage
+        run: |
+          # Coverage instrumentation is not a performance environment. The normal full suites run
+          # these five wall-clock/large-scale checks; this job excludes them.
+          swift test -c debug --enable-code-coverage \
+            --scratch-path "$RUNNER_TEMP/jbar-coverage-build" \
+            --skip '(ScorerTests/testPerf|PinyinTests/testPerformance1000Names|FrecencyTests/testSavePerformanceFor500Entries|SearchEngineTests/testScale300kFullAndIncrementalSearchSemantics|PathModeStreamingTests/testTwentyThousandEntriesBoundedTotalsAndSupersessionSmoke)'
+
+      - name: Validate and stage the exported schema
+        run: |
+          coverage_path="$(swift test --show-codecov-path \
+            --scratch-path "$RUNNER_TEMP/jbar-coverage-build")"
+          test -s "$coverage_path"
+          case "$coverage_path" in
+            "$RUNNER_TEMP/jbar-coverage-build"/*) ;;
+            *) echo "error: unexpected coverage path: $coverage_path" >&2; exit 1 ;;
+          esac
+          mkdir -p "$RUNNER_TEMP/jbar-coverage-artifact"
+          cp "$coverage_path" "$RUNNER_TEMP/jbar-coverage-artifact/jbar-codecov.json"
+          ruby scripts/tests/coverage-gate.rb --self-test
+          ruby scripts/tests/coverage-gate.rb \
+            "$RUNNER_TEMP/jbar-coverage-artifact/jbar-codecov.json" | \
+            tee "$RUNNER_TEMP/jbar-coverage-artifact/jbar-coverage-summary.txt"
+
+      - name: Upload coverage JSON
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: JBar-llvm-coverage
+          path: ${{ runner.temp }}/jbar-coverage-artifact/
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 9
+
+  benchmark_smoke:
+    name: Deterministic benchmark smoke
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build the optimized benchmark executable
+        run: |
+          swift build -c release --product JBar \
+            --scratch-path "$RUNNER_TEMP/jbar-benchmark-build"
+
+      - name: Run fixed-fixture smoke without a latency threshold
+        env:
+          JBAR_BENCHMARK_FIXTURE_ITEMS: "10000"
+        run: |
+          bin_dir="$(swift build -c release --show-bin-path \
+            --scratch-path "$RUNNER_TEMP/jbar-benchmark-build")"
+          JBAR_BENCHMARK_JSON_OUTPUT="$RUNNER_TEMP/jbar-benchmark.json" \
+            "$bin_dir/JBar" --benchmark 3 | tee "$RUNNER_TEMP/jbar-benchmark.log"
+          JBAR_BENCHMARK_JSON_OUTPUT="$RUNNER_TEMP/jbar-benchmark-repeat.json" \
+            "$bin_dir/JBar" --benchmark 3 > "$RUNNER_TEMP/jbar-benchmark-repeat.log"
+          grep -F 'corpus: deterministic fixture v2, items=10000, seed=0x4a4241525f42454e, fingerprint=0xa73f4b422d0f4612' \
+            "$RUNNER_TEMP/jbar-benchmark.log"
+          test "$(grep -m 1 '^corpus:' "$RUNNER_TEMP/jbar-benchmark.log")" = \
+            "$(grep -m 1 '^corpus:' "$RUNNER_TEMP/jbar-benchmark-repeat.log")"
+          grep -F 'nearest-rank p50/p95/p99/max' "$RUNNER_TEMP/jbar-benchmark.log"
+          grep -F 'Rapid supersession / cancellation' "$RUNNER_TEMP/jbar-benchmark.log"
+          grep -Eq '^older cancelled: [0-3]/3; newest unexpectedly cancelled: 0/3$' \
+            "$RUNNER_TEMP/jbar-benchmark.log"
+          grep -F 'not run: deterministic fixture paths do not exist in Spotlight' "$RUNNER_TEMP/jbar-benchmark.log"
+          test "$(stat -f '%Lp' "$RUNNER_TEMP/jbar-benchmark.json")" = "600"
+          test "$(stat -f '%Lp' "$RUNNER_TEMP/jbar-benchmark-repeat.json")" = "600"
+          ruby scripts/tests/benchmark-report-gate.rb --self-test
+          ruby scripts/tests/benchmark-report-gate.rb \
+            --expected-samples 3 --expected-fixture-items 10000 \
+            "$RUNNER_TEMP/jbar-benchmark.json" 2>&1 | \
+            tee "$RUNNER_TEMP/jbar-benchmark.gate.log"
+          ruby scripts/tests/benchmark-report-gate.rb \
+            --expected-samples 3 --expected-fixture-items 10000 \
+            "$RUNNER_TEMP/jbar-benchmark-repeat.json" 2>&1 | \
+            tee "$RUNNER_TEMP/jbar-benchmark-repeat.gate.log"
+          test "$(grep -c '^IDENTITY ' "$RUNNER_TEMP/jbar-benchmark.gate.log")" = "1"
+          test "$(grep -c '^IDENTITY ' "$RUNNER_TEMP/jbar-benchmark-repeat.gate.log")" = "1"
+          test "$(grep '^IDENTITY ' "$RUNNER_TEMP/jbar-benchmark.gate.log")" = \
+            "$(grep '^IDENTITY ' "$RUNNER_TEMP/jbar-benchmark-repeat.gate.log")"
+          # Shared hosted runners are not comparable performance instruments; successful completion,
+          # complete result validation and stable cross-process evidence identity are the regression
+          # gate here.
+
+      - name: Upload deterministic benchmark evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: JBar-deterministic-benchmark-smoke
+          path: |
+            ${{ runner.temp }}/jbar-benchmark.json
+            ${{ runner.temp }}/jbar-benchmark-repeat.json
+            ${{ runner.temp }}/jbar-benchmark.log
+            ${{ runner.temp }}/jbar-benchmark-repeat.log
+            ${{ runner.temp }}/jbar-benchmark.gate.log
+            ${{ runner.temp }}/jbar-benchmark-repeat.gate.log
+          if-no-files-found: warn
+          retention-days: 14
+          compression-level: 9
+
+  universal_package:
+    name: Universal app, packaging, and shell safety
+    runs-on: macos-15
+    timeout-minutes: 65
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check shell syntax
+        run: find scripts -type f -name '*.sh' -print0 | xargs -0 -n 1 bash -n
+
+      - name: Exercise transactional build safety
+        run: scripts/tests/build-safety.sh
+
+      - name: Build the ad-hoc signed Universal 2 app
+        run: scripts/build-app.sh "$RUNNER_TEMP/jbar-app-build"
+
+      - name: Verify the staged bundle and native CLI
+        run: |
+          app="$RUNNER_TEMP/jbar-app-build/JBar.app"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          test "$(lipo -archs "$app/Contents/MacOS/JBar")" = "x86_64 arm64" || \
+            test "$(lipo -archs "$app/Contents/MacOS/JBar")" = "arm64 x86_64"
+          "$app/Contents/MacOS/JBar" --version
+          "$app/Contents/MacOS/JBar" --help | grep -F 'keyboard-first launcher'
+
+      - name: Package and checksum the bundle
+        run: |
+          artifact_dir="$RUNNER_TEMP/jbar-artifacts"
+          mkdir -p "$artifact_dir"
+          scripts/package-app.sh \
+            "$RUNNER_TEMP/jbar-app-build/JBar.app" \
+            "$artifact_dir/JBar-ci-universal.zip"
+          (cd "$artifact_dir" && shasum -a 256 JBar-ci-universal.zip > JBar-ci-universal.zip.sha256)
+
+      - name: Exercise fail-closed package validation
+        env:
+          JBAR_PACKAGE_TEST_SOURCE_APP: ${{ runner.temp }}/jbar-app-build/JBar.app
+        run: scripts/tests/package-safety.sh
+
+      - name: Exercise transactional install safety
+        env:
+          JBAR_INSTALL_TEST_SOURCE_APP: ${{ runner.temp }}/jbar-app-build/JBar.app
+        run: scripts/tests/install-safety.sh
+
+      - name: Exercise recoverable uninstall safety
+        run: scripts/tests/uninstall-safety.sh
+
+      - name: Upload packaged development artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: JBar-development-universal
+          path: |
+            ${{ runner.temp }}/jbar-artifacts/JBar-ci-universal.zip
+            ${{ runner.temp }}/jbar-artifacts/JBar-ci-universal.zip.sha256
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+  required_gate:
+    name: Required CI gate
+    if: ${{ always() }}
+    needs:
+      - debug_tests
+      - static_analysis
+      - release_tests
+      - strict_concurrency
+      - compatibility_smoke
+      - sanitizers
+      - coverage
+      - benchmark_smoke
+      - universal_package
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Require every evidence job
+        env:
+          DEBUG_TESTS: ${{ needs.debug_tests.result }}
+          STATIC_ANALYSIS: ${{ needs.static_analysis.result }}
+          RELEASE_TESTS: ${{ needs.release_tests.result }}
+          STRICT_CONCURRENCY: ${{ needs.strict_concurrency.result }}
+          COMPATIBILITY_SMOKE: ${{ needs.compatibility_smoke.result }}
+          SANITIZERS: ${{ needs.sanitizers.result }}
+          COVERAGE: ${{ needs.coverage.result }}
+          BENCHMARK_SMOKE: ${{ needs.benchmark_smoke.result }}
+          UNIVERSAL_PACKAGE: ${{ needs.universal_package.result }}
+        run: |
+          failed=0
+          check() {
+            if [ "$2" != "success" ]; then
+              echo "::error::$1 finished with result '$2'"
+              failed=1
+            fi
+          }
+          check debug_tests "$DEBUG_TESTS"
+          check static_analysis "$STATIC_ANALYSIS"
+          check release_tests "$RELEASE_TESTS"
+          check strict_concurrency "$STRICT_CONCURRENCY"
+          check compatibility_smoke "$COMPATIBILITY_SMOKE"
+          check sanitizers "$SANITIZERS"
+          check coverage "$COVERAGE"
+          check benchmark_smoke "$BENCHMARK_SMOKE"
+          check universal_package "$UNIVERSAL_PACKAGE"
+          exit "$failed"

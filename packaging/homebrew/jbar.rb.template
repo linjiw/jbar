@@ -1,0 +1,23 @@
+cask "jbar" do
+  version "@VERSION@"
+  sha256 "@SHA256@"
+
+  url "https://github.com/linjiw/jbar/releases/download/v#{version}/JBar-#{version}-universal.zip"
+  name "JBar"
+  desc "Keyboard-first launcher for apps and files"
+  homepage "https://github.com/linjiw/jbar"
+
+  depends_on macos: :ventura
+
+  app "JBar.app"
+
+  uninstall quit:       "com.linji.jbar",
+            login_item: "JBar"
+
+  zap trash: [
+    "~/.config/jbar",
+    "~/Library/Application Support/JBar",
+    "~/Library/Caches/com.linji.jbar",
+    "~/Library/Preferences/com.linji.jbar.plist",
+  ]
+end

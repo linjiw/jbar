@@ -7,7 +7,8 @@ import ServiceManagement
 /// - `JBar --version`
 /// - `JBar --unregister-login-item`          (used by scripts/uninstall.sh)
 /// - `JBar --cli "<query>"`                  (headless index + search with timings; the integrator's benchmark)
-/// - `JBar --bench-index`                    (headless crawl; prints stats + RSS)
+/// - `JBar --bench-index`                    (real configured crawl stats; not the search benchmark)
+/// - `JBar --benchmark [samples]`            (isolated search benchmark + non-equivalent Spotlight reference)
 /// - `JBar --help`
 enum CLI {
     /// Seconds to wait for the first full crawl before searching anyway.
@@ -40,7 +41,13 @@ enum CLI {
         case "--bench-index":
             runAsync { await benchIndex() }
         case "--benchmark":
-            let iters = args.dropFirst(2).first.flatMap { Int($0) } ?? 200
+            let supplied = args.dropFirst(2).first
+            guard let iters = benchmarkIterations(supplied) else {
+                FileHandle.standardError.write(
+                    "benchmark iterations must be an integer in 1...\(SafetyLimits.maxBenchmarkIterations)\n".data(using: .utf8)!
+                )
+                exit(2)
+            }
             runAsync { await Benchmark.run(iterations: iters) }
         default:
             return nil
@@ -52,25 +59,107 @@ enum CLI {
       JBar                        start the menu-bar app (normally launched via JBar.app)
       JBar --version              print the version
       JBar --cli "<query>"        headless: index, search once, print rows + timings
-      JBar --bench-index          headless: index, print stats + memory
-      JBar --benchmark [iters]    head-to-head: JBar engine vs Spotlight (latency, coverage)
+      JBar --bench-index          real configured crawl: index stats + RSS (not search latency)
+      JBar --benchmark [samples]  isolated JBar distributions; non-equivalent Spotlight reference, no speed ratio
       JBar --unregister-login-item remove the login item (used by uninstall.sh)
       JBar --print-hotkey         print the configured hotkey (e.g. ⌥Space)
+    Benchmark: JBAR_BENCHMARK_FIXTURE_ITEMS=300000|500000|1000000 selects a deterministic corpus.
     Environment: JBAR_DEMO=1 (UI with demo data), JBAR_SHOW_ON_LAUNCH=1 (show panel at launch)
     """
 
+    /// Parse the optional benchmark sample count without permitting an unbounded allocation/run.
+    static func benchmarkIterations(_ value: String?) -> Int? {
+        guard let value else { return 200 }
+        guard let parsed = Int(value), (1...SafetyLimits.maxBenchmarkIterations).contains(parsed) else { return nil }
+        return parsed
+    }
+
     // MARK: - Modes
 
-    private static func unregisterLoginItem() -> Int32 {
-        let before = LoginItem.status
-        print("login item status before: \(LoginItem.describe(before))")
-        guard before == .enabled || before == .requiresApproval else { return 0 }
-        if let err = LoginItem.unregister() {
-            print("unregister failed: \(err)")
-            return 1
+    struct LoginItemUnregisterResult: Equatable {
+        let exitCode: Int32
+        let standardOutput: [String]
+        let standardError: [String]
+    }
+
+    /// Pure policy seam for `--unregister-login-item`. Callers inject status reads and the
+    /// unregister operation; production uses `SMAppService.mainApp`, while tests use inert fakes.
+    static func unregisterLoginItem(
+        status: () -> LoginItem.State,
+        unregister: () throws -> Void
+    ) -> LoginItemUnregisterResult {
+        let outcome = LoginItem.ensureUnregistered(
+            status: status, performUnregister: unregister
+        )
+        var standardOutput = [
+            "login item status before: \(LoginItem.describe(outcome.before))",
+        ]
+
+        switch outcome {
+        case .alreadyNotRegistered:
+            return LoginItemUnregisterResult(
+                exitCode: 0, standardOutput: standardOutput, standardError: []
+            )
+        case .unregistered:
+            standardOutput.append("login item status after: not registered")
+            return LoginItemUnregisterResult(
+                exitCode: 0, standardOutput: standardOutput, standardError: []
+            )
+        case .refused(let before):
+            let diagnostic: String
+            if before == .notFound {
+                diagnostic = "unregister failed: status not found is not proof that the login item is unregistered"
+            } else {
+                diagnostic = "unregister failed: unsupported login item status \(LoginItem.describe(before))"
+            }
+            return LoginItemUnregisterResult(
+                exitCode: 1,
+                standardOutput: standardOutput,
+                standardError: [diagnostic]
+            )
+        case .nonTerminal(_, let after):
+            standardOutput.append("login item status after: \(LoginItem.describe(after))")
+            return LoginItemUnregisterResult(
+                exitCode: 1,
+                standardOutput: standardOutput,
+                standardError: [
+                    "unregister failed: expected not registered after unregister, got \(LoginItem.describe(after))",
+                ]
+            )
+        case .unregisteredAfterAPIError(_, let apiError):
+            standardOutput.append("login item status after API error: not registered")
+            return LoginItemUnregisterResult(
+                exitCode: 0,
+                standardOutput: standardOutput,
+                standardError: [
+                    "unregister warning: API returned domain=\(apiError.domain) code=\(apiError.code), but terminal status is not registered",
+                ]
+            )
+        case .apiError(_, let apiError, let after):
+            standardOutput.append(
+                "login item status after API error: \(LoginItem.describe(after))"
+            )
+            return LoginItemUnregisterResult(
+                exitCode: 1,
+                standardOutput: standardOutput,
+                standardError: [
+                    "unregister failed: domain=\(apiError.domain) code=\(apiError.code); terminal status is \(LoginItem.describe(after))",
+                ]
+            )
         }
-        print("login item status after: \(LoginItem.describe(LoginItem.status))")
-        return 0
+    }
+
+    private static func unregisterLoginItem() -> Int32 {
+        let service = SMAppService.mainApp
+        let result = unregisterLoginItem(
+            status: { LoginItem.state(for: service.status) },
+            unregister: { try service.unregister() }
+        )
+        result.standardOutput.forEach { print($0) }
+        for line in result.standardError {
+            FileHandle.standardError.write(Data("\(line)\n".utf8))
+        }
+        return result.exitCode
     }
 
     /// `--cli`: Config.load → IndexCoordinator (no FSEvents) → wait for idle → search twice → print.
@@ -103,7 +192,7 @@ enum CLI {
         print(String(format: "crawl: %.2f s (total %.2f s)", waited, Date().timeIntervalSince(t0)))
         print("items: \(status.itemCount)  apps: \(status.appCount)  dirs: \(store.dirs.count)  generation: \(store.generation)")
         print("arena bytes: folded=\(store.foldedArena.count) display=\(store.displayArena.count) dirs=\(store.dirArena.count)")
-        print("denied: \(status.deniedPaths.count)  cappedDirs: \(status.cappedDirs.count)  hitItemCap: \(status.hitItemCap)  phase: \(phaseName(status.phase))")
+        print("denied: \(status.deniedPaths.count)  unsafeSkipped: \(status.unsafeEntriesSkipped)  cappedDirs: \(status.cappedDirs.count)  hitItemCap: \(status.hitItemCap)  phase: \(phaseName(status.phase))")
         if let rss = ProcessMemory.residentBytes() { print(String(format: "rss: %.1f MB", Double(rss) / 1_048_576)) }
         return 0
     }
@@ -147,23 +236,31 @@ enum CLI {
     }
 
     /// Remembers whether the coordinator has been busy and then gone idle (or failed).
-    private final class StatusTracker {
-        private(set) var sawBusy = false
-        private(set) var isReady = false
+    /// Callback and polling paths run on different executors. The lock is the complete
+    /// synchronization invariant for the readiness state.
+    final class StatusTracker: @unchecked Sendable {
+        private let lock = NSLock()
+        private var sawBusy = false
+        private var ready = false
         private var idleSince: Date?
+
+        var isReady: Bool { lock.withLock { ready } }
+
         func observe(_ s: IndexStatus) {
-            switch s.phase {
-            case .idle:
-                if sawBusy { isReady = true; return }
-                // Never saw a busy phase: treat a populated store that stays idle for 2 s as ready.
-                if s.itemCount > 0 {
-                    if let t = idleSince { if Date().timeIntervalSince(t) > 2 { isReady = true } } else { idleSince = Date() }
+            lock.withLock {
+                switch s.phase {
+                case .idle:
+                    if sawBusy { ready = true; return }
+                    // Never saw a busy phase: treat a populated store that stays idle for 2 s as ready.
+                    if s.itemCount > 0 {
+                        if let t = idleSince { if Date().timeIntervalSince(t) > 2 { ready = true } } else { idleSince = Date() }
+                    }
+                case .failed:
+                    ready = true
+                default:
+                    sawBusy = true
+                    idleSince = nil
                 }
-            case .failed:
-                isReady = true
-            default:
-                sawBusy = true
-                idleSince = nil
             }
         }
     }
@@ -189,7 +286,7 @@ enum CLI {
     }
 
     /// Run an async body on the main run loop and exit with its status.
-    private static func runAsync(_ body: @escaping () async -> Int32) -> Never {
+    private static func runAsync(_ body: @escaping @Sendable () async -> Int32) -> Never {
         Task { @MainActor in
             let code = await body()
             exit(code)

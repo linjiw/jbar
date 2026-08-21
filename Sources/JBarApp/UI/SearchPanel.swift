@@ -2,6 +2,63 @@ import AppKit
 import Carbon.HIToolbox
 import JBarCore
 
+/// One immutable answer to every question derived from `visibleRows`: how many complete rows the
+/// current screen can hold, how many the panel should expose, whether content overflows, how far a
+/// page key moves, and the resulting window height. Keeping these values together prevents the table
+/// from believing 20 rows are visible while a short screen has clipped the window to (for example) 11.
+struct PanelLayoutMetrics: Equatable {
+    static let inputRowHeight: CGFloat = 60
+    static let rowHeight: CGFloat = 48
+    static let bottomPadding: CGFloat = 8
+    static let peekHeight: CGFloat = 16
+    static let configuredRowsRange = SafetyLimits.visibleRows
+
+    let configuredVisibleRows: Int
+    let screenCapacity: Int
+    let effectiveVisibleRows: Int
+    let pageStride: Int
+    let visibleRowCount: Int
+    let hasOverflow: Bool
+    let showsPeek: Bool
+    let panelHeight: CGFloat
+
+    /// `maximumPanelHeight == nil` means there is no screen constraint (useful for pure sizing and
+    /// tests). Capacity always reserves the peek sliver so it remains stable as result counts change.
+    init(configuredVisibleRows requestedRows: Int, rowCount requestedRowCount: Int,
+         maximumPanelHeight: CGFloat? = nil) {
+        let configured = min(max(requestedRows, Self.configuredRowsRange.lowerBound),
+                             Self.configuredRowsRange.upperBound)
+        let rowCount = max(0, requestedRowCount)
+        let heightLimit = max(Self.minimumHeight,
+                              maximumPanelHeight ?? Self.height(forVisibleRows: configured, peeking: true))
+        let capacity = max(1, Self.rowsThatFit(in: heightLimit, reservingPeek: true))
+        let effective = min(configured, capacity)
+        let visible = min(rowCount, effective)
+        let overflow = rowCount > effective
+        let canPeek = overflow && heightLimit >= Self.height(forVisibleRows: effective, peeking: true)
+
+        configuredVisibleRows = configured
+        screenCapacity = capacity
+        effectiveVisibleRows = effective
+        pageStride = effective
+        visibleRowCount = visible
+        hasOverflow = overflow
+        showsPeek = canPeek
+        panelHeight = min(heightLimit, Self.height(forVisibleRows: visible, peeking: canPeek))
+    }
+
+    static var minimumHeight: CGFloat { inputRowHeight + bottomPadding }
+
+    static func height(forVisibleRows count: Int, peeking: Bool = false) -> CGFloat {
+        inputRowHeight + rowHeight * CGFloat(max(0, count)) + (peeking ? peekHeight : 0) + bottomPadding
+    }
+
+    static func rowsThatFit(in height: CGFloat, reservingPeek: Bool = false) -> Int {
+        let reserved = inputRowHeight + bottomPadding + (reservingPeek ? peekHeight : 0)
+        return max(0, Int((height - reserved) / rowHeight))
+    }
+}
+
 /// The launcher window (DESIGN.md §7.2–7.5): a borderless, non-activating floating panel with the
 /// query field and the results table. It never activates JBar; it takes key status on its own.
 ///
@@ -24,9 +81,11 @@ final class SearchPanel: NSPanel, NSTextFieldDelegate {
 
         init() {}
         init(config: Config, hotkeyDisplay: String) {
-            maxResults = max(1, config.maxResults)
-            visibleRows = max(1, config.visibleRows)
-            appsFirstCap = max(0, config.appsFirstCap)
+            maxResults = min(max(config.maxResults, SafetyLimits.maxResults.lowerBound),
+                             SafetyLimits.maxResults.upperBound)
+            visibleRows = min(max(config.visibleRows, SafetyLimits.visibleRows.lowerBound),
+                              SafetyLimits.visibleRows.upperBound)
+            appsFirstCap = min(max(0, config.appsFirstCap), maxResults)
             screen = config.screen
             restoreQueryOnReopen = config.restoreQueryOnReopen
             showRecentsOnEmpty = config.showRecentsOnEmpty
@@ -35,12 +94,9 @@ final class SearchPanel: NSPanel, NSTextFieldDelegate {
     }
 
     static let panelWidth: CGFloat = 680
-    static let inputRowHeight: CGFloat = 60
-    static let bottomPadding: CGFloat = 8
-    static let rowHeight = ResultsController.rowHeight
-    /// Height with the default 8 visible rows (60 + 8 × 48 + 8). The live maximum follows
-    /// `visibleRows` and the screen — see `maxPanelHeight(on:)`.
-    static let maxHeight: CGFloat = 452
+    static let inputRowHeight = PanelLayoutMetrics.inputRowHeight
+    static let bottomPadding = PanelLayoutMetrics.bottomPadding
+    static let rowHeight = PanelLayoutMetrics.rowHeight
     /// Delay before a "Loading…" row replaces stale content while a slow (path-mode) query runs.
     static let loadingRowDelay: TimeInterval = 0.3
 
@@ -48,7 +104,6 @@ final class SearchPanel: NSPanel, NSTextFieldDelegate {
     var settings: Settings {
         didSet {
             guard settings != oldValue else { return }
-            results.maxVisible = settings.visibleRows
             if isVisible { applyHeight(); runSearch() }
         }
     }
@@ -72,6 +127,10 @@ final class SearchPanel: NSPanel, NSTextFieldDelegate {
 
     private var topEdge: CGFloat = 0
     private var lastAppliedRequestId: UInt64 = 0
+    /// UI-side epoch, independent of a provider's request ids. Some product policies (notably
+    /// `showRecentsOnEmpty: false`) intentionally do not display the provider's next response, but
+    /// they still supersede an in-flight query and must make its eventual rows ineligible to render.
+    private var searchEpoch: UInt64 = 0
     private var currentMode: QueryMode = .empty
     private var keyMonitor: Any?
     private var loadingWork: DispatchWorkItem?
@@ -85,17 +144,18 @@ final class SearchPanel: NSPanel, NSTextFieldDelegate {
         self.settings = settings
         let rect = NSRect(x: 0, y: 0, width: Self.panelWidth, height: Self.inputRowHeight + Self.bottomPadding)
         super.init(contentRect: rect, styleMask: [.borderless, .nonactivatingPanel, .fullSizeContentView], backing: .buffered, defer: false)
-        // `didSet` does not fire for the assignment above (property observers are skipped during init),
-        // so seed the visible-row cap explicitly.
-        results.maxVisible = settings.visibleRows
         configureWindow()
         buildContent()
         installMonitors()
     }
 
     deinit {
-        if let m = keyMonitor { NSEvent.removeMonitor(m) }
-        observers.forEach { NotificationCenter.default.removeObserver($0) }
+        // The panel and its monitors are main-actor owned. Swift 6.1 requires this explicit
+        // assertion because isolated deinitializers are not enabled there by default.
+        MainActor.assumeIsolated {
+            if let m = keyMonitor { NSEvent.removeMonitor(m) }
+            observers.forEach { NotificationCenter.default.removeObserver($0) }
+        }
     }
 
     override var canBecomeKey: Bool { true }
@@ -143,27 +203,37 @@ final class SearchPanel: NSPanel, NSTextFieldDelegate {
         }
         let nc = NotificationCenter.default
         observers.append(nc.addObserver(forName: NSWindow.didResignKeyNotification, object: self, queue: .main) { [weak self] _ in
-            self?.handleResignKey(modifiers: NSEvent.modifierFlags)
+            // `queue: .main` is the runtime guarantee behind this assertion. Keep the read synchronous:
+            // an IME candidate window can take key status and clear its marked range before a deferred
+            // task runs, which would make a normal input-source transition look like an app crash.
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.handleResignKey(hadMarkedText: self.field.hasMarkedText,
+                                     modifiers: NSEvent.modifierFlags)
+            }
         })
     }
 
     /// Input-source switchers can briefly take key status while Control is held. Defer the decision so a
     /// responder transition back to this panel does not look like a crash, and never tear down active IME
     /// marked text merely because its candidate/input-source UI appeared.
-    private func handleResignKey(modifiers: NSEvent.ModifierFlags) {
+    private func handleResignKey(hadMarkedText: Bool, modifiers: NSEvent.ModifierFlags) {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             if Self.shouldHideAfterResign(isVisible: isVisible, isKeyWindow: isKeyWindow,
-                                          hasMarkedText: field.hasMarkedText, modifiers: modifiers) {
+                                          hadMarkedText: hadMarkedText,
+                                          hasMarkedText: field.hasMarkedText,
+                                          modifiers: modifiers) {
                 hide()
             }
         }
     }
 
-    static func shouldHideAfterResign(isVisible: Bool, isKeyWindow: Bool, hasMarkedText: Bool,
+    static func shouldHideAfterResign(isVisible: Bool, isKeyWindow: Bool, hadMarkedText: Bool,
+                                      hasMarkedText: Bool,
                                       modifiers: NSEvent.ModifierFlags) -> Bool {
         let flags = modifiers.intersection(.deviceIndependentFlagsMask)
-        return isVisible && !isKeyWindow && !hasMarkedText && !flags.contains(.control)
+        return isVisible && !isKeyWindow && !hadMarkedText && !hasMarkedText && !flags.contains(.control)
     }
 
     // MARK: - Show / hide
@@ -195,6 +265,9 @@ final class SearchPanel: NSPanel, NSTextFieldDelegate {
         // Ending/committing composition may synchronously send a text-change notification. Cancel after
         // that transition too so no newly queued search keeps running for a panel that is about to hide.
         loadingWork?.cancel()
+        searchEpoch &+= 1
+        let provider = self.provider
+        Task { _ = await provider.runSearch("", limit: 0, appsFirstCap: 0) }
         orderOut(nil)
         Log.panel.notice("panel hidden")
     }
@@ -209,6 +282,7 @@ final class SearchPanel: NSPanel, NSTextFieldDelegate {
         // text before clearing. This matters when Ctrl+Space changes input source while the panel resigns.
         field.setText("")
         currentMode = .empty
+        pathBadge.text = "PATH"
         pathBadge.isHidden = true
         results.setRows([])
         applyHeight()
@@ -228,13 +302,16 @@ final class SearchPanel: NSPanel, NSTextFieldDelegate {
         }
     }
 
-    /// Tallest the panel may grow with the configured `visibleRows`, never exceeding the screen's
-    /// visible frame (so a large `visibleRows`, or a small display, cannot push it off-screen —
-    /// the extra rows simply scroll instead).
-    private func maxPanelHeight(on screen: NSScreen?) -> CGFloat {
-        let wanted = Self.height(forVisibleRows: results.maxVisible, peeking: true)
-        guard let vf = screen?.visibleFrame else { return wanted }
-        return min(wanted, max(Self.inputRowHeight + Self.bottomPadding, vf.height - 32))
+    /// Height available after a 16pt safety inset at both screen edges. The layout metrics convert
+    /// this into an effective row capacity while reserving space for the overflow peek.
+    private func availablePanelHeight(on screen: NSScreen?) -> CGFloat? {
+        screen.map { max(PanelLayoutMetrics.minimumHeight, $0.visibleFrame.height - 32) }
+    }
+
+    private func layoutMetrics(on screen: NSScreen?, rowCount: Int? = nil) -> PanelLayoutMetrics {
+        PanelLayoutMetrics(configuredVisibleRows: settings.visibleRows,
+                           rowCount: rowCount ?? results.rowCount,
+                           maximumPanelHeight: availablePanelHeight(on: screen))
     }
 
     /// Centre horizontally on the target screen, input-row centre 1/3 down the visible frame.
@@ -242,7 +319,9 @@ final class SearchPanel: NSPanel, NSTextFieldDelegate {
         guard let screen = targetScreen() else { return }
         let vf = screen.visibleFrame
         let width = min(Self.panelWidth, max(320, vf.width - 40))
-        let maxH = maxPanelHeight(on: screen)
+        // Reserve room for a fully populated result list even when the panel is currently empty, so
+        // later search responses can grow it downward without crossing the screen's safe edge.
+        let maxH = layoutMetrics(on: screen, rowCount: Int.max).panelHeight
         var top = (vf.maxY - vf.height / 3 + Self.inputRowHeight / 2).rounded()
         top = min(top, vf.maxY - 8)
         if top - maxH < vf.minY { top = min(vf.maxY - 8, vf.minY + maxH + 8) }
@@ -254,22 +333,23 @@ final class SearchPanel: NSPanel, NSTextFieldDelegate {
     /// Sliver of the next row left showing when more results exist below the fold. Without it the list
     /// looks complete — overlay scrollers are invisible until you already started scrolling — so nobody
     /// discovers that there is anything to scroll to.
-    static let peekHeight: CGFloat = 16
+    static let peekHeight = PanelLayoutMetrics.peekHeight
 
-    /// Height needed for `n` rows, ignoring any cap (callers clamp to `maxPanelHeight(on:)`).
-    /// `peeking` adds the sliver that reveals there are more rows below.
+    /// Height needed for `n` rows, ignoring any cap. `peeking` adds the sliver that reveals there are
+    /// more rows below; `PanelLayoutMetrics` applies the real screen limit.
     static func height(forVisibleRows n: Int, peeking: Bool = false) -> CGFloat {
-        inputRowHeight + rowHeight * CGFloat(max(0, n)) + (peeking ? peekHeight : 0) + bottomPadding
+        PanelLayoutMetrics.height(forVisibleRows: n, peeking: peeking)
     }
 
     /// How many rows actually fit in `height` (used to keep `visibleRows` honest on small screens).
     static func rowsThatFit(in height: CGFloat) -> Int {
-        max(0, Int((height - inputRowHeight - bottomPadding) / rowHeight))
+        PanelLayoutMetrics.rowsThatFit(in: height)
     }
 
     private func applyHeight() {
-        let h = min(Self.height(forVisibleRows: results.visibleRowCount, peeking: results.hasHiddenRows),
-                    maxPanelHeight(on: targetScreen()))
+        let metrics = layoutMetrics(on: targetScreen())
+        results.applyLayout(metrics)
+        let h = metrics.panelHeight
         var f = frame
         if topEdge == 0 { topEdge = f.maxY }
         f.origin.y = topEdge - h
@@ -328,7 +408,14 @@ final class SearchPanel: NSPanel, NSTextFieldDelegate {
         runSearch()
     }
 
+    /// Re-run the current query after state outside the panel changes (for example history clear).
+    func refreshResults() {
+        if isVisible { runSearch() }
+    }
+
     private func runSearch() {
+        searchEpoch &+= 1
+        let epoch = searchEpoch
         let q = field.stringValue
         // `showRecentsOnEmpty: false` means an empty query shows nothing but the hint row.
         if !settings.showRecentsOnEmpty, q.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -336,6 +423,10 @@ final class SearchPanel: NSPanel, NSTextFieldDelegate {
             let hint = indexingNote ?? (showsHintWhenEmpty ? Self.hintText(hotkeyDisplay: settings.hotkeyDisplay) : nil)
             results.setRows(hint.map { [PanelRow.hint($0)] } ?? [])
             applyHeight()
+            // Issue a zero-result empty request solely to advance SearchEngine's cancellation counter.
+            // The UI epoch above is still the authority: this response is never rendered.
+            let provider = self.provider
+            Task { _ = await provider.runSearch(q, limit: 0, appsFirstCap: 0) }
             return
         }
         let limit = settings.maxResults
@@ -344,9 +435,13 @@ final class SearchPanel: NSPanel, NSTextFieldDelegate {
         scheduleLoadingRow()
         Task { @MainActor [weak self] in
             let response = await provider.runSearch(q, limit: limit, appsFirstCap: cap)
-            self?.apply(response)
+            guard let self, self.searchEpoch == epoch else { return }
+            self.apply(response)
         }
     }
+
+    /// Current rows exposed for AppKit integration tests and accessibility diagnostics.
+    var displayedRows: [PanelRow] { results.rows }
 
     private func scheduleLoadingRow() {
         loadingWork?.cancel()
@@ -370,21 +465,50 @@ final class SearchPanel: NSPanel, NSTextFieldDelegate {
         lastAppliedRequestId = r.requestId
         loadingWork?.cancel()
         currentMode = r.mode
-        let inPath: Bool = { if case .path = r.mode { return true }; return false }()
-        pathBadge.isHidden = !inPath
+        let pathStatus = Self.pathBadgeText(for: r)
+        pathBadge.text = pathStatus ?? "PATH"
+        pathBadge.isHidden = pathStatus == nil
+        pathBadge.setAccessibilityLabel(Self.pathBadgeAccessibilityLabel(for: r))
         results.setRows(Self.panelRows(for: r,
                                        hint: showsHintWhenEmpty ? Self.hintText(hotkeyDisplay: settings.hotkeyDisplay) : nil,
                                        indexing: indexingNote))
         applyHeight()
-        Log.panel.debug("applied \(r.rows.count) rows for \"\(r.query, privacy: .public)\" in \(Int(r.elapsed * 1000)) ms (id=\(r.requestId))")
+        Log.panel.debug("\(Self.appliedLogSummary(for: r), privacy: .public)")
+    }
+
+    /// Query-independent operational metadata. Queries can contain filenames, client names, or pasted
+    /// secrets, so the raw string is deliberately unavailable to the logging call site.
+    static func appliedLogSummary(for response: SearchResponse) -> String {
+        "applied \(response.rows.count) rows in \(Int(response.elapsed * 1000)) ms (id=\(response.requestId))"
+    }
+
+    /// Compact, always-visible path-mode completeness signal. The result table deliberately keeps
+    /// only a bounded page; showing `kept/total` prevents that page from looking like the whole folder.
+    static func pathBadgeText(for response: SearchResponse) -> String? {
+        guard case .path = response.mode else { return nil }
+        guard response.totalMatchesIsComplete else { return "PATH · ?" }
+        guard response.hasMoreResults == true else { return "PATH" }
+        return "PATH · \(response.rows.count)/\(response.totalMatches)"
+    }
+
+    static func pathBadgeAccessibilityLabel(for response: SearchResponse) -> String? {
+        guard case .path = response.mode else { return nil }
+        guard response.totalMatchesIsComplete else { return "Path mode; result count unavailable" }
+        if response.hasMoreResults == true {
+            return "Path mode; showing \(response.rows.count) of \(response.totalMatches) matches"
+        }
+        return "Path mode; all \(response.totalMatches) matches shown"
     }
 
     /// Map a response to table rows, adding the empty-state or hint row when there are no results.
-    static func panelRows(for r: SearchResponse, hint: String?, indexing: String? = nil) -> [PanelRow] {
+    nonisolated static func panelRows(for r: SearchResponse, hint: String?,
+                                      indexing: String? = nil) -> [PanelRow] {
         if !r.rows.isEmpty { return r.rows.map(PanelRow.result) }
         switch r.mode {
         case .empty:
             return indexing.map { [.hint($0)] } ?? hint.map { [.hint($0)] } ?? []
+        case .path where !r.totalMatchesIsComplete:
+            return [.hint("Folder scan incomplete")]
         case .search, .path, .extensionOnly:
             let q = r.query.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !q.isEmpty else { return [] }
@@ -405,7 +529,9 @@ final class SearchPanel: NSPanel, NSTextFieldDelegate {
 
     private func open(_ row: ResultRow) {
         let q = field.stringValue
-        if launcher.open(row, query: q) { hide() }
+        launcher.open(row, query: q) { [weak self] succeeded in
+            if succeeded { self?.hide() }
+        }
     }
 
     private func openSelected() {
@@ -445,15 +571,13 @@ final class SearchPanel: NSPanel, NSTextFieldDelegate {
         let folder = row.kind == .folder || (!row.isApp && !row.path.hasSuffix(".app") && isDirectory(row.path))
         guard folder || inPathMode else { return nil }
         var target = folder ? row.path + "/" : row.path
-        if !query.hasPrefix("/") { target = abbreviateHome(target, home: home) }
+        if query.utf8.first != 0x2F { target = abbreviateHome(target, home: home) }
         return target
     }
 
     /// `/Users/me/x` → `~/x`.
     static func abbreviateHome(_ path: String, home: String = NSHomeDirectory()) -> String {
-        if path == home { return "~" }
-        if path.hasPrefix(home + "/") { return "~" + path.dropFirst(home.count) }
-        return path
+        SafetyLimits.abbreviatingHome(path, home: home)
     }
 
     // MARK: - Keyboard
@@ -461,15 +585,24 @@ final class SearchPanel: NSPanel, NSTextFieldDelegate {
     /// Local monitor: ⌘-shortcuts that must win over the field editor (⌘1–8, ⌘↩, ⌘C, ⌘,, ⌘Q).
     private func handleKeyDown(_ event: NSEvent) -> NSEvent? {
         guard isVisible, event.window === self else { return event }
-        if Self.shouldCloseForKey(keyCode: event.keyCode, hasMarkedText: field.hasMarkedText,
+        let hasMarkedText = field.hasMarkedText
+        if Self.shouldCloseForKey(keyCode: event.keyCode, hasMarkedText: hasMarkedText,
                                   modifiers: event.modifierFlags) {
             hide()
             return nil
         }
+        guard Self.shouldInterceptCommandShortcut(hasMarkedText: hasMarkedText,
+                                                  modifiers: event.modifierFlags) else { return event }
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
-        guard flags.contains(.command), !flags.contains(.control), !flags.contains(.option) else { return event }
         if Int(event.keyCode) == kVK_Return || Int(event.keyCode) == kVK_ANSI_KeypadEnter {
             revealSelected()
+            return nil
+        }
+        // Key codes identify the physical number row independently of the active keyboard layout.
+        // `charactersIgnoringModifiers` can be "&", "é", etc. for the same keys on non-US layouts.
+        if !flags.contains(.shift), let ordinal = Self.resultOrdinal(forCommandKeyCode: event.keyCode) {
+            guard let row = results.result(atOrdinal: ordinal) else { NSSound.beep(); return nil }
+            open(row)
             return nil
         }
         guard !flags.contains(.shift), let chars = event.charactersIgnoringModifiers?.lowercased(), chars.count == 1 else { return event }
@@ -480,12 +613,32 @@ final class SearchPanel: NSPanel, NSTextFieldDelegate {
             if field.hasTextSelection { return event }
             copySelectedPath()
             return nil
-        case "1", "2", "3", "4", "5", "6", "7", "8":
-            guard let n = Int(chars), let row = results.result(atOrdinal: n - 1) else { NSSound.beep(); return nil }
-            open(row)
-            return nil
         default:
             return event
+        }
+    }
+
+    /// Whether the panel may consume a Command shortcut before the field editor sees it. Marked
+    /// text always wins: candidate selection and input-method bindings commonly use Command keys.
+    static func shouldInterceptCommandShortcut(hasMarkedText: Bool,
+                                               modifiers: NSEvent.ModifierFlags) -> Bool {
+        let flags = modifiers.intersection(.deviceIndependentFlagsMask)
+        return !hasMarkedText && flags.contains(.command) && !flags.contains(.control) && !flags.contains(.option)
+    }
+
+    /// Zero-based result ordinal for the physical ANSI 1…8 keys. This deliberately does not inspect
+    /// characters, so AZERTY and other non-US layouts get the same ⌘1…8 behavior as US keyboards.
+    static func resultOrdinal(forCommandKeyCode keyCode: UInt16) -> Int? {
+        switch Int(keyCode) {
+        case kVK_ANSI_1: return 0
+        case kVK_ANSI_2: return 1
+        case kVK_ANSI_3: return 2
+        case kVK_ANSI_4: return 3
+        case kVK_ANSI_5: return 4
+        case kVK_ANSI_6: return 5
+        case kVK_ANSI_7: return 6
+        case kVK_ANSI_8: return 7
+        default: return nil
         }
     }
 
@@ -500,6 +653,17 @@ final class SearchPanel: NSPanel, NSTextFieldDelegate {
 
     /// Keys reaching the panel when the field editor is not first responder (e.g. after a click on the list).
     override func keyDown(with event: NSEvent) {
+        if field.hasMarkedText {
+            makeFirstResponder(field)
+            // Preserve the text-input context even if a transient responder change delivered the key
+            // to the panel. The IME, not result navigation, owns every key while text is marked.
+            if let editor = field.currentEditor() {
+                editor.interpretKeyEvents([event])
+            } else {
+                super.keyDown(with: event)
+            }
+            return
+        }
         switch Int(event.keyCode) {
         case kVK_Escape:
             if Self.shouldCloseForKey(keyCode: event.keyCode, hasMarkedText: field.hasMarkedText,
@@ -526,14 +690,17 @@ final class SearchPanel: NSPanel, NSTextFieldDelegate {
     }
 
     func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+        // Returning false hands the command back to AppKit/NSTextInputContext. This covers Return,
+        // Tab, arrows, Page Up/Down and Escape as well as input-method-specific command selectors.
+        guard Self.shouldHandleFieldEditorCommand(hasMarkedText: textView.hasMarkedText()) else { return false }
         switch commandSelector {
         case #selector(NSResponder.moveUp(_:)): results.moveSelection(by: -1, wrap: true)
         case #selector(NSResponder.moveDown(_:)): results.moveSelection(by: 1, wrap: true)
         case #selector(NSResponder.insertBacktab(_:)): results.moveSelection(by: -1, wrap: true)
         case #selector(NSResponder.scrollPageUp(_:)), #selector(NSResponder.pageUp(_:)):
-            results.moveSelection(by: -results.maxVisible, wrap: false)
+            results.moveSelectionByPage(-1)
         case #selector(NSResponder.scrollPageDown(_:)), #selector(NSResponder.pageDown(_:)):
-            results.moveSelection(by: results.maxVisible, wrap: false)
+            results.moveSelectionByPage(1)
         case #selector(NSResponder.moveToBeginningOfDocument(_:)): results.selectEdge(first: true)
         case #selector(NSResponder.moveToEndOfDocument(_:)): results.selectEdge(first: false)
         case #selector(NSResponder.insertNewline(_:)): openSelected()
@@ -545,4 +712,7 @@ final class SearchPanel: NSPanel, NSTextFieldDelegate {
         }
         return true
     }
+
+    /// The launcher only owns field-editor commands after composition has committed.
+    static func shouldHandleFieldEditorCommand(hasMarkedText: Bool) -> Bool { !hasMarkedText }
 }

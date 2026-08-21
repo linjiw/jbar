@@ -37,6 +37,12 @@ public final class FSEventsWatcher {
     private let lock = NSLock()
     private var stream: FSEventStreamRef?
 
+    /// Hard ceilings are deliberately below any allocation that could destabilize the process. A
+    /// larger kernel batch is still consumed once for flags/ids, then converted to a full-rescan
+    /// marker without bridging/copying attacker-controlled paths.
+    static let maxRawEventsPerBatch = 4_096
+    static let maxUniquePathsPerBatch = IndexUpdater.fullRecrawlThreshold
+
     /// Heap box handed to FSEvents as the context `info`. Holds the watcher weakly so a late callback after `deinit`
     /// is a no-op; FSEvents releases the box via the context `release` callback when the stream is released.
     private final class Context {
@@ -46,7 +52,13 @@ public final class FSEventsWatcher {
 
     /// `handler` is invoked on `queue`.
     public init(paths: [String], sinceWhen: UInt64 = 0, latency: TimeInterval = 1.0, queue: DispatchQueue, handler: @escaping (FSEventsBatch) -> Void) {
-        self.paths = paths; self.latency = latency; self.latestEventId = sinceWhen
+        // Public embedding callers can bypass Config validation. Bound roots before constructing a
+        // CFArray, and normalize non-finite/negative latency before handing it to the C API.
+        self.paths = Array(paths.prefix(SafetyLimits.maxRootEntries)).filter {
+            SafetyLimits.isSafeAbsolutePath($0)
+        }
+        self.latency = latency.isFinite ? max(0, latency) : 1.0
+        self.latestEventId = sinceWhen
         self.queue = queue
         self.handler = handler
     }
@@ -127,6 +139,15 @@ public final class FSEventsWatcher {
     /// The C callback: unwraps the context box and forwards to the live watcher (if any).
     private static let callback: FSEventStreamCallback = { _, info, numEvents, eventPaths, eventFlags, eventIds in
         guard let info = info, let watcher = Unmanaged<Context>.fromOpaque(info).takeUnretainedValue().watcher else { return }
+        guard numEvents <= FSEventsWatcher.maxRawEventsPerBatch else {
+            // Do not bridge the CFString paths in an oversized batch. One allocation-free pass over
+            // fixed-size metadata preserves the newest replay id and observes reliability flags.
+            let summary = FSEventsWatcher.summarizeOversizedBatch(count: numEvents,
+                                                                   flags: eventFlags, ids: eventIds)
+            watcher.deliverOversized(latestRawEventId: summary.latestEventId,
+                                     observedFullRescanFlag: summary.observedFullRescanFlag)
+            return
+        }
         // UseCFTypes → eventPaths is a CFArray of CFString.
         let array = Unmanaged<CFArray>.fromOpaque(UnsafeRawPointer(eventPaths)).takeUnretainedValue()
         var paths: [String] = []
@@ -142,15 +163,51 @@ public final class FSEventsWatcher {
 
     /// Build and deliver a batch (already on `queue`). Skips delivery if the stream was stopped meanwhile.
     private func deliver(paths: [String], flags: [FSEventStreamEventFlags], ids: [FSEventStreamEventId]) {
-        lock.lock()
-        guard let s = stream else { lock.unlock(); return }
-        let streamLatest = FSEventStreamGetLatestEventId(s)
         let maxId = ids.max() ?? 0
-        let latest = streamLatest != FSEventStreamEventId(kFSEventStreamEventIdSinceNow) ? max(streamLatest, maxId) : max(latestEventId, maxId)
-        latestEventId = latest
-        lock.unlock()
+        guard let latest = updateLatestEventId(rawMaximum: maxId) else { return }
         let (changes, full) = FSEventsWatcher.mapEvents(paths: paths, flags: flags, roots: self.paths)
         handler(FSEventsBatch(changes: changes, needsFullRescan: full, latestEventId: latest))
+    }
+
+    /// Deliver the fail-closed representation of an oversized raw callback. `observedFullRescanFlag`
+    /// is intentionally retained in the common summary contract even though size alone requires a
+    /// full rescan; this proves the metadata pass examined both arrays without retaining either.
+    private func deliverOversized(latestRawEventId: UInt64, observedFullRescanFlag: Bool) {
+        _ = observedFullRescanFlag
+        guard let latest = updateLatestEventId(rawMaximum: latestRawEventId) else { return }
+        handler(FSEventsBatch(changes: [], needsFullRescan: true, latestEventId: latest))
+    }
+
+    private func updateLatestEventId(rawMaximum: UInt64) -> UInt64? {
+        lock.lock()
+        guard let s = stream else { lock.unlock(); return nil }
+        let streamLatest = FSEventStreamGetLatestEventId(s)
+        let latest = streamLatest != FSEventStreamEventId(kFSEventStreamEventIdSinceNow)
+            ? max(streamLatest, rawMaximum) : max(latestEventId, rawMaximum)
+        latestEventId = latest
+        lock.unlock()
+        return latest
+    }
+
+    struct OversizedBatchSummary: Equatable {
+        var latestEventId: UInt64
+        var observedFullRescanFlag: Bool
+    }
+
+    /// Allocation-free single-pass metadata reduction used before any oversized callback paths are
+    /// bridged. Internal visibility is a deterministic test seam for the C callback boundary.
+    static func summarizeOversizedBatch(count: Int,
+                                        flags: UnsafePointer<FSEventStreamEventFlags>,
+                                        ids: UnsafePointer<FSEventStreamEventId>) -> OversizedBatchSummary {
+        var latest: UInt64 = 0
+        var observedFullRescanFlag = false
+        guard count > 0 else { return OversizedBatchSummary(latestEventId: 0, observedFullRescanFlag: false) }
+        for index in 0..<count {
+            latest = max(latest, ids[index])
+            if flags[index] & fullRescanFlags != 0 { observedFullRescanFlag = true }
+        }
+        return OversizedBatchSummary(latestEventId: latest,
+                                     observedFullRescanFlag: observedFullRescanFlag)
     }
 
     // MARK: - Event mapping (pure, testable)
@@ -164,34 +221,63 @@ public final class FSEventsWatcher {
     /// on a root itself re-lists the root (never its parent, which is outside the watched tree). `exists` is injectable
     /// for tests (default: `FileManager.fileExists`), used to decide whether a created/renamed directory should itself be listed.
     static func mapEvents(paths: [String], flags: [FSEventStreamEventFlags], roots: [String] = [],
+                          rawEventLimit: Int = maxRawEventsPerBatch,
+                          uniquePathLimit: Int = maxUniquePathsPerBatch,
                           exists: (String) -> Bool = { FileManager.default.fileExists(atPath: $0) }) -> (changes: [IndexUpdater.Change], needsFullRescan: Bool) {
+        let rawLimit = min(max(0, rawEventLimit), maxRawEventsPerBatch)
+        let uniqueLimit = min(max(0, uniquePathLimit), maxUniquePathsPerBatch)
+        // This guard runs before root-set/dictionary allocation and before any filesystem probe.
+        guard paths.count <= rawLimit else { return ([], true) }
         let rootSet = Set(roots.map(stripTrailingSlash))
         var order: [String] = []
         var recursive: [String: Bool] = [:]
+        var uniquePaths = Set<String>()
+        var existence = [String: Bool]()
         var full = false
-        func add(_ path: String, _ rec: Bool) {
+        func add(_ path: String, _ rec: Bool) -> Bool {
             if let existing = recursive[path] {
                 if rec && !existing { recursive[path] = true }
             } else {
+                guard order.count < uniqueLimit else { return false }
                 order.append(path); recursive[path] = rec
             }
+            return true
         }
         for (i, rawPath) in paths.enumerated() {
             let f = i < flags.count ? flags[i] : 0
             if f & FSEventsWatcher.fullRescanFlags != 0 { full = true }
             if f & FSEventStreamEventFlags(kFSEventStreamEventFlagHistoryDone) != 0 { continue }
+            guard SafetyLimits.utf8Fits(rawPath, maxBytes: SafetyLimits.maxPathUTF8Bytes) else {
+                return ([], true)
+            }
             let path = FSEventsWatcher.stripTrailingSlash(rawPath)
             guard !path.isEmpty else { continue }
+            if uniquePaths.insert(path).inserted, uniquePaths.count > uniqueLimit {
+                return ([], true)
+            }
             if f & FSEventStreamEventFlags(kFSEventStreamEventFlagMustScanSubDirs) != 0 {
-                add(path, true)
+                guard add(path, true) else { return ([], true) }
                 continue
             }
-            add(rootSet.contains(path) ? path : FSEventsWatcher.dirname(path), false)
+            guard add(rootSet.contains(path) ? path : FSEventsWatcher.dirname(path), false) else {
+                return ([], true)
+            }
             let isDir = f & FSEventStreamEventFlags(kFSEventStreamEventFlagItemIsDir) != 0
             let createdOrRenamed = f & FSEventStreamEventFlags(kFSEventStreamEventFlagItemCreated | kFSEventStreamEventFlagItemRenamed) != 0
-            if isDir && createdOrRenamed && exists(path) {
+            let pathExists: Bool
+            if let cached = existence[path] {
+                pathExists = cached
+            } else if isDir && createdOrRenamed {
+                pathExists = exists(path)
+                existence[path] = pathExists
+            } else {
+                pathExists = false
+            }
+            if isDir && createdOrRenamed && pathExists {
                 // A renamed-in directory brings its whole subtree without per-file events → recursive.
-                add(path, f & FSEventStreamEventFlags(kFSEventStreamEventFlagItemRenamed) != 0)
+                guard add(path, f & FSEventStreamEventFlags(kFSEventStreamEventFlagItemRenamed) != 0) else {
+                    return ([], true)
+                }
             }
         }
         let changes = order.map { IndexUpdater.Change(path: $0, mustScanSubDirs: recursive[$0] ?? false) }
@@ -200,15 +286,14 @@ public final class FSEventsWatcher {
 
     /// Parent directory of `path` (`/a/b/c` → `/a/b`, `/a` → `/`, `/` → `/`).
     static func dirname(_ path: String) -> String {
-        guard let slash = path.lastIndex(of: "/") else { return "." }
-        if slash == path.startIndex { return "/" }
-        return String(path[..<slash])
+        let bytes = Array(path.utf8)
+        guard let slash = bytes.lastIndex(of: 0x2F) else { return "." }
+        if slash == 0 { return "/" }
+        return String(decoding: bytes[..<slash], as: UTF8.self)
     }
 
     /// Remove trailing slashes (but keep `/`).
     static func stripTrailingSlash(_ path: String) -> String {
-        var p = path
-        while p.count > 1 && p.hasSuffix("/") { p.removeLast() }
-        return p
+        SafetyLimits.trimmingTrailingPathSlashes(path)
     }
 }

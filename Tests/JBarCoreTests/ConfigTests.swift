@@ -1,4 +1,5 @@
 import XCTest
+import Darwin
 @testable import JBarCore
 
 final class ConfigTests: XCTestCase {
@@ -66,6 +67,159 @@ final class ConfigTests: XCTestCase {
         }
     }
 
+    func testNumericSafetyBoundaries() throws {
+        func decoded(_ fragment: String) throws -> Config {
+            try Config.decode(Data("{\(fragment)}".utf8))
+        }
+        XCTAssertEqual(try decoded(#""maxResults": 1, "visibleRows": 1"#).maxResults, 1)
+        XCTAssertEqual(try decoded(#""maxResults": 1, "visibleRows": 1"#).appsFirstCap, 1,
+                       "an omitted dependent cap follows maxResults")
+        XCTAssertEqual(try decoded(#""maxResults": 500, "visibleRows": 20"#).maxResults, 500)
+        XCTAssertEqual(try decoded(#""visibleRows": 1"#).visibleRows, 1)
+        XCTAssertEqual(try decoded(#""visibleRows": 20"#).visibleRows, 20)
+        XCTAssertEqual(try decoded(#""appsFirstCap": 0"#).appsFirstCap, 0)
+        XCTAssertEqual(try decoded(#""appsFirstCap": 40"#).appsFirstCap, 40)
+        XCTAssertEqual(try decoded(#""maxDepth": 0"#).maxDepth, 0)
+        XCTAssertEqual(try decoded(#""maxDepth": 64"#).maxDepth, 64)
+        XCTAssertEqual(try decoded(#""maxIndexedItems": 1"#).maxIndexedItems, 1)
+        XCTAssertEqual(try decoded(#""maxIndexedItems": 2000000"#).maxIndexedItems, 2_000_000)
+
+        let invalid: [(key: String, fragment: String)] = [
+            ("maxResults", #""maxResults": 0, "visibleRows": 1"#),
+            ("maxResults", #""maxResults": 501, "visibleRows": 8"#),
+            ("maxResults", #""maxResults": 9223372036854775807, "visibleRows": 8"#),
+            ("maxResults", #""maxResults": -9223372036854775808, "visibleRows": 1"#),
+            ("visibleRows", #""visibleRows": 0"#),
+            ("visibleRows", #""visibleRows": 21"#),
+            ("visibleRows", #""maxResults": 1, "visibleRows": 20"#),
+            ("appsFirstCap", #""appsFirstCap": -1"#),
+            ("appsFirstCap", #""maxResults": 10, "visibleRows": 8, "appsFirstCap": 11"#),
+            ("maxDepth", #""maxDepth": -1"#),
+            ("maxDepth", #""maxDepth": 65"#),
+            ("maxIndexedItems", #""maxIndexedItems": 0"#),
+            ("maxIndexedItems", #""maxIndexedItems": 2000001"#),
+        ]
+        for test in invalid {
+            XCTAssertThrowsError(try decoded(test.fragment), test.fragment) { error in
+                let message = Config.describe(error)
+                XCTAssertTrue(message.contains(test.key), "\(test.fragment): \(message)")
+                XCTAssertTrue(message.contains("expected"), "\(test.fragment): \(message)")
+            }
+        }
+    }
+
+    func testLegacyVisibleRowsMigrationIsBounded() throws {
+        let high = try Config.decode(Data(#"{"maxResults":60}"#.utf8))
+        XCTAssertEqual(high.maxResults, 60)
+        XCTAssertEqual(high.visibleRows, SafetyLimits.visibleRows.upperBound)
+
+        XCTAssertThrowsError(try Config.decode(Data(#"{"maxResults":9223372036854775807}"#.utf8))) { error in
+            XCTAssertTrue(Config.describe(error).contains("maxResults"))
+        }
+        XCTAssertThrowsError(try Config.decode(Data(#"{"maxResults":-1}"#.utf8))) { error in
+            XCTAssertTrue(Config.describe(error).contains("maxResults"))
+        }
+    }
+
+    func testStringAndCollectionSafetyBounds() throws {
+        func data(_ object: [String: Any]) throws -> Data {
+            try JSONSerialization.data(withJSONObject: object)
+        }
+        XCTAssertEqual(try Config.decode(data(["hotkey": "not-a-hotkey"])).hotkey, "not-a-hotkey",
+                       "invalid syntax is handled by the existing visible hotkey fallback")
+        XCTAssertEqual(try Config.decode(data(["screen": "sideways"])).screen, "sideways",
+                       "unknown screens retain the established mouse-screen fallback")
+        XCTAssertThrowsError(try Config.decode(data(["hotkey": String(repeating: "x", count: SafetyLimits.maxHotkeyUTF8Bytes + 1)]))) { error in
+            XCTAssertTrue(Config.describe(error).contains("hotkey"))
+        }
+        XCTAssertThrowsError(try Config.decode(data(["screen": String(repeating: "x", count: SafetyLimits.maxSettingUTF8Bytes + 1)]))) { error in
+            XCTAssertTrue(Config.describe(error).contains("screen"))
+        }
+        XCTAssertThrowsError(try Config.decode(data(["fileRoots": Array(repeating: "~", count: SafetyLimits.maxRootEntries + 1)]))) { error in
+            XCTAssertTrue(Config.describe(error).contains("fileRoots"))
+        }
+        XCTAssertThrowsError(try Config.decode(data(["excludePaths": Array(repeating: "~/x", count: SafetyLimits.maxExcludedPathEntries + 1)]))) { error in
+            XCTAssertTrue(Config.describe(error).contains("excludePaths"))
+        }
+        XCTAssertThrowsError(try Config.decode(data(["excludeNames": Array(repeating: "x", count: SafetyLimits.maxNameEntries + 1)]))) { error in
+            XCTAssertTrue(Config.describe(error).contains("excludeNames"))
+        }
+        let longPath = "/" + String(repeating: "a", count: SafetyLimits.maxPathUTF8Bytes)
+        XCTAssertThrowsError(try Config.decode(data(["appDirectories": [longPath]]))) { error in
+            XCTAssertTrue(Config.describe(error).contains("appDirectories[0]"))
+        }
+        let longName = String(repeating: "a", count: SafetyLimits.maxNameUTF8Bytes + 1)
+        XCTAssertThrowsError(try Config.decode(data(["downrankNames": [longName]]))) { error in
+            XCTAssertTrue(Config.describe(error).contains("downrankNames[0]"))
+        }
+        for (key, object) in [
+            ("fileRoots", ["fileRoots": ["relative/path"]]),
+            ("appDirectories", ["appDirectories": ["~someone/Applications"]]),
+            ("excludePaths", ["excludePaths": ["/safe\0truncated"]]),
+            ("excludePaths", ["excludePaths": ["/safe\0\u{301}truncated"]]),
+            ("fileRoots", ["fileRoots": ["/safe/\u{301}/../escape"]]),
+            ("fileRoots", ["fileRoots": ["~/\u{301}/../escape"]]),
+            ("excludeNames", ["excludeNames": ["bad\0name"]]),
+        ] as [(String, [String: Any])] {
+            XCTAssertThrowsError(try Config.decode(data(object))) { error in
+                XCTAssertTrue(Config.describe(error).contains(key), "\(key): \(error)")
+            }
+        }
+        XCTAssertEqual(try Config.decode(data(["fileRoots": ["~/\u{301}目录"]])).fileRoots,
+                       ["~/\u{301}目录"],
+                       "valid POSIX tilde paths must not depend on Swift grapheme segmentation")
+    }
+
+    func testDirectSaveRejectsInvalidConfig() throws {
+        var c = Config.default
+        c.maxResults = Int.max
+        XCTAssertThrowsError(try c.jsonData())
+        XCTAssertThrowsError(try c.save(to: url()))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url().path))
+    }
+
+    func testEncodedConfigCannotExceedItsOwnLoaderLimitOrReplaceLastGoodFile() throws {
+        var config = Config.default
+        config.excludeNames = (0..<1_100).map { index in
+            String(repeating: "a", count: 1_020) + String(format: "%04d", index)
+        }
+        let destination = url()
+        let existing = Data(#"{"visibleRows":7}"#.utf8)
+        try existing.write(to: destination)
+
+        XCTAssertThrowsError(try config.jsonData()) { error in
+            guard let validation = error as? Config.ValidationError else {
+                return XCTFail("unexpected error: \(error)")
+            }
+            XCTAssertEqual(validation.key, "configFile")
+        }
+        XCTAssertThrowsError(try config.save(to: destination))
+        XCTAssertEqual(try Data(contentsOf: destination), existing,
+                       "a rejected oversized encoding must not replace the last-good file")
+    }
+
+    func testAggregateEscapedConfigIsRejectedBeforeAnyEncoderCanMaterializeIt() {
+        var config = Config.default
+        let controlHeavy = String(repeating: "\u{0001}", count: SafetyLimits.maxNameUTF8Bytes)
+        config.excludeNames = [String](repeating: controlHeavy, count: 200)
+        XCTAssertThrowsError(try config.validate()) { error in
+            XCTAssertEqual((error as? Config.ValidationError)?.key, "configFile")
+        }
+        XCTAssertThrowsError(try JSONEncoder().encode(config),
+                             "the public Encodable entry must enforce the same preflight")
+    }
+
+    func testAggregatePreflightDoesNotRejectOrdinaryASCIIWellBelowTheFileLimit() throws {
+        var config = Config.default
+        config.excludeNames = (0..<200).map { index in
+            String(format: "%04d-", index) + String(repeating: "a", count: 995)
+        }
+        try config.validate()
+        let data = try config.jsonData()
+        XCTAssertLessThan(data.count, SafetyLimits.maxConfigFileBytes)
+        XCTAssertGreaterThan(data.count, 190_000)
+    }
+
     func testAllFieldsRoundTrip() throws {
         var c = Config()
         c.hotkey = "ctrl+option+space"; c.launchAtLogin = false; c.maxResults = 10; c.appsFirstCap = 3; c.screen = "main"
@@ -87,6 +241,40 @@ final class ConfigTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: u.path), "defaults written, parent dirs created")
         // Second load reads the file back.
         XCTAssertEqual(Config.load(from: u), .loaded(.default))
+    }
+
+    func testReadOnlyLoadMissingDoesNotCreateAnything() {
+        let u = url("diagnostic-only/config.json")
+
+        XCTAssertEqual(Config.loadReadOnly(from: u), .missing)
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: u.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: u.deletingLastPathComponent().path),
+                       "read-only loading must not even create the parent directory")
+    }
+
+    func testReadOnlyLoadUsesNormalValidationWithoutMutatingFile() throws {
+        let u = url()
+        let original = Data(#"{"maxResults": 17, "visibleRows": 6}"#.utf8)
+        try original.write(to: u)
+
+        XCTAssertEqual(Config.loadReadOnly(from: u), .loaded({
+            var config = Config.default
+            config.maxResults = 17
+            config.visibleRows = 6
+            return config
+        }()))
+        XCTAssertEqual(try Data(contentsOf: u), original)
+    }
+
+    func testReadOnlyLoadRejectsFIFOWithoutBlocking() throws {
+        let u = url("config.fifo")
+        XCTAssertEqual(mkfifo(u.path, 0o600), 0)
+
+        guard case .invalid(let message) = Config.loadReadOnly(from: u) else {
+            return XCTFail("expected a FIFO to be rejected")
+        }
+        XCTAssertTrue(message.contains("regular file"), message)
     }
 
     func testLoadValidFile() throws {
@@ -113,6 +301,14 @@ final class ConfigTests: XCTestCase {
         try Data(#"{"fileRoots": "~"}"#.utf8).write(to: u)
         guard case .invalid(let message) = Config.load(from: u) else { return XCTFail("expected .invalid") }
         XCTAssertTrue(message.contains("fileRoots"), message)
+    }
+
+    func testLoadRejectsOversizedFileBeforeReading() throws {
+        let u = url()
+        try Data(repeating: 0x20, count: SafetyLimits.maxConfigFileBytes + 1).write(to: u)
+        guard case .invalid(let message) = Config.load(from: u) else { return XCTFail("expected .invalid") }
+        XCTAssertTrue(message.contains("too large"), message)
+        XCTAssertTrue(message.contains(String(SafetyLimits.maxConfigFileBytes)), message)
     }
 
     func testLoadUnreadableFileIsInvalid() throws {
@@ -196,6 +392,7 @@ final class ConfigTests: XCTestCase {
         XCTAssertEqual(Config.expandTilde("/", home: "/h"), "/")
         XCTAssertEqual(Config.expandTilde("~user/x", home: "/h"), "~user/x", "other users' homes are left alone")
         XCTAssertEqual(Config.expandTilde("rel/~/x", home: "/h"), "rel/~/x")
+        XCTAssertEqual(Config.expandTilde("~/\u{301}目录", home: "/h"), "/h/\u{301}目录")
     }
 
     func testCoordinatorOptions() {
@@ -287,18 +484,38 @@ final class ConfigTests: XCTestCase {
     // MARK: - ConfigWatcher
 
     /// Helper: a watcher on `u` that records changes/errors on a serial queue.
-    private final class Recorder {
+    /// All mutable fields are confined to `queue`; the unchecked conformance exists solely so the
+    /// watcher's `@Sendable` callbacks can capture this queue-isolated test probe.
+    private final class Recorder: @unchecked Sendable {
         let queue = DispatchQueue(label: "test.recorder")
-        var changes: [Config] = []
-        var errors: [String] = []
-        var onChangeExpectation: XCTestExpectation?
-        var onErrorExpectation: XCTestExpectation?
+        private(set) var changes: [Config] = []
+        private(set) var errors: [String] = []
+        private var onChangeExpectation: XCTestExpectation?
+        private var onErrorExpectation: XCTestExpectation?
+
+        func setChangeExpectation(_ expectation: XCTestExpectation?) {
+            queue.sync { onChangeExpectation = expectation }
+        }
+
+        func setErrorExpectation(_ expectation: XCTestExpectation?) {
+            queue.sync { onErrorExpectation = expectation }
+        }
+
+        func record(change: Config) {
+            changes.append(change)
+            onChangeExpectation?.fulfill()
+        }
+
+        func record(error: String) {
+            errors.append(error)
+            onErrorExpectation?.fulfill()
+        }
     }
 
     private func makeWatcher(_ u: URL, _ rec: Recorder) -> ConfigWatcher {
         ConfigWatcher(url: u, queue: rec.queue,
-                      onChange: { c in rec.changes.append(c); rec.onChangeExpectation?.fulfill() },
-                      onError: { m in rec.errors.append(m); rec.onErrorExpectation?.fulfill() })
+                      onChange: { rec.record(change: $0) },
+                      onError: { rec.record(error: $0) })
     }
 
     /// Write with a temp file + rename (what editors do).
@@ -317,7 +534,7 @@ final class ConfigTests: XCTestCase {
         w.start() // idempotent
         defer { w.stop() }
         let exp = expectation(description: "onChange")
-        rec.onChangeExpectation = exp
+        rec.setChangeExpectation(exp)
         // In-place write (no rename): truncate + write via FileHandle.
         Thread.sleep(forTimeInterval: 0.1)
         let fh = try FileHandle(forWritingTo: u)
@@ -341,21 +558,21 @@ final class ConfigTests: XCTestCase {
         Thread.sleep(forTimeInterval: 0.1)
 
         let exp1 = expectation(description: "first replace")
-        rec.onChangeExpectation = exp1
+        rec.setChangeExpectation(exp1)
         try atomicReplace(u, #"{"hotkey": "cmd+space"}"#)
         wait(for: [exp1], timeout: 3)
         rec.queue.sync { XCTAssertEqual(rec.changes.last?.hotkey, "cmd+space") }
 
         // The file source was re-armed on the new inode: a second replace must also be seen.
         let exp2 = expectation(description: "second replace")
-        rec.onChangeExpectation = exp2
+        rec.setChangeExpectation(exp2)
         try atomicReplace(u, #"{"hotkey": "ctrl+space"}"#)
         wait(for: [exp2], timeout: 3)
         rec.queue.sync { XCTAssertEqual(rec.changes.last?.hotkey, "ctrl+space") }
 
         // And a plain in-place write after the replace is seen too.
         let exp3 = expectation(description: "in-place after replace")
-        rec.onChangeExpectation = exp3
+        rec.setChangeExpectation(exp3)
         let fh = try FileHandle(forWritingTo: u)
         try fh.truncate(atOffset: 0)
         try fh.write(contentsOf: Data(#"{"hotkey": "option+k"}"#.utf8))
@@ -373,7 +590,7 @@ final class ConfigTests: XCTestCase {
         defer { w.stop() }
         Thread.sleep(forTimeInterval: 0.1)
         let exp = expectation(description: "onError")
-        rec.onErrorExpectation = exp
+        rec.setErrorExpectation(exp)
         try atomicReplace(u, "{ definitely not json")
         wait(for: [exp], timeout: 3)
         rec.queue.sync {
@@ -382,10 +599,35 @@ final class ConfigTests: XCTestCase {
         }
         // Fixing the file fires onChange again (so the app can clear its warning).
         let exp2 = expectation(description: "fixed")
-        rec.onChangeExpectation = exp2
+        rec.setChangeExpectation(exp2)
         try atomicReplace(u, #"{"visibleRows": 5}"#)
         wait(for: [exp2], timeout: 3)
         rec.queue.sync { XCTAssertEqual(rec.changes.last?.visibleRows, 5) }
+    }
+
+    func testWatcherRejectsUnsafeValueAndKeepsLastGood() throws {
+        let u = url()
+        try Config.default.save(to: u)
+        let rec = Recorder()
+        let w = makeWatcher(u, rec)
+        w.start()
+        defer { w.stop() }
+        Thread.sleep(forTimeInterval: 0.1)
+
+        let rejected = expectation(description: "unsafe config rejected")
+        rec.setErrorExpectation(rejected)
+        try atomicReplace(u, #"{"maxResults":9223372036854775807,"visibleRows":8}"#)
+        wait(for: [rejected], timeout: 3)
+        rec.queue.sync {
+            XCTAssertTrue(rec.changes.isEmpty, "an invalid reload must not replace the caller's last-good config")
+            XCTAssertTrue(rec.errors.last?.contains("maxResults") == true, "\(rec.errors)")
+        }
+
+        let accepted = expectation(description: "valid config accepted afterward")
+        rec.setChangeExpectation(accepted)
+        try atomicReplace(u, #"{"maxResults":50,"visibleRows":10}"#)
+        wait(for: [accepted], timeout: 3)
+        rec.queue.sync { XCTAssertEqual(rec.changes.last?.maxResults, 50) }
     }
 
     func testWatcherDebouncesBurst() throws {
@@ -398,7 +640,7 @@ final class ConfigTests: XCTestCase {
         Thread.sleep(forTimeInterval: 0.1)
         let exp = expectation(description: "onChange")
         exp.assertForOverFulfill = false
-        rec.onChangeExpectation = exp
+        rec.setChangeExpectation(exp)
         for i in 1...5 {
             try atomicReplace(u, #"{"visibleRows": \#(i)}"#)
             Thread.sleep(forTimeInterval: 0.02)
@@ -421,7 +663,7 @@ final class ConfigTests: XCTestCase {
         Thread.sleep(forTimeInterval: 0.1)
         let exp = expectation(description: "onChange after delete")
         exp.assertForOverFulfill = false
-        rec.onChangeExpectation = exp
+        rec.setChangeExpectation(exp)
         try FileManager.default.removeItem(at: u)
         wait(for: [exp], timeout: 3)
         XCTAssertTrue(FileManager.default.fileExists(atPath: u.path), "defaults re-created")
@@ -438,14 +680,14 @@ final class ConfigTests: XCTestCase {
         Thread.sleep(forTimeInterval: 0.1)
         let exp = expectation(description: "defaults re-created after rm -rf")
         exp.assertForOverFulfill = false
-        rec.onChangeExpectation = exp
+        rec.setChangeExpectation(exp)
         try FileManager.default.removeItem(at: u.deletingLastPathComponent())
         wait(for: [exp], timeout: 3)
         XCTAssertTrue(FileManager.default.fileExists(atPath: u.path))
         Thread.sleep(forTimeInterval: 0.5)
         // The directory and file sources were re-armed on the new inodes: a later edit is still seen.
         let exp2 = expectation(description: "edit after re-creation")
-        rec.onChangeExpectation = exp2
+        rec.setChangeExpectation(exp2)
         try atomicReplace(u, #"{"visibleRows": 7}"#)
         wait(for: [exp2], timeout: 3)
         rec.queue.sync { XCTAssertEqual(rec.changes.last?.visibleRows, 7) }
@@ -466,12 +708,43 @@ final class ConfigTests: XCTestCase {
         // Restart works.
         w.start()
         let exp = expectation(description: "after restart")
-        rec.onChangeExpectation = exp
+        rec.setChangeExpectation(exp)
         Thread.sleep(forTimeInterval: 0.1)
         try atomicReplace(u, #"{"visibleRows": 4}"#)
         wait(for: [exp], timeout: 3)
         w.stop()
         rec.queue.sync { XCTAssertEqual(rec.changes.last?.visibleRows, 4) }
+    }
+
+    func testWatcherConcurrentLifecycleStressLeavesNoStaleCallbacks() throws {
+        let u = url()
+        try Config.default.save(to: u)
+        let rec = Recorder()
+        let w = makeWatcher(u, rec)
+
+        // Exercise the public thread-safety contract and descriptor cancellation from many callers.
+        DispatchQueue.concurrentPerform(iterations: 128) { i in
+            if i.isMultiple(of: 2) { w.start() } else { w.stop() }
+        }
+        // Establish a final linearization point after all concurrent operations complete.
+        w.stop()
+        let callbacksAtStop = rec.queue.sync { rec.changes.count + rec.errors.count }
+
+        try atomicReplace(u, #"{"visibleRows": 6}"#)
+        Thread.sleep(forTimeInterval: 0.7)
+        let callbacksAfterEdit = rec.queue.sync { rec.changes.count + rec.errors.count }
+        XCTAssertEqual(callbacksAfterEdit, callbacksAtStop,
+                       "a stopped lifecycle generation must not deliver queued or new events")
+
+        // The heavily exercised watcher can still be restarted and observe a fresh generation.
+        let restarted = expectation(description: "reload after lifecycle stress")
+        rec.setChangeExpectation(restarted)
+        w.start()
+        Thread.sleep(forTimeInterval: 0.1)
+        try atomicReplace(u, #"{"visibleRows": 9}"#)
+        wait(for: [restarted], timeout: 3)
+        w.stop()
+        rec.queue.sync { XCTAssertEqual(rec.changes.last?.visibleRows, 9) }
     }
 
     func testWatcherCreatesMissingDirectory() throws {
@@ -482,9 +755,9 @@ final class ConfigTests: XCTestCase {
         defer { w.stop() }
         XCTAssertTrue(FileManager.default.fileExists(atPath: u.deletingLastPathComponent().path))
         let exp = expectation(description: "first save seen")
-        rec.onChangeExpectation = exp
+        rec.setChangeExpectation(exp)
         Thread.sleep(forTimeInterval: 0.1)
-        var c = Config(); c.maxResults = 6
+        var c = Config(); c.maxResults = 6; c.visibleRows = 6
         try c.save(to: u)
         wait(for: [exp], timeout: 3)
         rec.queue.sync { XCTAssertEqual(rec.changes.last?.maxResults, 6) }
@@ -495,7 +768,7 @@ final class ConfigTests: XCTestCase {
         let rec = Recorder()
         let w = makeWatcher(u, rec)
         let exp = expectation(description: "onError")
-        rec.onErrorExpectation = exp
+        rec.setErrorExpectation(exp)
         w.start()
         wait(for: [exp], timeout: 3)
         rec.queue.sync { XCTAssertTrue(rec.errors.first?.contains("Cannot watch") ?? false) }

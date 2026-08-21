@@ -328,6 +328,21 @@ final class ScorerTests: XCTestCase {
         s.ensure(300); XCTAssertEqual(s.h.count, 300); XCTAssertEqual(s.c.count, 300)
     }
 
+    func testScratchAndScoreClampExtremePublicCapacities() {
+        let negative = ScorerScratch(capacity: Int.min)
+        XCTAssertEqual(negative.h.count, 0)
+        XCTAssertEqual(negative.c.count, 0)
+        negative.ensure(Int.max)
+        XCTAssertEqual(negative.h.count, Scorer.maxTextBytes)
+        XCTAssertEqual(negative.c.count, Scorer.maxTextBytes)
+
+        let oversizedText = [UInt8](repeating: 0x61, count: Scorer.maxTextBytes + 1)
+        XCTAssertNil(Scorer.score(query: [0x61], text: oversizedText,
+                                  bonus: oversizedText, scratch: negative))
+        XCTAssertEqual(Scorer.matchPositions(query: [0x61][...], text: oversizedText[...],
+                                             bonus: oversizedText[...]), [])
+    }
+
     func testScoreBest() {
         let strings = [TextAnalyzer.analyze("WeChat"), TextAnalyzer.analyze("微信"), TextAnalyzer.analyze("weixin"), TextAnalyzer.analyze("wx")]
         // "wx" matches the initials alias exactly (48 + 32 = 80) and "weixin" loosely; best is the alias.

@@ -50,6 +50,26 @@ final class ExclusionsTests: XCTestCase {
         // A home with a trailing slash is normalised before substitution.
         XCTAssertEqual(Exclusions.expandTilde("~", home: "/home/u/"), "/home/u")
         XCTAssertEqual(Exclusions.expandTilde("~/x", home: "/home/u/"), "/home/u/x")
+        XCTAssertEqual(Exclusions.expandTilde("~/\u{301}目录", home: home), "/home/u/\u{301}目录",
+                       "POSIX tilde/slash parsing must not depend on Swift grapheme clustering")
+    }
+
+    func testBytePathContainmentHandlesCombiningLeadingComponent() {
+        let candidate = "/home/u/\u{301}目录/file"
+        XCTAssertTrue(SafetyLimits.isPath(candidate, within: "/home/u"))
+        XCTAssertEqual(SafetyLimits.relativePath(candidate, within: "/home/u"), "\u{301}目录/file")
+        XCTAssertTrue(SafetyLimits.isPath(candidate, within: "/"))
+        XCTAssertFalse(SafetyLimits.isPath("/home/user", within: "/home/u"),
+                       "a byte prefix without a path-separator boundary is not containment")
+
+        let nfcRoot = "/home/Café/한글"
+        let nfdCandidate = "/home/Cafe\u{301}/한글/\u{301}文件"
+        XCTAssertTrue(SafetyLimits.isPath(nfdCandidate, within: nfcRoot),
+                      "APFS-preserved NFC/NFD spellings are canonically equivalent")
+        XCTAssertEqual(SafetyLimits.relativePath(nfdCandidate, within: nfcRoot), "\u{301}文件")
+        XCTAssertEqual(SafetyLimits.abbreviatingHome("/home/u/docs/", home: "/home/u"), "~/docs/")
+        XCTAssertEqual(SafetyLimits.abbreviatingHome("/home/Cafe\u{301}/文件/", home: "/home/Café"),
+                       "~/文件/")
     }
 
     // MARK: - Name checks (case-insensitive)
@@ -100,6 +120,11 @@ final class ExclusionsTests: XCTestCase {
         XCTAssertTrue(e.isExcludedPath("/home/u/Pictures/library.photoslibrary"))
         XCTAssertFalse(e.isExcludedPath("/home/u/Pictures/My Photos.library"))   // wrong extension
         XCTAssertFalse(e.isExcludedPath("/home/u/Documents/x.photoslibrary"))    // wrong parent
+
+        let decorated = ExcludedPathMatcher(patterns: ["/home/u/Parent/foo*\u{0301}"])
+        XCTAssertTrue(decorated.matches("/home/u/Parent/foo-anything\u{0301}"),
+                      "a POSIX '*' byte remains a glob when followed by a combining scalar")
+        XCTAssertFalse(decorated.matches("/home/u/Other/foo-anything\u{0301}"))
     }
 
     func testExcludedPathMatcherHelpers() {

@@ -3,18 +3,18 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>JBar — a launcher that finds your files in 1.5 ms</title>
-<meta name="description" content="A keyboard-first macOS launcher for apps and files. Owns its own index: ~1.5 ms warm search, about 360× faster than Spotlight. Swift/AppKit, zero dependencies, MIT.">
+<title>JBar — a local filename launcher for macOS</title>
+<meta name="description" content="A keyboard-first Swift/AppKit launcher for macOS apps and filenames, with a bounded local index and explicit release evidence.">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>">
-<meta property="og:title" content="JBar — a launcher that finds your files in 1.5 ms">
-<meta property="og:description" content="Keyboard-first macOS launcher for apps and files. ~360× faster than Spotlight, because it owns its own index.">
+<meta property="og:title" content="JBar — a local filename launcher for macOS">
+<meta property="og:description" content="Keyboard-first macOS app and filename search with a bounded local index. Development preview; release validation is explicit.">
 <meta property="og:type" content="website">
 <meta property="og:url" content="https://linjiw.github.io/jbar/">
 <meta property="og:image" content="https://linjiw.github.io/jbar/images/jbar-panel.png">
 <meta name="twitter:card" content="summary_large_image">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@600;700;800&family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@600;700;800&amp;family=IBM+Plex+Mono:wght@400;500;600&amp;family=IBM+Plex+Sans:wght@400;500;600&amp;display=swap">
 <style>
   :root{
     --bg:#eef1f6; --panel:#fff; --panel-2:#f6f8fb; --line:#dde3ec;
@@ -104,26 +104,7 @@
 
   .card{background:var(--panel);border:1px solid var(--line);border-radius:16px;box-shadow:var(--shadow);
     padding:clamp(18px,3vw,26px)}
-  .legend{display:flex;gap:18px;font-family:var(--mono);font-size:12px;color:var(--muted);
-    margin-bottom:16px;flex-wrap:wrap;align-items:center}
-  .swatch{display:inline-flex;align-items:center;gap:7px}
-  .swatch i{width:12px;height:12px;border-radius:3px;display:inline-block}
-  .axis{position:relative;height:15px;margin-left:96px;border-bottom:1px solid var(--line)}
-  .axis .t{position:absolute;top:0;transform:translateX(-50%);font-family:var(--mono);font-size:10.5px;color:var(--faint);white-space:nowrap}
-  .row{display:grid;grid-template-columns:96px 1fr;align-items:center;padding:9px 0;border-bottom:1px dashed var(--line)}
-  .row:last-child{border-bottom:0}
-  .row .q{font-family:var(--mono);font-size:13px;font-weight:500}
-  .row .q small{color:var(--faint);font-weight:400;font-size:10.5px;display:block;margin-top:1px}
-  .track{position:relative;height:34px}
-  .bar{position:absolute;height:13px;border-radius:0 4px 4px 0;left:0;width:0;
-    transition:width .9s cubic-bezier(.2,.7,.2,1)}
-  .bar.j{top:2px;background:var(--jbar)}
-  .bar.s{top:19px;background:var(--spot)}
-  .bar.slow{background:linear-gradient(90deg,var(--spot),var(--amber))}
-  .bar .v{position:absolute;left:calc(100% + 7px);top:50%;transform:translateY(-50%);
-    font-family:var(--mono);font-size:11px;white-space:nowrap;color:var(--muted)}
-  .bar.j .v{color:var(--jbar);font-weight:600}
-  .chart-note{font-family:var(--mono);font-size:12px;color:var(--faint);margin-top:14px;line-height:1.6}
+  .evidence-note{font-family:var(--mono);font-size:12px;color:var(--faint);margin-top:14px;line-height:1.6}
 
   .tbl-wrap{overflow-x:auto}
   table{width:100%;border-collapse:collapse;font-size:14.5px}
@@ -152,7 +133,6 @@
   footer{margin-top:clamp(56px,8vw,96px);padding:26px 0 60px;border-top:1px solid var(--line);
     font-family:var(--mono);font-size:12.5px;color:var(--faint);display:flex;flex-wrap:wrap;gap:8px 20px;
     justify-content:space-between}
-  @media (prefers-reduced-motion:reduce){.bar{transition:none}}
 </style>
 </head>
 <body>
@@ -164,6 +144,7 @@
     <a href="#install">Install</a>
     <a href="#why">Why</a>
     <a href="#how">How it works</a>
+    <a href="https://github.com/linjiw/jbar/blob/main/docs/PRIVACY.md">Privacy</a>
     <a href="https://github.com/linjiw/jbar">GitHub</a>
   </div>
 </div></nav>
@@ -172,13 +153,13 @@
 
 <header>
   <div class="eyebrow">macOS launcher · Swift + AppKit · MIT</div>
-  <h1>Your files, found in <span class="em">1.5 ms</span>.</h1>
-  <p class="lede">JBar is a keyboard-first launcher for macOS apps and files. It builds and searches
-    its <strong>own index</strong>, so it stays instant and complete even when Spotlight's index is
-    mid-rebuild — measured at about <strong>360× faster</strong> than Spotlight on the same machine
-    and the same queries.</p>
+  <h1>Local filename search, <span class="em">built for macOS</span>.</h1>
+  <p class="lede">JBar is a keyboard-first launcher for macOS apps and files. It searches a bounded
+    <strong>local name/metadata index</strong>, ranks for launching, and leaves document-content search
+    to Spotlight. It is currently a source-built development preview while the physical compatibility
+    and notarized-release matrix is completed.</p>
   <div class="cta">
-    <a class="btn primary" href="#install">Install</a>
+    <a class="btn primary" href="#install">Build from source</a>
     <a class="btn" href="https://github.com/linjiw/jbar">View source</a>
     <div class="install">
       <span class="p">$</span><span id="cmd">git clone https://github.com/linjiw/jbar &amp;&amp; cd jbar &amp;&amp; make install</span>
@@ -195,55 +176,54 @@
 </header>
 
 <section id="numbers">
-  <h2>The numbers</h2>
-  <p class="sub">Measured on an Apple Silicon MacBook Air (10 cores, 16 GB, macOS 26.5.2) — after
-    Spotlight had fully rebuilt its index, so this is Spotlight at its best, not mid-rebuild.</p>
+  <h2>Current evidence</h2>
+  <p class="sub">Current local release-mode evidence uses one immutable binary, versioned correctness
+    reports, and independent processes. It is development-machine evidence, not a notarized artifact,
+    cross-machine percentile, or advertised SLA.</p>
   <div class="stats">
-    <div class="stat"><div class="n j">1.5<span> ms</span></div><div class="k">Warm search, median</div><div class="d">Spotlight: 556 ms</div></div>
-    <div class="stat"><div class="n">2.3<span> s</span></div><div class="k">Cold index build</div><div class="d">182k files, all cores</div></div>
-    <div class="stat"><div class="n">82<span> MB</span></div><div class="k">Resident memory</div><div class="d">~0 idle CPU</div></div>
-    <div class="stat"><div class="n">0</div><div class="k">Permissions needed</div><div class="d">no Accessibility / FDA</div></div>
-    <div class="stat"><div class="n">0</div><div class="k">Dependencies</div><div class="d">system frameworks only</div></div>
-    <div class="stat"><div class="n">297</div><div class="k">Unit tests</div><div class="d">90%+ core coverage</div></div>
+    <div class="stat"><div class="n j">3 × 100</div><div class="k">Processes × samples</div><div class="d">for each synthetic size</div></div>
+    <div class="stat"><div class="n">1<span> M</span></div><div class="k">Largest fixed fixture</div><div class="d">schema 1 · workload 2</div></div>
+    <div class="stat"><div class="n">172–182<span> ms</span></div><div class="k">1M cold-x p50</div><div class="d">range across three processes</div></div>
+    <div class="stat"><div class="n">251–270<span> ms</span></div><div class="k">1M serial-typing r p50</div><div class="d">engine call, not key-to-paint</div></div>
+    <div class="stat"><div class="n">900/900</div><div class="k">Older scans cancelled</div><div class="d">newest unexpected: 0</div></div>
+    <div class="stat"><div class="n">Pending</div><div class="k">Release matrix</div><div class="d">physical IME, Intel, notarization</div></div>
   </div>
 </section>
 
 <section id="benchmark">
-  <h2>JBar vs Spotlight, per query</h2>
-  <p class="sub">Warm p50 over 300 iterations against JBar's engine, and <code>NSMetadataQuery</code>
-    against Spotlight, in the same process. The axis is logarithmic — the gap spans three orders of
-    magnitude, so a linear scale would hide JBar entirely.</p>
+  <h2>Reproducible benchmark, honest semantics</h2>
+  <p class="sub">JBar fuzzy ranking and Spotlight filename-substring metadata gathers are not equivalent
+    workloads. The harness reports each separately and deliberately omits a speedup ratio.</p>
   <div class="card">
-    <div class="legend">
-      <span class="swatch"><i style="background:var(--jbar)"></i> JBar</span>
-      <span class="swatch"><i style="background:var(--spot)"></i> Spotlight</span>
-      <span class="swatch"><i style="background:linear-gradient(90deg,var(--spot),var(--amber))"></i> Spotlight &gt; 1 s</span>
-      <span style="margin-left:auto;color:var(--faint)">log scale · milliseconds</span>
-    </div>
-    <div class="axis" id="axis"></div>
-    <div id="chart"></div>
-    <p class="chart-note">Every JBar keystroke lands inside one 60 fps frame (16 ms). Spotlight's cost
-      grows with the number of matches: a single character costs it three seconds.</p>
+    <p style="margin-top:0">The release harness uses fixed-seed 300k/500k/1M fixtures in three sequential
+      independent processes per size, prints the environment/fingerprint/sample plan, and reports
+      nearest-rank p50/p95/p99/max without best-of-N selection. Every timed response must retain the same
+      complete ordered rows and exact total across matching workloads. An opt-in real crawl uses a
+      temporary isolated snapshot and then runs a semantically different same-root Spotlight reference.</p>
+<pre>scripts/benchmark-release.sh 100
+JBAR_BENCHMARK_INCLUDE_REAL=1 scripts/benchmark-release.sh 100</pre>
+    <p class="evidence-note">The current local campaign passed nine synthetic processes from clean candidate
+      commit <code>183fc3c2e526e21dccc7976203e5f00ba371426c</code>; its evidence manifest is
+      <code>7a64cb87…0de6ab</code>. The opt-in real crawl was not part of this run. Publication still requires the
+      supported OS/CPU matrix, exact signed artifact checksum, and separately stated cache/system load.</p>
   </div>
 </section>
 
 <section id="compare">
   <h2>Side by side</h2>
-  <p class="sub">Two tools with different jobs. JBar is a launcher that owns a fresh index of your apps
-    and files; Spotlight is a whole-Mac content search running as a system service.</p>
+  <p class="sub">Two tools with different jobs. JBar is a launcher that maintains a bounded local index
+    of configured app/file roots; Spotlight is macOS's system metadata and content-search service.</p>
   <div class="card tbl-wrap">
     <table>
       <thead><tr><th>Dimension</th><th>JBar</th><th>Spotlight</th></tr></thead>
       <tbody>
-        <tr><td>Median warm latency</td><td class="n j">1.5 ms</td><td class="n">556 ms</td></tr>
-        <tr><td>Worst query (single char <code>x</code>)</td><td class="n j">2.0 ms</td><td class="n">3,004 ms</td></tr>
-        <tr><td>Index build / refresh</td><td class="n j">2.3 s</td><td class="n">minutes–hours</td></tr>
-        <tr><td>Warm start</td><td class="n j">0.1–0.4 s</td><td class="n">—</td></tr>
-        <tr><td>Ranking for launching</td><td>apps-first · acronyms · pinyin · frecency</td><td>opaque substring</td></tr>
-        <tr><td>Chinese / pinyin (<code>wx</code> → 微信)</td><td class="j">yes</td><td>partial</td></tr>
+        <tr><td>Primary job</td><td>launch by name/alias</td><td>system metadata and content search</td></tr>
+        <tr><td>Benchmark semantics</td><td>fuzzy terms + aliases + ranking</td><td>filename-substring metadata gathers</td></tr>
+        <tr><td>Ranking for launching</td><td>apps-first · acronyms · pinyin · frecency</td><td>system-defined</td></tr>
+        <tr><td>Localized app names / pinyin</td><td>Finder display name + bundled aliases</td><td>system behavior</td></tr>
         <tr><td>Searches file <em>contents</em></td><td>no — names + metadata</td><td class="j">yes</td></tr>
-        <tr><td>Scope</td><td>configured home roots</td><td>whole Mac</td></tr>
-        <tr><td>Idle CPU</td><td class="n j">~0</td><td class="n">200–400% while reindexing</td></tr>
+        <tr><td>Scope</td><td>configured readable roots, exclusions, hard cap</td><td>macOS-managed scope</td></tr>
+        <tr><td>Interactive dependency</td><td>no Spotlight query</td><td>Spotlight service</td></tr>
       </tbody>
     </table>
   </div>
@@ -266,9 +246,9 @@
     <p>Meanwhile <strong>34%</strong> of everything it had indexed under the home directory was
       <code>node_modules</code>, and <code>mds</code> burned 160–400% CPU for over an hour importing
       dependency trees while the user's documents waited in the queue.</p>
-    <p>That is a failure mode no amount of Spotlight tuning prevents. So JBar owns its index, refreshes
-      it in ~2.3 s, keeps it current with FSEvents, and excludes the junk by default — which is why its
-      index is 182k items where Spotlight's is 2 million.
+    <p>That incident motivated a narrower launcher-owned index with explicit exclusions and FSEvents
+      updates. The current formal benchmark covers deterministic synthetic fixtures; a real-corpus
+      run must be repeated from the exact release binary before any refresh-time figure is published.
       <a href="https://github.com/linjiw/jbar/blob/main/docs/DIAGNOSIS.md">Read the full forensic write-up →</a></p>
   </div>
 </section>
@@ -280,135 +260,101 @@
       <span class="kbd">xc</span> → Xcode. An fzf-style Smith-Waterman scorer with word-boundary and
       camelCase bonuses, behind a 64-bit character-mask prefilter.</p></div>
     <div class="feat"><h3>Chinese &amp; pinyin</h3><p><span class="kbd">wx</span>, <span class="kbd">weixin</span>
-      and <span class="kbd">微信</span> all find WeChat. Pinyin (with heteronym overrides) is precomputed
-      at index time for every CJK name.</p></div>
+      and <span class="kbd">微信</span> can find WeChat. Pinyin aliases (with heteronym overrides) are
+      precomputed for CJK application display/localized names.</p></div>
     <div class="feat"><h3>Learns what you open</h3><p>Mozilla-style frecency with a 7-day half-life, plus
-      per-query learning — the thing you picked last time for this exact query comes back first.</p></div>
-    <div class="feat"><h3>Path browsing</h3><p>Type <span class="kbd">~/Dow</span> and press Tab to walk
-      the filesystem live, listing every entry in a directory — including ones Spotlight hasn't indexed.</p></div>
+      a bounded query-pick boost for the last successful selection from the same normalized query.</p></div>
+    <div class="feat"><h3>Bounded path browsing</h3><p>Type <span class="kbd">~/Dow</span> and press Tab.
+      JBar streams one directory, retains a bounded best-result set, cancels stale scans, and shows
+      <span class="kbd">PATH · shown/total</span> when results are truncated.</p></div>
+    <div class="feat"><h3>Screen-aware result viewport</h3><p>The scrollable result pool is separate from
+      visible rows. Short displays reduce panel height and Page Up/Down stride through the same layout
+      calculation, while overflow remains reachable and visibly indicated.</p></div>
     <div class="feat"><h3>Knows what's junk</h3><p><code>node_modules</code>, <code>.venv</code>,
-      <code>vendor/</code>, conda, <code>go/pkg</code> and build output are never crawled; <code>build/</code>,
-      <code>dist/</code> and friends are indexed but de-ranked.</p></div>
-    <div class="feat"><h3>Keyboard only</h3><p>Return opens, ⌘Return reveals in Finder, ⌘C copies the path,
-      ⌘1–8 jump to a row, Esc closes. No mouse, no Dock icon — just a menu-bar item.</p></div>
-    <div class="feat"><h3>No scary permissions</h3><p>The hotkey uses Carbon's
+      conda stores and <code>go/pkg</code> are excluded by default; <code>vendor/</code>, <code>build/</code>,
+      <code>dist/</code> and similar trees remain searchable but are de-ranked.</p></div>
+    <div class="feat"><h3>IME-aware keyboard flow</h3><p>Return opens, ⌘Return reveals, and ⌘C copies.
+      Control/Delete never close the panel; marked text keeps Escape and commands in AppKit's input
+      system. Physical Chinese/Korean/Japanese verification is still a release gate.</p></div>
+    <div class="feat"><h3>Confirmed application opens</h3><p>JBar waits for LaunchServices' asynchronous
+      result before hiding the panel or recording application history. Failed or missing launches stay
+      unrecorded; richer inline failure feedback is still planned.</p></div>
+    <div class="feat"><h3>Narrow permissions</h3><p>The hotkey uses Carbon's
       <code>RegisterEventHotKey</code>, so JBar never asks for Accessibility, Input Monitoring or Full
       Disk Access — only the standard folder prompts.</p></div>
-    <div class="feat"><h3>Stays out of the way</h3><p>~82 MB resident, ~0 idle CPU (FSEvents, no polling),
-      and a binary snapshot that makes a warm start ~0.1 s.</p></div>
+    <div class="feat"><h3>Local, bounded state</h3><p>Config, filename-metadata snapshot, and frecency
+      history remain local, use bounded reads and owner-only atomic writes, and can be cleared
+      independently. History still contains sensitive paths and query picks.</p></div>
   </div>
 </section>
 
 <section id="install">
-  <h2>Install</h2>
-  <p class="sub">Requires macOS 13+ and the Xcode command-line tools. No <code>sudo</code>.</p>
-<pre><span class="c"># build a release JBar.app, install it to /Applications, register a login item, launch it</span>
+  <h2>Development install</h2>
+  <p class="sub">Requires macOS 13+ and Xcode command-line tools. The current source flow produces an
+    ad-hoc-signed development app, not a notarized public release.</p>
+<pre><span class="c"># Build, validate, stage, and install the development app.</span>
 git clone https://github.com/linjiw/jbar.git
 cd jbar
 make install</pre>
   <p class="sub" style="margin-top:16px">Press <strong>⌥Space</strong>. On your first search macOS asks
-    to let JBar read Desktop, Documents and Downloads — allow them; that is the only permission it needs.
-    To remove it: <code>make uninstall</code> (add <code>PURGE=1</code> to delete config and cache too).</p>
+    for protected-folder access as needed by configured roots. Do not strip quarantine from a downloaded
+    build. A Homebrew Cask becomes appropriate only after the exact Universal 2 ZIP is Developer ID
+    signed, notarized/stapled, and clean-machine validated. npm or a language rewrite would not bypass
+    macOS signing, TCC, architecture, or minimum-OS requirements.</p>
 </section>
 
 <section id="how">
   <h2>How it works</h2>
-  <p class="sub">Two targets, zero dependencies, system frameworks only.</p>
+  <p class="sub">Three targets, zero dependencies, system frameworks only.</p>
 <pre>Hotkey (Carbon)  →  NSPanel + NSTableView  →  SearchEngine (actor)
                                                      ↓ reads
                        IndexStore  ←  Indexer: AppScanner · Crawler · FSEvents · Snapshot</pre>
   <div class="grid" style="margin-top:16px">
-    <div class="feat"><h3>Flat, cache-linear index</h3><p>Parallel arrays plus one lowercase UTF-8 name
-      arena — about 60 bytes per item. Paths are reconstructed on demand from a directory table rather
+    <div class="feat"><h3>Flat, bounded index</h3><p>Parallel arrays plus UTF-8 name
+      arenas. Paths are reconstructed on demand from a directory table rather
       than stored per file.</p></div>
     <div class="feat"><h3>Mask prefilter, then DP</h3><p>Each item carries a 64-bit character-presence
-      mask; a query rejects 75–92% of candidates with one AND before the fuzzy scorer runs on the
-      survivors.</p></div>
-    <div class="feat"><h3>Parallel crawl</h3><p>Every root is crawled concurrently into its own builder
-      and merged — 182k files in 2.3 s, with the autorelease pool drained per directory to keep peak
-      memory bounded.</p></div>
+      mask; impossible candidates are rejected before the fuzzy scorer runs. A bounded rerank window
+      limits later path/frecency work.</p></div>
+    <div class="feat"><h3>Shared hard cap</h3><p>Application scan, full crawl, and incremental updates
+      share the configured item budget. Invalid or oversized generations fail closed instead of being
+      published.</p></div>
     <div class="feat"><h3>Incremental, not periodic</h3><p>One FSEvents stream covers every root;
       changed directories are re-listed and the index is rebuilt as an immutable generation and swapped
       atomically.</p></div>
   </div>
-  <p class="sub" style="margin-top:16px">Architecture, data model, the verified-API table and the full
-    ranking spec: <a href="https://github.com/linjiw/jbar/blob/main/docs/DESIGN.md">docs/DESIGN.md</a>.</p>
+  <p class="sub" style="margin-top:16px">Architecture, data model, input behavior, persistence, ranking,
+    evidence, and release boundaries:
+    <a href="https://github.com/linjiw/jbar/blob/main/docs/DESIGN.md">docs/DESIGN.md</a>.</p>
 </section>
 
 <section id="limits">
-  <h2>Where Spotlight wins</h2>
+  <h2>Boundaries and release status</h2>
   <div class="card">
     <p style="margin:0 0 10px"><strong>Spotlight searches file contents. JBar does not.</strong> If you
       need to find a phrase inside a PDF or a Pages document, Spotlight is the right tool — JBar (v1)
       indexes names and metadata only.</p>
-    <p style="margin:0 0 10px">Spotlight also covers the whole Mac; JBar covers the roots you configure
-      (your home directory minus dependency trees, by default).</p>
-    <p style="margin:0">And the coverage figure is honest: on a random sample of 120 real files, JBar
-      surfaced the exact file in its top 50 for 92% of them. The other 8% are common filenames like
-      <code>index.js</code> with hundreds of copies — indexed, but out-ranked by their namesakes. A
-      launcher shows the best few on purpose.</p>
+    <p style="margin:0 0 10px">Spotlight also covers a macOS-managed scope; JBar covers readable roots
+      you configure after exclusions, depth, and a shared item cap. A bounded top-K can omit one of many
+      duplicate filenames even when it is indexed.</p>
+    <p style="margin:0">Automated marked-text/layout regressions, a packaged synthetic AppKit event smoke,
+      and a Universal 2 build with native arm64/Rosetta CLI checks are useful evidence. They do not prove
+      a physical IME, native Intel, macOS 13 runtime, LaunchServices, or release trust. Physical Sequoia
+      Chinese input, the remaining OS/language/layout matrix, native Intel runtime, and the Developer ID
+      notarized/stapled/Gatekeeper artifact remain pending. See the
+      <a href="https://github.com/linjiw/jbar/blob/main/docs/SUPPORT.md">support policy</a> and
+      <a href="https://github.com/linjiw/jbar/blob/main/docs/UX-TESTS.md">executable UX matrix</a>.</p>
   </div>
 </section>
 
 <footer>
   <span>JBar · MIT · <a href="https://github.com/linjiw/jbar">github.com/linjiw/jbar</a></span>
-  <span>Built in Swift + AppKit for macOS 13+</span>
+  <span>Swift + AppKit · intended macOS 13+ Universal 2 release</span>
 </footer>
 
 </div>
 
 <script>
-  // Measured data: [query, note, JBar p50 (ms), Spotlight (ms)]
-  var data = [
-    ["vsc","app acronym",3.40,480],
-    ["code","app word",3.91,1217],
-    ["xc","app acronym",1.31,788],
-    ["chrome","app exact",0.76,141],
-    ["wx","pinyin 微信",0.35,145],
-    ["term","app prefix",3.73,364],
-    ["report","file word",1.53,365],
-    ["report pdf","multi-term",0.19,122],
-    ["readme","common file",1.97,816],
-    ["index","hot token",0.48,1510],
-    ["x","single char",2.05,3005]
-  ];
-  var LO = Math.log10(0.01), HI = Math.log10(4000), SPAN = HI - LO;
-  function pos(ms){ return Math.max(0, Math.min(100, (Math.log10(ms) - LO) / SPAN * 100)); }
-  function fmt(ms){ return ms >= 1000 ? (ms/1000).toFixed(2) + "s" : (ms < 10 ? ms.toFixed(2) : Math.round(ms)) + "ms"; }
-
-  var axis = document.getElementById("axis");
-  [0.1, 1, 10, 100, 1000].forEach(function(v){
-    var t = document.createElement("span");
-    t.className = "t"; t.style.left = pos(v) + "%";
-    t.textContent = v >= 1000 ? (v/1000) + "s" : v + "ms";
-    axis.appendChild(t);
-  });
-
-  var chart = document.getElementById("chart");
-  data.forEach(function(d){
-    var row = document.createElement("div");
-    row.className = "row";
-    row.innerHTML =
-      '<div class="q">' + d[0] + '<small>' + d[1] + '</small></div>' +
-      '<div class="track">' +
-        '<div class="bar j" data-w="' + pos(d[2]) + '"><span class="v">' + fmt(d[2]) + '</span></div>' +
-        '<div class="bar ' + (d[3] > 1000 ? 'slow' : 's') + '" data-w="' + pos(d[3]) + '"><span class="v">' + fmt(d[3]) + '</span></div>' +
-      '</div>';
-    chart.appendChild(row);
-  });
-
-  function grow(){
-    document.querySelectorAll(".bar").forEach(function(b, i){
-      setTimeout(function(){ b.style.width = b.dataset.w + "%"; }, 40 + i * 20);
-    });
-  }
-  if ("IntersectionObserver" in window) {
-    var io = new IntersectionObserver(function(es){
-      es.forEach(function(e){ if (e.isIntersecting) { grow(); io.disconnect(); } });
-    }, { threshold: 0.15 });
-    io.observe(document.getElementById("benchmark"));
-  } else { grow(); }
-
   var copyBtn = document.getElementById("copy");
   copyBtn.addEventListener("click", function(){
     var text = document.getElementById("cmd").textContent;

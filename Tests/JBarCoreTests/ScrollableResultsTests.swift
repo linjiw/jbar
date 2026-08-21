@@ -111,11 +111,11 @@ final class ConfigMigrationTests: XCTestCase {
         XCTAssertGreaterThan(c.maxResults, c.visibleRows)
     }
 
-    func testLegacyLargeMaxResultsIsNeverShrunk() throws {
-        // Someone who asked for 60 rows should still get at least 60 results.
+    func testLegacyLargeMaxResultsKeepsPoolButBoundsPanelHeight() throws {
+        // Preserve the result-pool intent while preventing an old value from creating an unbounded panel.
         let legacy = #"{"maxResults":60}"#.data(using: .utf8)!
         let c = try JSONDecoder().decode(Config.self, from: legacy)
-        XCTAssertEqual(c.visibleRows, 60)
+        XCTAssertEqual(c.visibleRows, SafetyLimits.visibleRows.upperBound)
         XCTAssertGreaterThanOrEqual(c.maxResults, 60)
     }
 

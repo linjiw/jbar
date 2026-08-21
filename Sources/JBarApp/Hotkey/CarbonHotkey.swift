@@ -9,8 +9,9 @@ import Carbon.HIToolbox
 /// owning `CarbonHotkey` instance, so several instances can coexist.
 ///
 /// Must be used from the main thread (the Carbon handler runs on the main run loop).
+@MainActor
 final class CarbonHotkey {
-    typealias Handler = () -> Void
+    typealias Handler = @MainActor () -> Void
 
     /// Called on the main thread whenever the registered combination is pressed.
     var handler: Handler?
@@ -30,7 +31,11 @@ final class CarbonHotkey {
 
     init(handler: Handler? = nil) { self.handler = handler }
 
-    deinit { unregister() }
+    deinit {
+        // Instances are main-actor owned for their entire lifetime. Swift 6.1 does not yet enable
+        // isolated deinitializers by default, so make that runtime invariant explicit here.
+        MainActor.assumeIsolated { unregister() }
+    }
 
     /// Register `modifiers` (Carbon bits: `cmdKey|optionKey|controlKey|shiftKey`) + `keyCode` (`kVK_*`).
     /// Any previous registration of this instance is released first. Returns the Carbon status;
@@ -99,7 +104,9 @@ final class CarbonHotkey {
             let err = GetEventParameter(event, EventParamName(kEventParamDirectObject), EventParamType(typeEventHotKeyID),
                                         nil, MemoryLayout<EventHotKeyID>.size, nil, &hotKeyId)
             guard err == noErr, hotKeyId.signature == CarbonHotkey.signature else { return OSStatus(eventNotHandledErr) }
-            CarbonHotkey.dispatch(id: hotKeyId.id)
+            // Application-target Carbon events are delivered by the main event loop. Keep dispatch
+            // synchronous so one key press cannot be reordered behind a later registration change.
+            MainActor.assumeIsolated { CarbonHotkey.dispatch(id: hotKeyId.id) }
             return noErr
         }, 1, &spec, nil, nil)
         if status == noErr { handlerInstalled = true }

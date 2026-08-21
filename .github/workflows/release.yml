@@ -1,0 +1,1004 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing vMAJOR.MINOR.PATCH tag to release"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CASK_TEMPLATE_SHA256: 5e562653b06413d04ffbb2b119fdffb2b22e24c1e52c1ba8cd77092ddeca7634
+  EXPECTED_MIN_MACOS: "13.0"
+
+jobs:
+  candidate:
+    name: Test and build credential-free candidate
+    if: github.repository == 'linjiw/jbar'
+    runs-on: macos-15
+    timeout-minutes: 75
+    permissions:
+      actions: read
+      contents: read
+    env:
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+    outputs:
+      commit: ${{ steps.metadata.outputs.commit }}
+      tag: ${{ steps.metadata.outputs.tag }}
+      version: ${{ steps.metadata.outputs.version }}
+    steps:
+      - name: Check out the exact release tag without persisted credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate tag identity
+        id: metadata
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "error: release tag must be vMAJOR.MINOR.PATCH" >&2
+            exit 2
+          }
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            test "$GITHUB_REF" = "refs/tags/$RELEASE_TAG" || {
+              echo "error: manual release must itself be dispatched on refs/tags/$RELEASE_TAG" >&2
+              exit 2
+            }
+          fi
+          expected_commit="$(git rev-parse --verify "refs/tags/$RELEASE_TAG^{commit}")"
+          test "$(git rev-parse HEAD)" = "$expected_commit" || {
+            echo "error: checkout does not match the requested release tag" >&2
+            exit 2
+          }
+          {
+            echo "commit=$expected_commit"
+            echo "tag=$RELEASE_TAG"
+            echo "version=${RELEASE_TAG#v}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Require exact main-branch CI evidence
+        env:
+          EXPECTED_COMMIT: ${{ steps.metadata.outputs.commit }}
+          EXPECTED_REPOSITORY: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          fail() {
+            echo "::error title=Release CI gate::$1" >&2
+            exit 2
+          }
+
+          main_commit="$(git rev-parse --verify 'refs/remotes/origin/main^{commit}')" ||
+            fail "origin/main is unavailable in the full checkout"
+          git merge-base --is-ancestor "$EXPECTED_COMMIT" "$main_commit" ||
+            fail "the release commit is not an ancestor of origin/main"
+
+          runs_endpoint="repos/$EXPECTED_REPOSITORY/actions/workflows/ci.yml/runs"
+          runs_json="$(gh api --method GET \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "$runs_endpoint" \
+            -f branch=main \
+            -f event=push \
+            -f head_sha="$EXPECTED_COMMIT" \
+            -F per_page=100)" || fail "the workflow-runs API request failed"
+
+          jq -e '
+            ((.total_count | type) == "number") and
+            (.total_count >= 1) and
+            (.total_count <= 100) and
+            ((.workflow_runs | type) == "array") and
+            (.total_count == (.workflow_runs | length)) and
+            (all(.workflow_runs[];
+              ((.id | type) == "number") and (.id > 0) and
+              ((.run_number | type) == "number") and (.run_number > 0) and
+              ((.run_attempt | type) == "number") and (.run_attempt > 0)))
+          ' <<< "$runs_json" >/dev/null ||
+            fail "expected between 1 and 100 complete workflow-run records for the exact commit"
+
+          # Select before checking status/conclusion so an older success cannot mask a newer
+          # failed, cancelled, or in-progress run for the same commit.
+          run_json="$(jq -c '
+            .workflow_runs | sort_by([.run_number, .id]) | last
+          ' <<< "$runs_json")"
+          if ! jq -e \
+            --arg commit "$EXPECTED_COMMIT" \
+            --arg repository "$EXPECTED_REPOSITORY" '
+              .name == "CI" and
+              (.path == ".github/workflows/ci.yml" or
+                .path == ".github/workflows/ci.yml@main") and
+              .event == "push" and
+              .head_branch == "main" and
+              .head_sha == $commit and
+              .repository.full_name == $repository and
+              .head_repository.full_name == $repository and
+              .status == "completed" and
+              .conclusion == "success"
+            ' <<< "$run_json" >/dev/null; then
+            echo "Newest exact-commit CI run was rejected:" >&2
+            jq -c '{id, run_number, run_attempt, name, path, event, head_branch, head_sha,
+              repository: .repository.full_name, head_repository: .head_repository.full_name,
+              status, conclusion}' <<< "$run_json" >&2
+            fail "the newest exact-commit main push run is not a completed successful CI run"
+          fi
+
+          run_id="$(jq -r '.id' <<< "$run_json")"
+          run_attempt="$(jq -r '.run_attempt' <<< "$run_json")"
+          verified_run_evidence="$(jq -c '{id, run_number, run_attempt, name, path, event,
+            head_branch, head_sha, repository: .repository.full_name,
+            head_repository: .head_repository.full_name, status, conclusion}' <<< "$run_json")"
+          jobs_endpoint="repos/$EXPECTED_REPOSITORY/actions/runs/$run_id/attempts/$run_attempt/jobs"
+          jobs_json="$(gh api --method GET \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "$jobs_endpoint" \
+            -F per_page=100)" || fail "the current-attempt jobs API request failed"
+
+          jq -e '
+            ((.total_count | type) == "number") and
+            (.total_count >= 1) and
+            (.total_count <= 100) and
+            ((.jobs | type) == "array") and
+            (.total_count == (.jobs | length))
+          ' <<< "$jobs_json" >/dev/null ||
+            fail "expected between 1 and 100 complete job records for the current attempt"
+
+          if ! jq -e \
+            --arg commit "$EXPECTED_COMMIT" \
+            --argjson run_id "$run_id" '
+              [.jobs[] | select(.name == "Required CI gate")] as $gates |
+              ($gates | length) == 1 and
+              $gates[0].workflow_name == "CI" and
+              $gates[0].run_id == $run_id and
+              $gates[0].head_branch == "main" and
+              $gates[0].head_sha == $commit and
+              $gates[0].status == "completed" and
+              $gates[0].conclusion == "success" and
+              ([
+                $gates[0].steps[]? |
+                select(.name == "Require every evidence job") |
+                select(.status == "completed" and .conclusion == "success")
+              ] | length) == 1
+            ' <<< "$jobs_json" >/dev/null; then
+            echo "Current CI attempt jobs were rejected:" >&2
+            jq -c '[.jobs[] | {name, workflow_name, run_id, head_branch, head_sha,
+              status, conclusion}]' <<< "$jobs_json" >&2
+            fail "the current attempt lacks one successful Required CI gate job and gate step"
+          fi
+
+          # The attempt-specific jobs endpoint remains readable after somebody starts a re-run.
+          # Re-read the workflow-run list after validating its jobs so an old successful attempt
+          # cannot win a race against a newly current attempt or a newer run for this commit.
+          recheck_runs_json="$(gh api --method GET \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "$runs_endpoint" \
+            -f branch=main \
+            -f event=push \
+            -f head_sha="$EXPECTED_COMMIT" \
+            -F per_page=100)" || fail "the final workflow-runs API request failed"
+          jq -e '
+            ((.total_count | type) == "number") and
+            (.total_count >= 1) and
+            (.total_count <= 100) and
+            ((.workflow_runs | type) == "array") and
+            (.total_count == (.workflow_runs | length)) and
+            (all(.workflow_runs[];
+              ((.id | type) == "number") and (.id > 0) and
+              ((.run_number | type) == "number") and (.run_number > 0) and
+              ((.run_attempt | type) == "number") and (.run_attempt > 0)))
+          ' <<< "$recheck_runs_json" >/dev/null ||
+            fail "the final exact-commit workflow-run records are incomplete"
+          recheck_run_json="$(jq -c '
+            .workflow_runs | sort_by([.run_number, .id]) | last
+          ' <<< "$recheck_runs_json")"
+          recheck_run_evidence="$(jq -c '{id, run_number, run_attempt, name, path, event,
+            head_branch, head_sha, repository: .repository.full_name,
+            head_repository: .head_repository.full_name, status, conclusion}' \
+            <<< "$recheck_run_json")"
+          if [ "$recheck_run_evidence" != "$verified_run_evidence" ]; then
+            echo "CI run evidence changed while its jobs were being verified:" >&2
+            printf 'initial=%s\nfinal=%s\n' \
+              "$verified_run_evidence" "$recheck_run_evidence" >&2
+            fail "the newest exact-commit CI run or current attempt changed during verification"
+          fi
+
+          printf 'Verified CI run %s attempt %s for %s on main.\n' \
+            "$run_id" "$run_attempt" "$EXPECTED_COMMIT"
+
+      - name: Show pinned build environment
+        run: |
+          sw_vers
+          uname -m
+          swift --version
+          xcodebuild -version
+
+      - name: Run optimized tests
+        run: swift test -c release --scratch-path "$RUNNER_TEMP/jbar-release-tests"
+
+      - name: Compile all source and test targets with complete concurrency checking
+        run: |
+          swift build -c release --build-tests \
+            --scratch-path "$RUNNER_TEMP/jbar-release-strict" \
+            -Xswiftc -enable-testing \
+            -Xswiftc -strict-concurrency=complete \
+            -Xswiftc -warnings-as-errors
+
+      - name: Build and verify an ad-hoc Universal 2 candidate
+        env:
+          JBAR_VERSION: ${{ steps.metadata.outputs.version }}
+          JBAR_BUILD_NUMBER: ${{ github.run_number }}
+          CODESIGN_IDENTITY: "-"
+        run: |
+          set -euo pipefail
+          scripts/build-app.sh "$RUNNER_TEMP/jbar-candidate"
+          app="$RUNNER_TEMP/jbar-candidate/JBar.app"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          test "$("$app/Contents/MacOS/JBar" --version)" = "JBar $JBAR_VERSION"
+
+      - name: Package the candidate without release credentials
+        run: |
+          set -euo pipefail
+          candidate="$RUNNER_TEMP/jbar-candidate-artifact"
+          mkdir -p "$candidate"
+          JBAR_EXPECT_MIN_MACOS="$EXPECTED_MIN_MACOS" scripts/package-app.sh \
+            "$RUNNER_TEMP/jbar-candidate/JBar.app" \
+            "$candidate/JBar-ad-hoc-candidate.zip"
+          (
+            cd "$candidate"
+            shasum -a 256 JBar-ad-hoc-candidate.zip > JBar-ad-hoc-candidate.zip.sha256
+          )
+          cp packaging/homebrew/jbar.rb.template "$candidate/jbar.rb.template"
+          chmod 0644 "$candidate/jbar.rb.template"
+          test "$(shasum -a 256 "$candidate/jbar.rb.template" | awk '{print $1}')" = \
+            "$CASK_TEMPLATE_SHA256"
+
+      - name: Upload the credential-free candidate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: JBar-release-candidate
+          path: ${{ runner.temp }}/jbar-candidate-artifact
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  sign_and_notarize:
+    name: Sign, notarize, and verify
+    needs: candidate
+    if: github.repository == 'linjiw/jbar'
+    runs-on: macos-15
+    timeout-minutes: 60
+    environment: release
+    permissions:
+      actions: read
+    outputs:
+      immutable_releases_attested: ${{ steps.controls.outputs.immutable_releases_attested }}
+      team_id_sha256: ${{ steps.sign.outputs.team_id_sha256 }}
+    env:
+      EXPECTED_COMMIT: ${{ needs.candidate.outputs.commit }}
+      EXPECTED_TEAM_ID: ${{ vars.APPLE_DEVELOPER_TEAM_ID }}
+      IMMUTABLE_RELEASES_ATTESTED: ${{ vars.IMMUTABLE_RELEASES_ATTESTED }}
+      RELEASE_TAG: ${{ needs.candidate.outputs.tag }}
+      VERSION: ${{ needs.candidate.outputs.version }}
+    steps:
+      # Deliberately do not check out or execute repository code in this job. Apple credentials are
+      # exposed only to the one system-tool step that needs each credential family.
+      - name: Download the tested candidate
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: JBar-release-candidate
+          path: ${{ runner.temp }}/jbar-download
+
+      - name: Verify and extract the exact candidate before exposing secrets
+        run: |
+          set -euo pipefail
+          umask 077
+          find_must_be_empty() {
+            local match
+            match="$(/usr/bin/find "$@")" || return 1
+            test -z "$match"
+          }
+          validate_regular_file() {
+            local path="$1"
+            local maximum_bytes="$2"
+            test -f "$path" && test ! -L "$path"
+            test "$(stat -f '%u' "$path")" = "$(id -u)"
+            test "$(stat -f '%Lp' "$path")" = "644"
+            test "$(stat -f '%l' "$path")" = "1"
+            find_must_be_empty "$path" -acl -print -quit
+            local bytes
+            bytes="$(stat -f '%z' "$path")"
+            test "$bytes" -gt 0 && test "$bytes" -le "$maximum_bytes"
+          }
+          validate_archive_entry_topology() (
+            set -e
+            local archive="$1"
+            local listing="$2"
+            local entry
+            local logical
+            local count=0
+            local saw_app_root=0
+            trap 'rm -f -- "$listing"' EXIT
+            test ! -e "$listing" && test ! -L "$listing"
+            /usr/bin/zipinfo -1 "$archive" > "$listing"
+            test -s "$listing"
+            test "$(stat -f '%z' "$listing")" -le 16777216
+            while IFS= read -r entry || test -n "$entry"; do
+              count=$((count + 1))
+              test "$count" -le 100000
+              case "$entry" in
+                *$'\r'*|*'^J'*|*'^M'*|/*|*\\*) exit 1 ;;
+              esac
+              logical="${entry%/}"
+              test -n "$logical"
+              case "$logical" in
+                *//*|.|..|*/.|*/./*|*/..|*/../*) exit 1 ;;
+              esac
+              case "$entry" in
+                JBar.app/) saw_app_root=1 ;;
+                JBar.app/*|__MACOSX/|__MACOSX/JBar.app/|__MACOSX/JBar.app/*) ;;
+                *) exit 1 ;;
+              esac
+            done < "$listing"
+            test "$count" -gt 0 && test "$saw_app_root" -eq 1
+            test "$(LC_ALL=C sort "$listing" | uniq -d | wc -l | tr -d ' ')" = 0
+          )
+          validate_bundle_tree() {
+            local app="$1"
+            local binary="$app/Contents/MacOS/JBar"
+            test "$(basename "$app")" = "JBar.app"
+            test -d "$app" && test ! -L "$app"
+            test -f "$binary" && test ! -L "$binary" && test -x "$binary"
+            find_must_be_empty -x "$app" ! -type d ! -type f -print -quit
+            find_must_be_empty -x "$app" -acl -print -quit
+            find_must_be_empty -x "$app" ! -user "$(id -un)" -print -quit
+            find_must_be_empty -x "$app" -type d ! -perm 0755 -print -quit
+            test "$(stat -f '%Lp' "$binary")" = "755"
+            find_must_be_empty -x "$app" -type f ! -path "$binary" ! -perm 0644 -print -quit
+            find_must_be_empty -x "$app" -type f -links +1 -print -quit
+            while IFS= read -r -d '' entry; do
+              case "$entry" in *$'\n'*|*$'\r'*) return 1 ;; esac
+            done < <(find -x "$app" -print0)
+          }
+          download="$RUNNER_TEMP/jbar-download"
+          archive="$download/JBar-ad-hoc-candidate.zip"
+          checksum="$download/JBar-ad-hoc-candidate.zip.sha256"
+          template="$download/jbar.rb.template"
+          top_count="$(find "$download" -mindepth 1 -maxdepth 1 -print | wc -l | tr -d ' ')" || exit 1
+          test "$top_count" = "3"
+          validate_regular_file "$archive" 104857600
+          validate_regular_file "$checksum" 256
+          validate_regular_file "$template" 65536
+          test "$(wc -l < "$checksum" | tr -d ' ')" = "1"
+          test "$(awk '{print $2}' "$checksum")" = "JBar-ad-hoc-candidate.zip"
+          expected_sha="$(awk '{print $1}' "$checksum")"
+          [[ "$expected_sha" =~ ^[0-9a-f]{64}$ ]]
+          test "$(shasum -a 256 "$archive" | awk '{print $1}')" = "$expected_sha"
+          test "$(shasum -a 256 "$template" | awk '{print $1}')" = "$CASK_TEMPLATE_SHA256"
+          validate_archive_entry_topology "$archive" "$RUNNER_TEMP/jbar-candidate.entries"
+          test ! -e "$RUNNER_TEMP/jbar-release" && test ! -L "$RUNNER_TEMP/jbar-release"
+          mkdir -m 0700 "$RUNNER_TEMP/jbar-release"
+          ditto -x -k --rsrc --extattr --qtn --noacl \
+            "$archive" "$RUNNER_TEMP/jbar-release"
+          top_count="$(find "$RUNNER_TEMP/jbar-release" -mindepth 1 -maxdepth 1 -print | wc -l | tr -d ' ')" || exit 1
+          test "$top_count" = "1"
+          app="$RUNNER_TEMP/jbar-release/JBar.app"
+          binary="$app/Contents/MacOS/JBar"
+          plist="$app/Contents/Info.plist"
+          pkginfo="$app/Contents/PkgInfo"
+          validate_bundle_tree "$app"
+          test -f "$plist" && test ! -L "$plist"
+          test -f "$pkginfo" && test ! -L "$pkginfo"
+          printf 'APPL????' | cmp -s - "$pkginfo"
+          plutil -lint "$plist" >/dev/null
+          codesign --verify --deep --strict --verbose=2 "$app"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$plist")" = \
+            "com.linji.jbar"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$plist")" = "JBar"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundlePackageType' "$plist")" = "APPL"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$plist")" = \
+            "$VERSION"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$plist")" = \
+            "$EXPECTED_MIN_MACOS"
+          actual_archs="$(lipo -archs "$binary")"
+          test "$(wc -w <<< "$actual_archs" | tr -d ' ')" = "2"
+          for arch in arm64 x86_64; do
+            case " $actual_archs " in *" $arch "*) ;; *) exit 1 ;; esac
+            min_os="$(xcrun vtool -show-build -arch "$arch" "$binary" | \
+              awk '$1 == "minos" { print $2; exit }')"
+            test "$min_os" = "$EXPECTED_MIN_MACOS"
+          done
+
+      - name: Require the reviewed immutable-release prerequisite
+        id: controls
+        run: |
+          set -euo pipefail
+          test "$IMMUTABLE_RELEASES_ATTESTED" = "true" || {
+            echo "error: the protected release environment has not attested immutable releases" >&2
+            exit 2
+          }
+          echo "immutable_releases_attested=true" >> "$GITHUB_OUTPUT"
+
+      - name: Import Developer ID certificate and sign with Hardened Runtime
+        id: sign
+        env:
+          CERTIFICATE_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_CERTIFICATE_BASE64 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD }}
+          CODESIGN_IDENTITY: ${{ secrets.APPLE_DEVELOPER_ID_APPLICATION }}
+        run: |
+          set -euo pipefail
+          for value in CERTIFICATE_BASE64 CERTIFICATE_PASSWORD CODESIGN_IDENTITY EXPECTED_TEAM_ID; do
+            [ -n "${!value}" ] || { echo "error: release environment is missing $value" >&2; exit 2; }
+          done
+          [[ "$EXPECTED_TEAM_ID" =~ ^[A-Z0-9]{10}$ ]] || {
+            echo "error: APPLE_DEVELOPER_TEAM_ID must be a 10-character Apple Team ID" >&2
+            exit 2
+          }
+          case "$CODESIGN_IDENTITY" in
+            "Developer ID Application:"*"($EXPECTED_TEAM_ID)") ;;
+            *) echo "error: signing identity does not match the pinned Apple Team ID" >&2; exit 2 ;;
+          esac
+          umask 077
+          keychain="$RUNNER_TEMP/jbar-release.keychain-db"
+          p12="$RUNNER_TEMP/jbar-release.p12"
+          keychain_password="$(uuidgen)"
+          cleanup() {
+            security delete-keychain "$keychain" >/dev/null 2>&1 || true
+            rm -f -- "$p12"
+          }
+          trap cleanup EXIT INT TERM HUP
+          printf '%s' "$CERTIFICATE_BASE64" | base64 --decode > "$p12"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$p12" -k "$keychain" -P "$CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple: -s \
+            -k "$keychain_password" "$keychain"
+          security list-keychains -d user -s "$keychain"
+          app="$RUNNER_TEMP/jbar-release/JBar.app"
+          codesign --force --options runtime --timestamp \
+            --sign "$CODESIGN_IDENTITY" "$app"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          requirement="anchor apple generic and identifier \"com.linji.jbar\" and certificate leaf[subject.OU] = \"$EXPECTED_TEAM_ID\" and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists"
+          codesign --verify --deep --strict -R="$requirement" "$app"
+          signature_details="$(codesign -d --verbose=4 "$app" 2>&1)"
+          grep -Fq 'Authority=Developer ID Application:' <<< "$signature_details"
+          grep -Fqx "TeamIdentifier=$EXPECTED_TEAM_ID" <<< "$signature_details"
+          grep -Eq '^Timestamp=' <<< "$signature_details"
+          grep -Eq '^CodeDirectory .*flags=.*runtime' <<< "$signature_details"
+          team_id_sha256="$(printf '%s' "$EXPECTED_TEAM_ID" | shasum -a 256 | awk '{print $1}')"
+          [[ "$team_id_sha256" =~ ^[0-9a-f]{64}$ ]]
+          printf 'team_id_sha256=%s\n' "$team_id_sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Create the notarization submission with system tools only
+        run: |
+          set -euo pipefail
+          app="$RUNNER_TEMP/jbar-release/JBar.app"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          ditto -c -k --rsrc --extattr --qtn --noacl --sequesterRsrc --keepParent "$app" \
+            "$RUNNER_TEMP/JBar-notarization.zip"
+          test -s "$RUNNER_TEMP/JBar-notarization.zip"
+
+      - name: Submit, staple, and validate with notarization credentials
+        env:
+          NOTARY_KEY_BASE64: ${{ secrets.APPLE_NOTARY_KEY_BASE64 }}
+          NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          for value in NOTARY_KEY_BASE64 NOTARY_KEY_ID NOTARY_ISSUER_ID; do
+            [ -n "${!value}" ] || { echo "error: release environment is missing $value" >&2; exit 2; }
+          done
+          [[ "$NOTARY_KEY_ID" =~ ^[A-Z0-9]{10,64}$ ]] || {
+            echo "error: invalid App Store Connect key id" >&2
+            exit 2
+          }
+          [[ "$NOTARY_ISSUER_ID" =~ ^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ ]] || {
+            echo "error: invalid App Store Connect issuer id" >&2
+            exit 2
+          }
+          umask 077
+          key_file="$RUNNER_TEMP/AuthKey_${NOTARY_KEY_ID}.p8"
+          cleanup() {
+            rm -f -- "$key_file" "$RUNNER_TEMP/JBar-notarization.zip"
+          }
+          trap cleanup EXIT INT TERM HUP
+          printf '%s' "$NOTARY_KEY_BASE64" | base64 --decode > "$key_file"
+          chmod 600 "$key_file"
+          xcrun notarytool submit "$RUNNER_TEMP/JBar-notarization.zip" \
+            --key "$key_file" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER_ID" \
+            --wait --timeout 30m
+          app="$RUNNER_TEMP/jbar-release/JBar.app"
+          xcrun stapler staple "$app"
+          xcrun stapler validate "$app"
+
+      - name: Enforce final Gatekeeper and immutable-archive gates
+        run: |
+          set -euo pipefail
+          umask 077
+          [[ "$EXPECTED_TEAM_ID" =~ ^[A-Z0-9]{10}$ ]]
+          find_must_be_empty() {
+            local match
+            match="$(/usr/bin/find "$@")" || return 1
+            test -z "$match"
+          }
+          validate_regular_file() {
+            local path="$1"
+            local maximum_bytes="$2"
+            test -f "$path" && test ! -L "$path"
+            test "$(stat -f '%u' "$path")" = "$(id -u)"
+            test "$(stat -f '%Lp' "$path")" = "644"
+            test "$(stat -f '%l' "$path")" = "1"
+            find_must_be_empty "$path" -acl -print -quit
+            local bytes
+            bytes="$(stat -f '%z' "$path")"
+            test "$bytes" -gt 0 && test "$bytes" -le "$maximum_bytes"
+          }
+          validate_archive_entry_topology() (
+            set -e
+            local archive="$1"
+            local listing="$2"
+            local entry
+            local logical
+            local count=0
+            local saw_app_root=0
+            trap 'rm -f -- "$listing"' EXIT
+            test ! -e "$listing" && test ! -L "$listing"
+            /usr/bin/zipinfo -1 "$archive" > "$listing"
+            test -s "$listing"
+            test "$(stat -f '%z' "$listing")" -le 16777216
+            while IFS= read -r entry || test -n "$entry"; do
+              count=$((count + 1))
+              test "$count" -le 100000
+              case "$entry" in
+                *$'\r'*|*'^J'*|*'^M'*|/*|*\\*) exit 1 ;;
+              esac
+              logical="${entry%/}"
+              test -n "$logical"
+              case "$logical" in
+                *//*|.|..|*/.|*/./*|*/..|*/../*) exit 1 ;;
+              esac
+              case "$entry" in
+                JBar.app/) saw_app_root=1 ;;
+                JBar.app/*|__MACOSX/|__MACOSX/JBar.app/|__MACOSX/JBar.app/*) ;;
+                *) exit 1 ;;
+              esac
+            done < "$listing"
+            test "$count" -gt 0 && test "$saw_app_root" -eq 1
+            test "$(LC_ALL=C sort "$listing" | uniq -d | wc -l | tr -d ' ')" = 0
+          )
+          validate_bundle_structure() {
+            local app="$1"
+            local binary="$app/Contents/MacOS/JBar"
+            local plist="$app/Contents/Info.plist"
+            local pkginfo="$app/Contents/PkgInfo"
+            local actual_archs
+            local arch
+            local min_os
+            test "$(basename "$app")" = "JBar.app"
+            test -d "$app" && test ! -L "$app"
+            test -f "$binary" && test ! -L "$binary" && test -x "$binary"
+            test -f "$plist" && test ! -L "$plist"
+            test -f "$pkginfo" && test ! -L "$pkginfo"
+            find_must_be_empty -x "$app" ! -type d ! -type f -print -quit
+            find_must_be_empty -x "$app" -acl -print -quit
+            find_must_be_empty -x "$app" ! -user "$(id -un)" -print -quit
+            find_must_be_empty -x "$app" -type d ! -perm 0755 -print -quit
+            test "$(stat -f '%Lp' "$binary")" = "755"
+            find_must_be_empty -x "$app" -type f ! -path "$binary" ! -perm 0644 -print -quit
+            find_must_be_empty -x "$app" -type f -links +1 -print -quit
+            while IFS= read -r -d '' entry; do
+              case "$entry" in *$'\n'*|*$'\r'*) return 1 ;; esac
+            done < <(find -x "$app" -print0)
+            printf 'APPL????' | cmp -s - "$pkginfo"
+            plutil -lint "$plist" >/dev/null
+            test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$plist")" = \
+              "com.linji.jbar"
+            test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$plist")" = "JBar"
+            test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundlePackageType' "$plist")" = "APPL"
+            test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$plist")" = \
+              "$VERSION"
+            test "$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$plist")" = \
+              "$EXPECTED_MIN_MACOS"
+            actual_archs="$(lipo -archs "$binary")"
+            test "$(wc -w <<< "$actual_archs" | tr -d ' ')" = "2"
+            for arch in arm64 x86_64; do
+              case " $actual_archs " in *" $arch "*) ;; *) return 1 ;; esac
+              min_os="$(xcrun vtool -show-build -arch "$arch" "$binary" | \
+                awk '$1 == "minos" { print $2; exit }')"
+              test "$min_os" = "$EXPECTED_MIN_MACOS"
+            done
+          }
+          validate_cask() {
+            local cask="$1"
+            local sha256="$2"
+            local normalized="$RUNNER_TEMP/jbar-cask-normalized"
+            validate_regular_file "$cask" 65536
+            ruby -c "$cask" >/dev/null
+            test ! -e "$normalized" && test ! -L "$normalized"
+            awk -v version="$VERSION" -v sha256="$sha256" '
+              BEGIN { versions = 0; hashes = 0 }
+              $0 == "  version \"" version "\"" {
+                print "  version \"@VERSION@\""; versions += 1; next
+              }
+              $0 == "  sha256 \"" sha256 "\"" {
+                print "  sha256 \"@SHA256@\""; hashes += 1; next
+              }
+              { print }
+              END { if (versions != 1 || hashes != 1) exit 2 }
+            ' "$cask" > "$normalized"
+            test "$(shasum -a 256 "$normalized" | awk '{print $1}')" = \
+              "$CASK_TEMPLATE_SHA256"
+            rm -f -- "$normalized"
+          }
+
+          app="$RUNNER_TEMP/jbar-release/JBar.app"
+          validate_bundle_structure "$app"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          requirement="anchor apple generic and identifier \"com.linji.jbar\" and certificate leaf[subject.OU] = \"$EXPECTED_TEAM_ID\" and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists"
+          codesign --verify --deep --strict -R="$requirement" "$app"
+          syspolicy_check distribution "$app"
+          spctl --assess --type execute --verbose=4 "$app"
+
+          artifacts="$RUNNER_TEMP/jbar-artifacts"
+          verify="$RUNNER_TEMP/jbar-final-verify"
+          test ! -e "$artifacts" && test ! -L "$artifacts"
+          test ! -e "$verify" && test ! -L "$verify"
+          mkdir -m 0700 "$artifacts" "$verify"
+          final_zip="$artifacts/JBar-${VERSION}-universal.zip"
+          ditto -c -k --rsrc --extattr --qtn --noacl --sequesterRsrc --keepParent \
+            "$app" "$final_zip"
+          chmod 0644 "$final_zip"
+          validate_regular_file "$final_zip" 104857600
+          validate_archive_entry_topology "$final_zip" "$RUNNER_TEMP/jbar-final.entries"
+          ditto -x -k --rsrc --extattr --qtn --noacl "$final_zip" "$verify"
+          top_count="$(find "$verify" -mindepth 1 -maxdepth 1 -print | wc -l | tr -d ' ')" || exit 1
+          test "$top_count" = "1"
+          extracted_app="$verify/JBar.app"
+          validate_bundle_structure "$extracted_app"
+          codesign --verify --deep --strict --verbose=2 "$extracted_app"
+          codesign --verify --deep --strict -R="$requirement" "$extracted_app"
+          xcrun stapler validate "$extracted_app"
+          syspolicy_check distribution "$extracted_app"
+          spctl --assess --type execute --verbose=4 "$extracted_app"
+          (
+            cd "$artifacts"
+            shasum -a 256 "JBar-${VERSION}-universal.zip" > \
+              "JBar-${VERSION}-universal.zip.sha256"
+          )
+          chmod 0644 "$artifacts/JBar-${VERSION}-universal.zip.sha256"
+          validate_regular_file "$artifacts/JBar-${VERSION}-universal.zip.sha256" 256
+
+          sha256="$(awk '{print $1}' "$artifacts/JBar-${VERSION}-universal.zip.sha256")"
+          [[ "$sha256" =~ ^[0-9a-f]{64}$ ]]
+          sed -e "s/@VERSION@/$VERSION/g" -e "s/@SHA256@/$sha256/g" \
+            "$RUNNER_TEMP/jbar-download/jbar.rb.template" > "$artifacts/jbar.rb"
+          chmod 0644 "$artifacts/jbar.rb"
+          validate_cask "$artifacts/jbar.rb" "$sha256"
+
+      - name: Upload the verified signed release assets
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: JBar-signed-release
+          path: ${{ runner.temp }}/jbar-artifacts
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  verify_signed:
+    name: Verify the signed artifact on a fresh runner
+    needs:
+      - candidate
+      - sign_and_notarize
+    if: github.repository == 'linjiw/jbar'
+    runs-on: macos-15
+    timeout-minutes: 15
+    permissions:
+      actions: read
+    env:
+      EXPECTED_TEAM_ID_SHA256: ${{ needs.sign_and_notarize.outputs.team_id_sha256 }}
+      VERSION: ${{ needs.candidate.outputs.version }}
+    steps:
+      # A candidate is never executed on the runner that receives Apple credentials. Runtime smoke
+      # happens here, after downloading the exact immutable artifact, on a new runner with no secrets.
+      - name: Download the signed release assets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: JBar-signed-release
+          path: ${{ runner.temp }}/jbar-artifacts
+
+      - name: Verify, extract, assess, and run the signed archive
+        run: |
+          set -euo pipefail
+          umask 077
+          [[ "$EXPECTED_TEAM_ID_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          find_must_be_empty() {
+            local match
+            match="$(/usr/bin/find "$@")" || return 1
+            test -z "$match"
+          }
+          validate_regular_file() {
+            local path="$1"
+            local maximum_bytes="$2"
+            test -f "$path" && test ! -L "$path"
+            test "$(stat -f '%u' "$path")" = "$(id -u)"
+            test "$(stat -f '%Lp' "$path")" = "644"
+            test "$(stat -f '%l' "$path")" = "1"
+            find_must_be_empty "$path" -acl -print -quit
+            local bytes
+            bytes="$(stat -f '%z' "$path")"
+            test "$bytes" -gt 0 && test "$bytes" -le "$maximum_bytes"
+          }
+          validate_archive_entry_topology() (
+            set -e
+            local archive="$1"
+            local listing="$2"
+            local entry
+            local logical
+            local count=0
+            local saw_app_root=0
+            trap 'rm -f -- "$listing"' EXIT
+            test ! -e "$listing" && test ! -L "$listing"
+            /usr/bin/zipinfo -1 "$archive" > "$listing"
+            test -s "$listing"
+            test "$(stat -f '%z' "$listing")" -le 16777216
+            while IFS= read -r entry || test -n "$entry"; do
+              count=$((count + 1))
+              test "$count" -le 100000
+              case "$entry" in
+                *$'\r'*|*'^J'*|*'^M'*|/*|*\\*) exit 1 ;;
+              esac
+              logical="${entry%/}"
+              test -n "$logical"
+              case "$logical" in
+                *//*|.|..|*/.|*/./*|*/..|*/../*) exit 1 ;;
+              esac
+              case "$entry" in
+                JBar.app/) saw_app_root=1 ;;
+                JBar.app/*|__MACOSX/|__MACOSX/JBar.app/|__MACOSX/JBar.app/*) ;;
+                *) exit 1 ;;
+              esac
+            done < "$listing"
+            test "$count" -gt 0 && test "$saw_app_root" -eq 1
+            test "$(LC_ALL=C sort "$listing" | uniq -d | wc -l | tr -d ' ')" = 0
+          )
+          validate_bundle_structure() {
+            local app="$1"
+            local binary="$app/Contents/MacOS/JBar"
+            local plist="$app/Contents/Info.plist"
+            local pkginfo="$app/Contents/PkgInfo"
+            local actual_archs
+            local arch
+            local min_os
+            test "$(basename "$app")" = "JBar.app"
+            test -d "$app" && test ! -L "$app"
+            test -f "$binary" && test ! -L "$binary" && test -x "$binary"
+            test -f "$plist" && test ! -L "$plist"
+            test -f "$pkginfo" && test ! -L "$pkginfo"
+            find_must_be_empty -x "$app" ! -type d ! -type f -print -quit
+            find_must_be_empty -x "$app" -acl -print -quit
+            find_must_be_empty -x "$app" ! -user "$(id -un)" -print -quit
+            find_must_be_empty -x "$app" -type d ! -perm 0755 -print -quit
+            test "$(stat -f '%Lp' "$binary")" = "755"
+            find_must_be_empty -x "$app" -type f ! -path "$binary" ! -perm 0644 -print -quit
+            find_must_be_empty -x "$app" -type f -links +1 -print -quit
+            while IFS= read -r -d '' entry; do
+              case "$entry" in *$'\n'*|*$'\r'*) return 1 ;; esac
+            done < <(find -x "$app" -print0)
+            printf 'APPL????' | cmp -s - "$pkginfo"
+            plutil -lint "$plist" >/dev/null
+            test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$plist")" = \
+              "com.linji.jbar"
+            test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$plist")" = "JBar"
+            test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundlePackageType' "$plist")" = "APPL"
+            test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$plist")" = \
+              "$VERSION"
+            test "$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$plist")" = \
+              "$EXPECTED_MIN_MACOS"
+            actual_archs="$(lipo -archs "$binary")"
+            test "$(wc -w <<< "$actual_archs" | tr -d ' ')" = "2"
+            for arch in arm64 x86_64; do
+              case " $actual_archs " in *" $arch "*) ;; *) return 1 ;; esac
+              min_os="$(xcrun vtool -show-build -arch "$arch" "$binary" | \
+                awk '$1 == "minos" { print $2; exit }')"
+              test "$min_os" = "$EXPECTED_MIN_MACOS"
+            done
+          }
+          validate_cask() {
+            local cask="$1"
+            local sha256="$2"
+            local normalized="$RUNNER_TEMP/jbar-cask-normalized"
+            validate_regular_file "$cask" 65536
+            ruby -c "$cask" >/dev/null
+            test ! -e "$normalized" && test ! -L "$normalized"
+            awk -v version="$VERSION" -v sha256="$sha256" '
+              BEGIN { versions = 0; hashes = 0 }
+              $0 == "  version \"" version "\"" {
+                print "  version \"@VERSION@\""; versions += 1; next
+              }
+              $0 == "  sha256 \"" sha256 "\"" {
+                print "  sha256 \"@SHA256@\""; hashes += 1; next
+              }
+              { print }
+              END { if (versions != 1 || hashes != 1) exit 2 }
+            ' "$cask" > "$normalized"
+            test "$(shasum -a 256 "$normalized" | awk '{print $1}')" = \
+              "$CASK_TEMPLATE_SHA256"
+            rm -f -- "$normalized"
+          }
+
+          artifacts="$RUNNER_TEMP/jbar-artifacts"
+          zip="$artifacts/JBar-${VERSION}-universal.zip"
+          checksum="$zip.sha256"
+          cask="$artifacts/jbar.rb"
+          test "$(find "$artifacts" -mindepth 1 -maxdepth 1 -print | wc -l | tr -d ' ')" = "3"
+          validate_regular_file "$zip" 104857600
+          validate_regular_file "$checksum" 256
+          validate_regular_file "$cask" 65536
+          test "$(wc -l < "$checksum" | tr -d ' ')" = "1"
+          test "$(awk '{print $2}' "$checksum")" = "JBar-${VERSION}-universal.zip"
+          expected_sha="$(awk '{print $1}' "$checksum")"
+          [[ "$expected_sha" =~ ^[0-9a-f]{64}$ ]]
+          test "$(shasum -a 256 "$zip" | awk '{print $1}')" = "$expected_sha"
+          validate_cask "$cask" "$expected_sha"
+          validate_archive_entry_topology "$zip" "$RUNNER_TEMP/jbar-fresh.entries"
+
+          extracted="$RUNNER_TEMP/jbar-signed-verify"
+          test ! -e "$extracted" && test ! -L "$extracted"
+          mkdir -m 0700 "$extracted"
+          ditto -x -k --rsrc --extattr --qtn --noacl "$zip" "$extracted"
+          top_count="$(find "$extracted" -mindepth 1 -maxdepth 1 -print | wc -l | tr -d ' ')" || exit 1
+          test "$top_count" = "1"
+          app="$extracted/JBar.app"
+          binary="$app/Contents/MacOS/JBar"
+          validate_bundle_structure "$app"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          signature_details="$(codesign -d --verbose=4 "$app" 2>&1)"
+          actual_team_id="$(awk -F= '$1 == "TeamIdentifier" { print $2; exit }' \
+            <<< "$signature_details")"
+          [[ "$actual_team_id" =~ ^[A-Z0-9]{10}$ ]]
+          actual_team_id_sha256="$(printf '%s' "$actual_team_id" | shasum -a 256 | awk '{print $1}')"
+          test "$actual_team_id_sha256" = "$EXPECTED_TEAM_ID_SHA256"
+          requirement="anchor apple generic and identifier \"com.linji.jbar\" and certificate leaf[subject.OU] = \"$actual_team_id\" and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists"
+          codesign --verify --deep --strict -R="$requirement" "$app"
+          xcrun stapler validate "$app"
+          syspolicy_check distribution "$app"
+          spctl --assess --type execute --verbose=4 "$app"
+          test "$("$binary" --version)" = "JBar $VERSION"
+          "$binary" --help | grep -F 'keyboard-first launcher'
+
+  publish:
+    name: Publish the verified versioned assets
+    needs:
+      - candidate
+      - sign_and_notarize
+      - verify_signed
+    if: github.repository == 'linjiw/jbar'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: write
+    env:
+      EXPECTED_COMMIT: ${{ needs.candidate.outputs.commit }}
+      IMMUTABLE_RELEASES_ATTESTED: ${{ needs.sign_and_notarize.outputs.immutable_releases_attested }}
+      RELEASE_TAG: ${{ needs.candidate.outputs.tag }}
+      VERSION: ${{ needs.candidate.outputs.version }}
+    steps:
+      # This job has the only contents:write token. It does not check out the tag, execute JBar,
+      # parse a repository script, or receive any Apple credential.
+      - name: Download the signed release assets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: JBar-signed-release
+          path: ${{ runner.temp }}/jbar-artifacts
+
+      - name: Verify asset set and archive checksum without executing it
+        run: |
+          set -euo pipefail
+          umask 077
+          find_must_be_empty() {
+            local match
+            match="$(find "$@")" || return 1
+            test -z "$match"
+          }
+          validate_regular_file() {
+            local path="$1"
+            local maximum_bytes="$2"
+            test -f "$path" && test ! -L "$path"
+            test "$(stat -c '%u' "$path")" = "$(id -u)"
+            test "$(stat -c '%a' "$path")" = "644"
+            test "$(stat -c '%h' "$path")" = "1"
+            local bytes
+            bytes="$(stat -c '%s' "$path")"
+            test "$bytes" -gt 0 && test "$bytes" -le "$maximum_bytes"
+          }
+          validate_cask() {
+            local cask="$1"
+            local sha256="$2"
+            local normalized="$RUNNER_TEMP/jbar-cask-normalized"
+            validate_regular_file "$cask" 65536
+            ruby -c "$cask" >/dev/null
+            test ! -e "$normalized" && test ! -L "$normalized"
+            awk -v version="$VERSION" -v sha256="$sha256" '
+              BEGIN { versions = 0; hashes = 0 }
+              $0 == "  version \"" version "\"" {
+                print "  version \"@VERSION@\""; versions += 1; next
+              }
+              $0 == "  sha256 \"" sha256 "\"" {
+                print "  sha256 \"@SHA256@\""; hashes += 1; next
+              }
+              { print }
+              END { if (versions != 1 || hashes != 1) exit 2 }
+            ' "$cask" > "$normalized"
+            test "$(sha256sum "$normalized" | awk '{print $1}')" = "$CASK_TEMPLATE_SHA256"
+            rm -f -- "$normalized"
+          }
+
+          artifacts="$RUNNER_TEMP/jbar-artifacts"
+          zip="$artifacts/JBar-${VERSION}-universal.zip"
+          checksum="$zip.sha256"
+          cask="$artifacts/jbar.rb"
+          top_count="$(find "$artifacts" -mindepth 1 -maxdepth 1 -print | wc -l | tr -d ' ')" || exit 1
+          test "$top_count" = "3"
+          find_must_be_empty "$artifacts" ! -type d ! -type f -print -quit
+          validate_regular_file "$zip" 104857600
+          validate_regular_file "$checksum" 256
+          validate_regular_file "$cask" 65536
+          test "$(wc -l < "$checksum" | tr -d ' ')" = "1"
+          test "$(awk '{print $2}' "$checksum")" = "JBar-${VERSION}-universal.zip"
+          expected_sha="$(awk '{print $1}' "$checksum")"
+          [[ "$expected_sha" =~ ^[0-9a-f]{64}$ ]]
+          test "$(sha256sum "$zip" | awk '{print $1}')" = "$expected_sha"
+          validate_cask "$cask" "$expected_sha"
+
+      - name: Re-resolve the protected tag and publish the versioned assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          test "$IMMUTABLE_RELEASES_ATTESTED" = "true"
+          object_type="$(gh api "repos/$GH_REPO/git/ref/tags/$RELEASE_TAG" --jq '.object.type')"
+          object_sha="$(gh api "repos/$GH_REPO/git/ref/tags/$RELEASE_TAG" --jq '.object.sha')"
+          for _ in 1 2 3 4 5; do
+            if [ "$object_type" = "commit" ]; then break; fi
+            test "$object_type" = "tag"
+            tag_object="$(gh api "repos/$GH_REPO/git/tags/$object_sha")"
+            object_type="$(jq -r '.object.type' <<< "$tag_object")"
+            object_sha="$(jq -r '.object.sha' <<< "$tag_object")"
+          done
+          test "$object_type" = "commit"
+          test "$object_sha" = "$EXPECTED_COMMIT"
+          gh release create "$RELEASE_TAG" \
+            "$RUNNER_TEMP/jbar-artifacts/JBar-${VERSION}-universal.zip" \
+            "$RUNNER_TEMP/jbar-artifacts/JBar-${VERSION}-universal.zip.sha256" \
+            "$RUNNER_TEMP/jbar-artifacts/jbar.rb" \
+            --verify-tag --generate-notes --title "JBar $VERSION"
+
+          release_json="$(gh release view "$RELEASE_TAG" --json tagName,isDraft,isImmutable,assets)"
+          jq -e --arg tag "$RELEASE_TAG" --arg zip "JBar-${VERSION}-universal.zip" '
+            .tagName == $tag and
+            .isDraft == false and
+            .isImmutable == true and
+            ([.assets[].name] | sort) == ([$zip, ($zip + ".sha256"), "jbar.rb"] | sort)
+          ' <<< "$release_json" >/dev/null

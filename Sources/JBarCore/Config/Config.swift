@@ -27,12 +27,31 @@ public struct Config: Codable, Equatable, Sendable {
     public init() {}
     public static let `default` = Config()
 
+    /// A precise validation failure suitable for the menu-bar config warning and CLI diagnostics.
+    public struct ValidationError: Error, LocalizedError, Equatable, Sendable {
+        public let key: String
+        public let value: String
+        public let requirement: String
+
+        public init(key: String, value: String, requirement: String) {
+            self.key = key
+            self.value = value
+            self.requirement = requirement
+        }
+
+        public var errorDescription: String? {
+            "invalid value for '\(key)': \(value); expected \(requirement)"
+        }
+    }
+
     /// ~/.config/jbar/config.json (honours $XDG_CONFIG_HOME).
     public static func defaultURL() -> URL {
         let env = ProcessInfo.processInfo.environment
         // Per the XDG Base Directory spec, an empty or relative XDG_CONFIG_HOME is treated as unset
         // (an empty/relative value would otherwise resolve against the process cwd — "/" for a GUI app).
-        let base = env["XDG_CONFIG_HOME"].flatMap { $0.hasPrefix("/") ? URL(fileURLWithPath: $0) : nil }
+        let base = env["XDG_CONFIG_HOME"].flatMap {
+            SafetyLimits.isSafeAbsolutePath($0) ? URL(fileURLWithPath: $0) : nil
+        }
             ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".config")
         return base.appendingPathComponent("jbar", isDirectory: true).appendingPathComponent("config.json")
     }
@@ -41,6 +60,14 @@ public struct Config: Codable, Equatable, Sendable {
         case loaded(Config)
         case created(Config)          // file was missing; defaults written
         case invalid(String)          // parse error message; caller keeps last-good
+    }
+
+    /// Non-mutating load result for diagnostics and benchmarks. Unlike `LoadResult`, a missing file
+    /// is represented explicitly and never causes the default config to be written.
+    public enum ReadOnlyLoadResult: Sendable, Equatable {
+        case loaded(Config)
+        case missing
+        case invalid(String)
     }
 
     // MARK: - Codable (every key optional so partial / unknown JSON works)
@@ -67,10 +94,10 @@ public struct Config: Codable, Equatable, Sendable {
         // to, so reinterpret it: the old value becomes the visible height, and the pool takes the new
         // default (never smaller than what the user asked to see).
         if !c.contains(.visibleRows), let legacy = legacyMaxResults {
-            visibleRows = legacy
+            visibleRows = min(max(legacy, SafetyLimits.visibleRows.lowerBound), SafetyLimits.visibleRows.upperBound)
             maxResults = max(d.maxResults, legacy)
         }
-        appsFirstCap = try c.decodeIfPresent(Int.self, forKey: .appsFirstCap) ?? d.appsFirstCap
+        appsFirstCap = try c.decodeIfPresent(Int.self, forKey: .appsFirstCap) ?? min(d.appsFirstCap, maxResults)
         screen = try c.decodeIfPresent(String.self, forKey: .screen) ?? d.screen
         restoreQueryOnReopen = try c.decodeIfPresent(Bool.self, forKey: .restoreQueryOnReopen) ?? d.restoreQueryOnReopen
         showRecentsOnEmpty = try c.decodeIfPresent(Bool.self, forKey: .showRecentsOnEmpty) ?? d.showRecentsOnEmpty
@@ -82,10 +109,19 @@ public struct Config: Codable, Equatable, Sendable {
         includeHidden = try c.decodeIfPresent(Bool.self, forKey: .includeHidden) ?? d.includeHidden
         maxDepth = try c.decodeIfPresent(Int.self, forKey: .maxDepth) ?? d.maxDepth
         maxIndexedItems = try c.decodeIfPresent(Int.self, forKey: .maxIndexedItems) ?? d.maxIndexedItems
+        if !c.contains(.visibleRows), let legacy = legacyMaxResults, legacy < SafetyLimits.maxResults.lowerBound {
+            throw ValidationError(key: "maxResults", value: String(legacy),
+                                  requirement: "a positive legacy row count")
+        }
+        try validate()
     }
 
     /// Encode every key (so the written file documents all options). Paths are written exactly as stored (`~` kept).
     public func encode(to encoder: Encoder) throws {
+        // `Config` is publicly Encodable, so protect callers that bypass `jsonData()` too. Validation
+        // uses only bounded linear scans and rejects an oversized aggregate before JSONEncoder builds
+        // a potentially much larger escaped Data value.
+        try validate()
         var c = encoder.container(keyedBy: CodingKeys.self)
         try c.encode(hotkey, forKey: .hotkey)
         try c.encode(launchAtLogin, forKey: .launchAtLogin)
@@ -116,12 +152,107 @@ public struct Config: Codable, Equatable, Sendable {
 
     /// Pretty JSON bytes of this config (what `save` writes).
     public func jsonData() throws -> Data {
-        try Config.makeEncoder().encode(self)
+        try validate()
+        let data = try Config.makeEncoder().encode(self)
+        guard data.count <= SafetyLimits.maxConfigFileBytes else {
+            throw ValidationError(key: "configFile", value: "\(data.count) bytes",
+                                  requirement: "at most \(SafetyLimits.maxConfigFileBytes) bytes after encoding")
+        }
+        return data
     }
 
     /// Parse JSON bytes. Throws a `DecodingError` / `CocoaError` with a human-readable description on invalid input.
     public static func decode(_ data: Data) throws -> Config {
-        try JSONDecoder().decode(Config.self, from: data)
+        guard data.count <= SafetyLimits.maxConfigFileBytes else {
+            throw ValidationError(key: "configFile", value: "\(data.count) bytes",
+                                  requirement: "at most \(SafetyLimits.maxConfigFileBytes) bytes")
+        }
+        return try JSONDecoder().decode(Config.self, from: data)
+    }
+
+    /// Validate every setting that can drive allocation, traversal, or UI geometry.
+    /// Decoding and saving both use this single policy; hot reload therefore reports an error and keeps
+    /// the last-known-good config instead of applying a partially clamped configuration.
+    public func validate() throws {
+        var estimatedJSONBytes = 4_096 // keys, numbers, booleans, indentation, and structural slack
+        func require(_ condition: @autoclosure () -> Bool, key: String, value: String, expected: String) throws {
+            guard condition() else { throw ValidationError(key: key, value: value, requirement: expected) }
+        }
+        func accountJSONString(_ value: String, key: String) throws {
+            // Keep ordinary ASCII configurations close to their actual encoded size while still
+            // costing controls and Unicode at their longest legal JSON escape. Thirty-two bytes
+            // covers quotes, comma, indentation, and array structure per value.
+            let escaped = SafetyLimits.jsonEscapedStringByteUpperBound(value)
+            let (withOverhead, addOverflow) = escaped.addingReportingOverflow(32)
+            let (next, totalOverflow) = estimatedJSONBytes.addingReportingOverflow(withOverhead)
+            guard !addOverflow, !totalOverflow,
+                  next <= SafetyLimits.maxConfigFileBytes else {
+                throw ValidationError(key: "configFile", value: "aggregate text is too large (at \(key))",
+                                      requirement: "a JSON encoding no larger than \(SafetyLimits.maxConfigFileBytes) bytes")
+            }
+            estimatedJSONBytes = next
+        }
+        func requireRange(_ value: Int, _ range: ClosedRange<Int>, key: String) throws {
+            try require(range.contains(value), key: key, value: String(value),
+                        expected: "an integer in \(range.lowerBound)...\(range.upperBound)")
+        }
+        func requireArray(_ values: [String], key: String, maxCount: Int, maxBytes: Int,
+                          kind: String, absoluteOrTildePath: Bool = false) throws {
+            try require(values.count <= maxCount, key: key, value: "\(values.count) entries",
+                        expected: "at most \(maxCount) entries")
+            for (index, value) in values.enumerated() {
+                guard SafetyLimits.utf8Fits(value, maxBytes: maxBytes) else {
+                    throw ValidationError(key: "\(key)[\(index)]", value: "more than \(maxBytes) UTF-8 bytes",
+                                          requirement: "a \(kind) no longer than \(maxBytes) UTF-8 bytes")
+                }
+                try require(!SafetyLimits.containsNULByte(value), key: "\(key)[\(index)]", value: "contains NUL",
+                            expected: "a \(kind) without U+0000")
+                try accountJSONString(value, key: "\(key)[\(index)]")
+                if absoluteOrTildePath {
+                    let validPath = SafetyLimits.isSafeAbsoluteOrTildePath(value)
+                    try require(validPath, key: "\(key)[\(index)]", value: value,
+                                expected: "an absolute path or a path beginning with ~/ (wildcards allowed)")
+                }
+            }
+        }
+
+        try requireRange(maxResults, SafetyLimits.maxResults, key: "maxResults")
+        try requireRange(visibleRows, SafetyLimits.visibleRows, key: "visibleRows")
+        try require(visibleRows <= maxResults,
+                    key: "visibleRows", value: String(visibleRows),
+                    expected: "an integer no greater than maxResults (\(maxResults))")
+        try require(appsFirstCap >= 0 && appsFirstCap <= maxResults,
+                    key: "appsFirstCap", value: String(appsFirstCap),
+                    expected: "an integer in 0...maxResults (\(maxResults))")
+        try requireRange(maxDepth, SafetyLimits.maxDepth, key: "maxDepth")
+        try requireRange(maxIndexedItems, SafetyLimits.maxIndexedItems, key: "maxIndexedItems")
+
+        try require(SafetyLimits.utf8Fits(hotkey, maxBytes: SafetyLimits.maxHotkeyUTF8Bytes),
+                    key: "hotkey", value: "more than \(SafetyLimits.maxHotkeyUTF8Bytes) UTF-8 bytes",
+                    expected: "at most \(SafetyLimits.maxHotkeyUTF8Bytes) UTF-8 bytes")
+        try require(!SafetyLimits.containsNULByte(hotkey), key: "hotkey", value: "contains NUL",
+                    expected: "text without U+0000")
+        try accountJSONString(hotkey, key: "hotkey")
+        // Invalid hotkey syntax deliberately remains a recoverable runtime condition: CarbonHotkey
+        // falls back to Ctrl+Option+Space and presents a warning. Unknown screen values likewise keep
+        // the established "mouse" fallback. Bound their sizes without changing those product semantics.
+        try require(SafetyLimits.utf8Fits(screen, maxBytes: SafetyLimits.maxSettingUTF8Bytes),
+                    key: "screen", value: "more than \(SafetyLimits.maxSettingUTF8Bytes) UTF-8 bytes",
+                    expected: "at most \(SafetyLimits.maxSettingUTF8Bytes) UTF-8 bytes")
+        try require(!SafetyLimits.containsNULByte(screen), key: "screen", value: "contains NUL",
+                    expected: "text without U+0000")
+        try accountJSONString(screen, key: "screen")
+
+        try requireArray(appDirectories, key: "appDirectories", maxCount: SafetyLimits.maxRootEntries,
+                         maxBytes: SafetyLimits.maxPathUTF8Bytes, kind: "path", absoluteOrTildePath: true)
+        try requireArray(fileRoots, key: "fileRoots", maxCount: SafetyLimits.maxRootEntries,
+                         maxBytes: SafetyLimits.maxPathUTF8Bytes, kind: "path", absoluteOrTildePath: true)
+        try requireArray(excludePaths, key: "excludePaths", maxCount: SafetyLimits.maxExcludedPathEntries,
+                         maxBytes: SafetyLimits.maxPathUTF8Bytes, kind: "path", absoluteOrTildePath: true)
+        try requireArray(excludeNames, key: "excludeNames", maxCount: SafetyLimits.maxNameEntries,
+                         maxBytes: SafetyLimits.maxNameUTF8Bytes, kind: "name")
+        try requireArray(downrankNames, key: "downrankNames", maxCount: SafetyLimits.maxNameEntries,
+                         maxBytes: SafetyLimits.maxNameUTF8Bytes, kind: "name")
     }
 
     /// Load from `url`; if missing, write defaults (pretty JSON, sorted keys) and return `.created`.
@@ -131,24 +262,37 @@ public struct Config: Codable, Equatable, Sendable {
     /// - unreadable file or invalid / mistyped JSON → `.invalid(message)` (message includes the decoding error)
     /// - otherwise `.loaded(config)`; unknown keys ignored, missing keys defaulted.
     public static func load(from url: URL = defaultURL()) -> LoadResult {
-        let path = url.path
-        var isDir: ObjCBool = false
-        if !FileManager.default.fileExists(atPath: path, isDirectory: &isDir) {
+        switch loadReadOnly(from: url) {
+        case .loaded(let config):
+            return .loaded(config)
+        case .invalid(let message):
+            return .invalid(message)
+        case .missing:
             do {
                 try Config.default.save(to: url)
                 return .created(.default)
             } catch {
-                return .invalid("Could not write default config to \(path): \(error.localizedDescription)")
+                return .invalid("Could not write default config to \(url.path): \(error.localizedDescription)")
             }
         }
-        if isDir.boolValue {
-            return .invalid("Config path \(path) is a directory, not a file")
-        }
-        let data: Data
+    }
+
+    /// Load without creating or changing any file. The same descriptor-based, bounded, no-symlink
+    /// reader as normal config loading is used, so read-only tooling cannot block on a FIFO or follow
+    /// a replaced symbolic link.
+    public static func loadReadOnly(from url: URL = defaultURL()) -> ReadOnlyLoadResult {
+        let path = url.path
+        let data: Data?
         do {
-            data = try Data(contentsOf: url)
+            data = try SecureFileIO.readRegularFile(at: url, maxBytes: SafetyLimits.maxConfigFileBytes)
         } catch {
-            return .invalid("Could not read \(path): \(error.localizedDescription)")
+            if (error as? SecureFileIO.Failure) == .notRegularFile {
+                return .invalid("Config path \(path) is not a regular file (directory or symbolic link)")
+            }
+            return .invalid("Could not read config \(path): \(describe(error))")
+        }
+        guard let data else {
+            return .missing
         }
         do {
             return .loaded(try decode(data))
@@ -159,6 +303,9 @@ public struct Config: Codable, Equatable, Sendable {
 
     /// Human-readable description of a JSON decoding error (key path + reason where available).
     static func describe(_ error: Error) -> String {
+        if let validation = error as? ValidationError {
+            return validation.errorDescription ?? "invalid configuration"
+        }
         guard let decodingError = error as? DecodingError else {
             // JSONDecoder wraps JSONSerialization syntax errors in DecodingError.dataCorrupted, but be safe.
             let ns = error as NSError
@@ -190,9 +337,11 @@ public struct Config: Codable, Equatable, Sendable {
 
     /// Write pretty JSON atomically (creates parent dirs).
     public func save(to url: URL = defaultURL()) throws {
-        let dir = url.deletingLastPathComponent()
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        try jsonData().write(to: url, options: .atomic)
+        let data = try jsonData()
+        let ownsDirectory = url.standardizedFileURL.deletingLastPathComponent()
+            == Config.defaultURL().standardizedFileURL.deletingLastPathComponent()
+        try SecureFileIO.writeAtomicallyOwnerOnly(data, to: url,
+                                                  enforcePrivateDirectory: ownsDirectory)
     }
 
     // MARK: - Derived objects
@@ -200,11 +349,7 @@ public struct Config: Codable, Equatable, Sendable {
     /// Expand a leading `~` to `home` (`~` → home, `~/x` → home/x); other paths are returned unchanged.
     /// A trailing `/` is dropped (except for `/` itself) so comparisons are canonical.
     public static func expandTilde(_ path: String, home: String) -> String {
-        var p = path
-        if p == "~" { p = home }
-        else if p.hasPrefix("~/") { p = home + p.dropFirst(1) }
-        while p.count > 1 && p.hasSuffix("/") { p.removeLast() }
-        return p
+        Exclusions.expandTilde(path, home: home)
     }
 
     /// Build `Exclusions` from this config (lowercased names, `~` expanded).
@@ -213,7 +358,7 @@ public struct Config: Codable, Equatable, Sendable {
                    excludePaths: excludePaths.map { Config.expandTilde($0, home: home) },
                    downrankNames: Set(downrankNames.map { $0.lowercased() }),
                    includeHidden: includeHidden,
-                   maxDepth: maxDepth)
+                   maxDepth: min(max(maxDepth, SafetyLimits.maxDepth.lowerBound), SafetyLimits.maxDepth.upperBound))
     }
 
     /// `IndexCoordinator.Options` derived from this config. App/file roots are passed as written (`~` is expanded by the
@@ -223,7 +368,7 @@ public struct Config: Codable, Equatable, Sendable {
         o.home = home
         o.appRoots = appDirectories
         o.fileRoots = fileRoots
-        o.maxItems = maxIndexedItems
+        o.maxItems = min(max(maxIndexedItems, SafetyLimits.maxIndexedItems.lowerBound), SafetyLimits.maxIndexedItems.upperBound)
         return o
     }
 
@@ -277,6 +422,8 @@ public struct Config: Codable, Equatable, Sendable {
     }
 
     /// Parse `hotkey` ("option+space", "cmd+shift+k", "ctrl+option+space") into Carbon modifiers + virtual key code.
+    /// Key tokens name fixed US-ANSI physical key positions, not the character produced by the active
+    /// keyboard layout. The binding therefore remains stable when the user switches input sources.
     /// Returns nil for unknown keys/modifiers. Modifier names: cmd|command, ctrl|control, option|alt, shift. Keys: space, a–z, 0–9,
     /// f1–f19, return, tab, escape, `-`, `=`, `[`, `]`, `;`, `'`, `,`, `.`, `/`, `` ` ``, `\`.
     /// Tokens are case-insensitive and may be padded with spaces. Exactly one key and at least one modifier are required.
@@ -332,29 +479,39 @@ public struct Config: Codable, Equatable, Sendable {
 /// file → defaults are re-created and `onChange(default)`, invalid JSON → `onError(message)` (the caller keeps its
 /// last-good config). If the file was deleted or replaced the file source is re-armed on a fresh descriptor.
 /// `start()`/`stop()` are idempotent and thread-safe; descriptors are closed in the sources' cancel handlers.
-public final class ConfigWatcher {
+///
+/// Concurrency invariant: `workQueue` owns every mutable field (sources, pending work, lifecycle
+/// generation, and `started`). `sync` is the only cross-thread entry and uses a per-instance queue
+/// key, so two watchers cannot accidentally treat each other's queue as their own. Callback closures
+/// are `@Sendable`, serialized on `callbackQueue`, and re-check the lifecycle generation while
+/// synchronized with `stop()`. This queue confinement is the narrow basis for `@unchecked Sendable`.
+public final class ConfigWatcher: @unchecked Sendable {
     public let url: URL
     /// Debounce interval between the last file-system event and the reload.
     public static let debounce: DispatchTimeInterval = .milliseconds(300)
 
-    private let queue: DispatchQueue
-    private let onChange: (Config) -> Void
-    private let onError: (String) -> Void
+    private let callbackQueue: DispatchQueue
+    private let onChange: @Sendable (Config) -> Void
+    private let onError: @Sendable (String) -> Void
     /// Serial queue owning all mutable state below (sources, pending reload, started flag).
     private let workQueue = DispatchQueue(label: "com.linji.jbar.configwatcher", qos: .utility)
-    private static let workQueueKey = DispatchSpecificKey<Void>()
+    private let workQueueKey = DispatchSpecificKey<Void>()
     private var fileSource: DispatchSourceFileSystemObject?
     private var dirSource: DispatchSourceFileSystemObject?
     private var pendingReload: DispatchWorkItem?
     private var started = false
+    private var generation: UInt64 = 0
 
     /// Called on `queue` with each successful reload (debounced ~300 ms); invalid JSON → `onError(message)`.
-    public init(url: URL = Config.defaultURL(), queue: DispatchQueue = .main, onChange: @escaping (Config) -> Void, onError: @escaping (String) -> Void) {
+    public init(url: URL = Config.defaultURL(), queue: DispatchQueue = .main,
+                onChange: @escaping @Sendable (Config) -> Void,
+                onError: @escaping @Sendable (String) -> Void) {
         self.url = url
-        self.queue = queue
+        // Even if callers provide a concurrent target, configuration callbacks never overlap.
+        self.callbackQueue = DispatchQueue(label: "com.linji.jbar.configwatcher.callbacks", target: queue)
         self.onChange = onChange
         self.onError = onError
-        workQueue.setSpecific(key: ConfigWatcher.workQueueKey, value: ())
+        workQueue.setSpecific(key: workQueueKey, value: ())
     }
 
     deinit {
@@ -364,7 +521,7 @@ public final class ConfigWatcher {
 
     /// Run `body` on the work queue synchronously (inline if already there, to avoid self-deadlock).
     private func sync(_ body: () -> Void) {
-        if DispatchQueue.getSpecific(key: ConfigWatcher.workQueueKey) != nil { body() } else { workQueue.sync(execute: body) }
+        if DispatchQueue.getSpecific(key: workQueueKey) != nil { body() } else { workQueue.sync(execute: body) }
     }
 
     /// Begin watching. Idempotent. If the parent directory does not exist it is created (so the first save can be
@@ -372,11 +529,13 @@ public final class ConfigWatcher {
     public func start() {
         sync {
             guard !started else { return }
+            generation &+= 1
+            let attemptGeneration = generation
             let dir = url.deletingLastPathComponent()
             try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-            guard let ds = makeSource(path: dir.path, events: ConfigWatcher.dirEvents, isFile: false) else {
+            guard let ds = makeSource(path: dir.path, events: ConfigWatcher.dirEvents(), isFile: false) else {
                 let msg = "Cannot watch config directory \(dir.path): \(String(cString: strerror(errno)))"
-                queue.async { [onError] in onError(msg) }
+                deliver(generation: attemptGeneration, whenStarted: false) { [onError] in onError(msg) }
                 return
             }
             started = true
@@ -388,6 +547,8 @@ public final class ConfigWatcher {
     /// Stop watching and drop any pending reload. Idempotent.
     public func stop() {
         sync {
+            // Also invalidates an asynchronous error from a failed start attempt.
+            generation &+= 1
             guard started else { return }
             started = false
             pendingReload?.cancel()
@@ -413,15 +574,15 @@ public final class ConfigWatcher {
     }
 
     /// Events watched on the config file itself.
-    static let fileEvents: DispatchSource.FileSystemEvent = [.write, .delete, .rename, .extend, .attrib]
+    private static func fileEvents() -> DispatchSource.FileSystemEvent { [.write, .delete, .rename, .extend, .attrib] }
     /// Events watched on the parent directory (`.write` = entries added/removed/renamed; delete/rename = the directory
     /// itself went away, e.g. `rm -rf ~/.config/jbar`, after which it is re-created and re-armed).
-    static let dirEvents: DispatchSource.FileSystemEvent = [.write, .delete, .rename]
+    private static func dirEvents() -> DispatchSource.FileSystemEvent { [.write, .delete, .rename] }
 
     /// (Re)open the file source if the file exists and we are not already watching a live descriptor.
     private func armFileSource() {
         guard started, fileSource == nil else { return }
-        fileSource = makeSource(path: url.path, events: ConfigWatcher.fileEvents, isFile: true)
+        fileSource = makeSource(path: url.path, events: ConfigWatcher.fileEvents(), isFile: true)
     }
 
     /// (Re)open the directory source after the directory was deleted/renamed (re-created by `Config.load`).
@@ -429,7 +590,7 @@ public final class ConfigWatcher {
         guard started, dirSource == nil else { return }
         let dir = url.deletingLastPathComponent()
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        dirSource = makeSource(path: dir.path, events: ConfigWatcher.dirEvents, isFile: false)
+        dirSource = makeSource(path: dir.path, events: ConfigWatcher.dirEvents(), isFile: false)
     }
 
     /// Handle one source event on `workQueue`: drop a source whose inode went away (delete/rename) and debounce a reload.
@@ -453,14 +614,29 @@ public final class ConfigWatcher {
     private func reload() {
         guard started else { return }
         pendingReload = nil
+        let expectedGeneration = generation
         let result = Config.load(from: url)
         armDirSource()
         armFileSource()
         switch result {
         case .loaded(let c), .created(let c):
-            queue.async { [onChange] in onChange(c) }
+            deliver(generation: expectedGeneration, whenStarted: true) { [onChange] in onChange(c) }
         case .invalid(let message):
-            queue.async { [onError] in onError(message) }
+            deliver(generation: expectedGeneration, whenStarted: true) { [onError] in onError(message) }
+        }
+    }
+
+    /// Enqueue one callback in order, but suppress it if `stop()` completed or the watcher restarted
+    /// before delivery. The callback runs while synchronized with lifecycle changes, so once `stop()`
+    /// returns no callback from the stopped generation can still begin or remain in flight.
+    private func deliver(generation expectedGeneration: UInt64, whenStarted expectedStarted: Bool,
+                         body: @escaping @Sendable () -> Void) {
+        callbackQueue.async { [weak self] in
+            guard let self else { return }
+            self.sync {
+                guard self.started == expectedStarted, self.generation == expectedGeneration else { return }
+                body()
+            }
         }
     }
 }

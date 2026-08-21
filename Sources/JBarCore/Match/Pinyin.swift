@@ -180,25 +180,59 @@ public enum Pinyin {
 
     // MARK: - ICU transliteration (cached)
 
-    private static let cacheLock = NSLock()
-    private static var runCache: [String: [String]] = [:]
     /// Upper bound on cached runs; the cache is simply cleared when it fills (no LRU bookkeeping).
     static let runCacheLimit = 8192
+
+    /// Mutable cache state lives behind one lock and is exposed through value-copying operations only.
+    /// `@unchecked Sendable` is limited to this synchronization primitive: every access to `values`
+    /// (including test diagnostics) holds `lock`, and the stored key/value types are value-semantic.
+    private final class RunCache: @unchecked Sendable {
+        private let lock = NSLock()
+        private var values: [String: [String]] = [:]
+        private let limit: Int
+
+        init(limit: Int) { self.limit = limit }
+
+        func value(for key: String) -> [String]? {
+            lock.lock()
+            defer { lock.unlock() }
+            return values[key]
+        }
+
+        func insert(_ value: [String], for key: String) {
+            lock.lock()
+            defer { lock.unlock() }
+            // Another worker may have filled the same miss while ICU was running. Keep that value
+            // and, importantly, do not evict a full cache merely to overwrite an existing key.
+            guard values[key] == nil else { return }
+            if values.count >= limit { values.removeAll(keepingCapacity: true) }
+            values[key] = value
+        }
+
+        var count: Int {
+            lock.lock()
+            defer { lock.unlock() }
+            return values.count
+        }
+
+        func removeAll() {
+            lock.lock()
+            defer { lock.unlock() }
+            values.removeAll()
+        }
+    }
+
+    private static let runCache = RunCache(limit: runCacheLimit)
 
     /// Space-separated pinyin syllables of a pure-CJK run via `mandarinToLatin` + `stripDiacritics`.
     /// Falls back to the characters themselves if the transform is unavailable.
     static func transliterate(_ chars: [Unicode.Scalar]) -> [String] {
         var key = String()
         key.unicodeScalars.append(contentsOf: chars)
-        cacheLock.lock()
-        let hit = runCache[key]
-        cacheLock.unlock()
+        let hit = runCache.value(for: key)
         if let hit { return hit }
         let result = icuSyllables(of: key) ?? chars.map { String($0) }
-        cacheLock.lock()
-        if runCache.count >= runCacheLimit { runCache.removeAll(keepingCapacity: true) }
-        runCache[key] = result
-        cacheLock.unlock()
+        runCache.insert(result, for: key)
         return result
     }
 
@@ -210,10 +244,10 @@ public enum Pinyin {
     }
 
     /// Number of cached runs (for tests).
-    static var cachedRunCount: Int { cacheLock.lock(); defer { cacheLock.unlock() }; return runCache.count }
+    static var cachedRunCount: Int { runCache.count }
 
     /// Drop all cached runs (for tests).
-    static func clearCache() { cacheLock.lock(); runCache.removeAll(); cacheLock.unlock() }
+    static func clearCache() { runCache.removeAll() }
 
     // MARK: - Variant expansion
 
