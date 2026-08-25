@@ -53,22 +53,18 @@ done
 
 case "$VERSION_REQUEST" in
   latest)
-    latest_url="$(curl --fail --silent --show-error --location \
+    releases_json="$(curl --fail --silent --show-error --location \
       --proto '=https' --tlsv1.2 --retry 3 --retry-delay 1 \
-      --output /dev/null --write-out '%{url_effective}' \
-      "https://github.com/$REPOSITORY/releases/latest")" || {
-      echo "error: could not resolve the latest GitHub release" >&2
+      --max-filesize 1048576 \
+      "https://api.github.com/repos/$REPOSITORY/releases?per_page=1")" || {
+      echo "error: could not list published GitHub releases" >&2
       exit 1
     }
-    case "$latest_url" in
-      "https://github.com/$REPOSITORY/releases/tag/v"[0-9]*.[0-9]*.[0-9]*)
-        tag="${latest_url##*/}"
-        ;;
-      *)
-        echo "error: GitHub did not redirect to a stable vMAJOR.MINOR.PATCH release" >&2
-        exit 1
-        ;;
-    esac
+    tag="$(printf '%s' "$releases_json" | \
+      /usr/bin/plutil -extract 0.tag_name raw - 2>/dev/null)" || {
+      echo "error: GitHub returned no published release tag" >&2
+      exit 1
+    }
     ;;
   v[0-9]*.[0-9]*.[0-9]*) tag="$VERSION_REQUEST" ;;
   [0-9]*.[0-9]*.[0-9]*) tag="v$VERSION_REQUEST" ;;
