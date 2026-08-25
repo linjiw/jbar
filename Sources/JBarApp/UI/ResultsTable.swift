@@ -22,6 +22,12 @@ final class ResultsTableView: NSTableView {
 
     /// Called as the mouse goes DOWN, with the row under the pointer at that instant.
     var onPressRow: ((Int) -> Void)?
+    var onSubmitSelection: (() -> Void)?
+    /// Supplies a contextual menu for a result row. Informational rows return nil.
+    var contextMenuProvider: ((Int) -> NSMenu?)?
+    /// The launcher keeps focus in its query field; the Assistant result window opts into normal
+    /// table focus so arrows and VoiceOver can operate the evidence rows.
+    var permitsKeyboardFocus = false
 
     override func mouseDown(with event: NSEvent) {
         // `super.mouseDown` runs a nested tracking loop that pumps the main run loop until mouse-up, so
@@ -31,7 +37,15 @@ final class ResultsTableView: NSTableView {
         super.mouseDown(with: event)
     }
 
-    override var acceptsFirstResponder: Bool { false }
+    override var acceptsFirstResponder: Bool { permitsKeyboardFocus }
+
+    override func keyDown(with event: NSEvent) {
+        if event.keyCode == 36 || event.keyCode == 76 {
+            onSubmitSelection?()
+            return
+        }
+        super.keyDown(with: event)
+    }
 
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
@@ -51,6 +65,14 @@ final class ResultsTableView: NSTableView {
         let p = convert(event.locationInWindow, from: nil)
         let r = row(at: p)
         if r >= 0 { onHover?(r) }
+    }
+
+    override func menu(for event: NSEvent) -> NSMenu? {
+        let row = row(at: convert(event.locationInWindow, from: nil))
+        guard row >= 0, let menu = contextMenuProvider?(row) else { return nil }
+        selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+        scrollRowToVisible(row)
+        return menu
     }
 }
 
@@ -77,6 +99,12 @@ final class ResultsController: NSObject, NSTableViewDataSource, NSTableViewDeleg
     private var pressed: (index: Int, row: ResultRow)?
     /// Called when the user clicks a result row.
     var onOpen: ((ResultRow) -> Void)?
+    /// Launcher rows retain their fast single-click-open behavior. Evidence lists, such as
+    /// Assistant, opt out so a click only selects and a double-click opens.
+    var opensOnSingleClick = true
+    var onReveal: ((ResultRow) -> Void)?
+    var onCopyPath: ((ResultRow) -> Void)?
+    private var contextRow: ResultRow?
 
     override init() {
         super.init()
@@ -100,11 +128,17 @@ final class ResultsController: NSObject, NSTableViewDataSource, NSTableViewDeleg
         table.delegate = self
         table.target = self
         table.action = #selector(tableClicked(_:))
+        table.doubleAction = #selector(tableDoubleClicked(_:))
         table.onHover = { [weak self] r in self?.hover(r) }
         table.onPressRow = { [weak self] i in
             guard let self else { return }
             pressed = (i >= 0 && i < rows.count) ? rows[i].result.map { (i, $0) } ?? nil : nil
         }
+        table.onSubmitSelection = { [weak self] in
+            guard let self, let row = selectedResult else { return }
+            onOpen?(row)
+        }
+        table.contextMenuProvider = { [weak self] index in self?.contextMenu(for: index) }
 
         scrollView.documentView = table
         scrollView.hasVerticalScroller = true
@@ -242,7 +276,48 @@ final class ResultsController: NSObject, NSTableViewDataSource, NSTableViewDeleg
         // during the nested tracking loop, must not silently open a different item).
         guard let pressed, pressed.index == table.clickedRow else { self.pressed = nil; return }
         self.pressed = nil
-        onOpen?(pressed.row)
+        if opensOnSingleClick { onOpen?(pressed.row) }
+    }
+
+    @objc private func tableDoubleClicked(_ sender: Any?) {
+        let index = table.clickedRow
+        guard index >= 0, index < rows.count, let row = rows[index].result else { return }
+        pressed = nil
+        onOpen?(row)
+    }
+
+    private func contextMenu(for index: Int) -> NSMenu? {
+        guard index >= 0, index < rows.count, let row = rows[index].result,
+              onReveal != nil || onCopyPath != nil || !opensOnSingleClick else { return nil }
+        contextRow = row
+        let menu = NSMenu(title: "File Actions")
+        let open = NSMenuItem(title: "Open", action: #selector(openContextRow(_:)), keyEquivalent: "")
+        open.target = self
+        menu.addItem(open)
+        if onReveal != nil {
+            let reveal = NSMenuItem(title: "Reveal in Finder", action: #selector(revealContextRow(_:)),
+                                    keyEquivalent: "")
+            reveal.target = self
+            menu.addItem(reveal)
+        }
+        if onCopyPath != nil {
+            let copy = NSMenuItem(title: "Copy Path", action: #selector(copyContextRow(_:)), keyEquivalent: "")
+            copy.target = self
+            menu.addItem(copy)
+        }
+        return menu
+    }
+
+    @objc private func openContextRow(_ sender: Any?) {
+        if let contextRow { onOpen?(contextRow) }
+    }
+
+    @objc private func revealContextRow(_ sender: Any?) {
+        if let contextRow { onReveal?(contextRow) }
+    }
+
+    @objc private func copyContextRow(_ sender: Any?) {
+        if let contextRow { onCopyPath?(contextRow) }
     }
 
     // MARK: - NSTableViewDataSource / Delegate
@@ -272,6 +347,7 @@ final class ResultsController: NSObject, NSTableViewDataSource, NSTableViewDeleg
         case .empty(let q): cell.configure(message: "No matches for “\(q)”", symbol: "magnifyingglass")
         case .hint(let text): cell.configure(message: text, symbol: "keyboard")
         case .loading: cell.configure(message: "Loading…", symbol: "hourglass")
+        case .action(let message, let symbol): cell.configure(message: message, symbol: symbol)
         }
         return cell
     }

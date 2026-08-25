@@ -2,255 +2,316 @@
 
 # JBar
 
-**A keyboard-first, local filename launcher for macOS.**
+**Launch locally. Find with intent. Organize by copying.**
+
+A native, keyboard-first macOS launcher built with Swift and AppKit.
 
 [![CI](https://github.com/linjiw/jbar/actions/workflows/ci.yml/badge.svg)](https://github.com/linjiw/jbar/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Platform](https://img.shields.io/badge/platform-macOS%2013%2B-lightgrey.svg)](#requirements)
-[![Swift](https://img.shields.io/badge/Swift-5.9%2B-orange.svg)](https://swift.org)
-[![No dependencies](https://img.shields.io/badge/dependencies-none-brightgreen.svg)](#design)
+[![Platform](https://img.shields.io/badge/macOS-13%2B-lightgrey.svg)](#requirements)
+[![Universal 2](https://img.shields.io/badge/Universal%202-arm64%20%2B%20x86__64-6b7cff.svg)](#install)
 
-[Evidence](docs/COMPARISON.md) · [Design](docs/DESIGN.md) · [Performance program](docs/PERFORMANCE.md) · [Support matrix](docs/SUPPORT.md) · [Privacy](docs/PRIVACY.md) · [Why not Spotlight?](docs/DIAGNOSIS.md) · [UX tests](docs/UX-TESTS.md)
+[Website](https://linjiw.github.io/jbar/) · [Install](#install) · [Features](#three-workflows-one-bar) · [Settings](#settings) · [Privacy](docs/PRIVACY.md) · [Design](docs/ASSISTED-WORKFLOWS-DESIGN.md)
 
-<img src="docs/images/jbar-panel.png" alt="JBar's search panel showing apps grouped above files, with matched characters highlighted" width="820">
+<img src="docs/images/jbar-panel.png" alt="JBar showing applications and files in its native macOS launcher" width="820">
 
 </div>
 
----
+Press **⌥Space**, type, and press **Return**. Ordinary typing searches applications and filenames on
+your Mac without starting AI. Three explicit prefixes unlock assisted workflows only when you submit
+them:
 
-Press **⌥Space**, type, then press **Return**. JBar builds a bounded local index of the configured app and file roots and ranks names for launching. It does not depend on Spotlight for normal search, and it does not search file contents.
+| Input | Workflow | What happens |
+|---|---|---|
+| `safari`, `report pdf` | Local Launcher | JBar searches its local app/file index and opens the selected result. |
+| `?` or `？` | Assistant | Codex converts natural language into a restricted `SearchPlan`; JBar searches locally and shows file results. |
+| `!` or `！` | Copy Organize | JBar finds files across every configured indexed root, asks for a destination, and previews copy/skip actions before Copy is enabled. |
+| `>` or `＞` | Developer Agent | Opens a separate Codex development session rooted in `~/jbar`. |
 
-JBar does not request Accessibility, Input Monitoring, or Full Disk Access. macOS can still show standard Files and Folders consent prompts when a configured root includes protected locations such as Desktop, Documents, or Downloads.
+Typing alone never starts Codex. `?`, `!`, and `>` require an explicit **Return**.
 
-> **Release status:** JBar is currently an ad-hoc-signed developer preview available through GitHub Releases and npm. The intended contract is macOS 13+, Apple Silicon and Intel from one Universal 2 app, with any system language/input source and an English v1 interface. Automated regressions exist, but the required physical Mac/input-method matrix and a Developer ID notarized release are still pending. See [SUPPORT.md](docs/SUPPORT.md).
-
-## Why
-
-A Spotlight failure on the original development machine motivated JBar: after an unclean shutdown, ordinary Downloads files were absent from Spotlight results while its system-wide content index rebuilt. The full machine-specific investigation is in [DIAGNOSIS.md](docs/DIAGNOSIS.md).
-
-JBar deliberately solves a narrower problem: search configured filenames and application aliases, exclude dependency/cache trees, and rank likely launch targets. Spotlight remains the better tool for searching inside documents and across its broader system index.
-
-## Current performance evidence
-
-The benchmark uses report schema v1, workload v2, deterministic fixture generator v2, and a
-deterministic in-memory production-stage-2 frecency profile. Every timed response is checked against
-complete ordered rows and its exact total when it is expected to complete; deliberately superseded
-older requests are checked for cancellation. Fingerprints are report identities, not correctness
-oracles. The following synthetic results are ranges of the process-level nearest-rank statistics from three sequential,
-independent release processes per size, with 100 observations per workload in each process:
-
-| Items | engine-cache-cold `x`: p50 / p95 / p99 / worst max (ms) | typing `r`: p50 / p95 / p99 / worst max (ms) | supersession newest `chrome`: p50 / p95 / p99 / worst max (ms) |
-|---:|---:|---:|---:|
-| 300,000 | 43.689–55.232 / 49.349–57.592 / 49.470–59.391 / 59.413 | 71.341–84.240 / 76.207–92.882 / 77.723–98.259 / 100.719 | 13.419–14.085 / 14.770–16.891 / 14.867–17.316 / 23.740 |
-| 500,000 | 90.123–90.996 / 96.980–97.031 / 98.619–98.682 / 99.343 | 132.956–143.578 / 148.162–156.551 / 156.403–172.096 / 181.244 | 22.625–24.058 / 25.698–27.505 / 26.353–28.802 / 29.407 |
-| 1,000,000 | 171.521–181.592 / 178.376–188.499 / 179.651–189.826 / 193.135 | 251.063–269.888 / 268.004–291.179 / 270.453–306.044 / 320.136 | 40.284–45.404 / 47.079–50.047 / 48.457–52.138 / 53.612 |
-
-At each size, all 300 older superseded scans cancelled as intended and none of the 300 newest scans
-cancelled unexpectedly. High-tail samples are retained; this is observational data, not an absolute
-latency gate. The current formal campaign intentionally ran synthetic fixtures only. An opt-in real
-crawl and the semantically different Spotlight reference remain available, but figures from an older
-binary are not presented as current release evidence.
-
-The run was generated at 2026-08-21T00:20:08Z on a Mac16,12 with an Apple M4, 10 active processors,
-16 GiB memory, arm64, macOS 26.5.2 (25F84), Xcode 26.2 (17C52), and Swift 6.2.3. All nine reports used
-the same optimized arm64 binary (`SHA-256
-ec4496606f09e30f3ac5ea65b8fcdd16a7c77d8e21b1402f508b73d93356654f`) built from the clean
-candidate commit `183fc3c2e526e21dccc7976203e5f00ba371426c`. The frozen source-manifest file hashes to
-`7da3d07f27a0da2b128c3acc38876fcf8f5136b9a9626e246ee878a0915fdead`, the tooling-manifest file to
-`7b78ccb538ef93e6cc237b1069a37f8d2946a18154b911fbd102499058c8590f`, and the final `SHA256SUMS`
-file to `7a64cb87f45e11a04b116be1a05c78e6da3077e9cf5f422fcd23a86c070de6ab`. This is local development
-evidence from a precisely recorded clean candidate, not a notarized release artifact or a cross-machine SLA. See
-[COMPARISON.md](docs/COMPARISON.md) for provenance and workload identities.
-
-```bash
-# Deterministic 300k, 500k and 1M fixtures; three sequential release processes per size.
-scripts/benchmark-release.sh 100
-
-# Add one isolated real cold crawl and same-root Spotlight reference.
-JBAR_BENCHMARK_INCLUDE_REAL=1 scripts/benchmark-release.sh 100
-```
+> **Developer preview:** JBar is currently ad-hoc signed and not notarized. The current source tree is
+> the canonical build for the newest assisted workflows; published GitHub/npm builds may trail it.
+> Do not disable Gatekeeper or remove quarantine. See the [support matrix](docs/SUPPORT.md).
 
 ## Install
 
-JBar is currently a free **developer preview**. The GitHub and npm paths download the same ad-hoc
-signed Universal 2 ZIP; neither requires Homebrew, Xcode, or Swift. Apple Silicon Macs run its
-native `arm64` slice. Because this preview is not Apple-notarized, macOS may ask the user to approve
-the first launch. Do not disable Gatekeeper or remove quarantine.
+### Build the current source
 
-### GitHub Release
+This is the recommended path for the newest `?`, `!`, and `>` workflows. It requires macOS 13 or
+later and Xcode Command Line Tools.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/linjiw/jbar/main/scripts/install-from-github.sh | bash
-```
-
-The installer verifies the release SHA-256, checks the bundle signature and both `arm64`/`x86_64`
-slices, then installs to `/Applications` or `~/Applications`. It preserves macOS quarantine metadata.
-
-### npm
-
-```bash
-npm install --global @linjiw/jbar
-jbar
-```
-
-Or run it once without a global install:
-
-```bash
-npx --yes @linjiw/jbar
-```
-
-The npm package requires Node 18 or later and is only a download launcher. It runs only when
-explicitly invoked, downloads the versioned GitHub Release, verifies its checksum, and installs the
-same native preview app.
-
-### Build from source
-
-Building from source is the best option when you prefer not to approve an unsigned preview; it
-requires macOS 13+ plus Xcode command-line tools:
-
-```bash
+xcode-select --install             # skip if already installed
 git clone https://github.com/linjiw/jbar.git
 cd jbar
 make install
 ```
 
-This builds a Universal 2 app by default, ad-hoc signs it, validates it in a same-volume staging
-location, then installs it in `/Applications` or `~/Applications`.
+`make install` builds a Universal 2 app, ad-hoc signs and validates it, installs it into
+`/Applications` (or `~/Applications` when appropriate), and launches JBar. It never uses `sudo`.
 
-Swift/AppKit remains the native app implementation; npm is only an installation entry point and does
-not change the macOS signing, TCC, architecture, or OS-version requirements. See
-[npm publishing setup](docs/NPM-PUBLISHING.md) for the maintainer steps.
+### GitHub Release
 
-## Usage
+The release installer needs neither Xcode nor Swift:
 
-| You type | You get |
+```bash
+curl -fsSL https://raw.githubusercontent.com/linjiw/jbar/main/scripts/install-from-github.sh | bash
+```
+
+It downloads the latest versioned Universal 2 archive, verifies its SHA-256, signature, bundle
+identity, minimum macOS version, and both architectures before installing. Quarantine metadata is
+preserved so macOS remains in control of first-launch approval.
+
+### npm
+
+The npm package is a small Node 18+ installer for the same native GitHub Release—not an Electron app
+or a second JBar implementation.
+
+```bash
+npm install --global @linjiw/jbar
+jbar
+
+# Or run the installer once:
+npx --yes @linjiw/jbar
+```
+
+### First launch
+
+1. Open JBar and approve the ordinary macOS Files and Folders prompts for roots you want indexed.
+2. Wait for the menu-bar status to change from **Indexing…** to **Index: _n_ items**.
+3. Press **⌥Space**, type an app or filename, and press **Return**.
+4. The first submitted `?`, `!`, or `>` request may open an official ChatGPT sign-in page for JBar's
+   isolated Codex account state.
+
+JBar does not request Accessibility, Input Monitoring, or Full Disk Access. A protected folder that
+you do not approve remains unavailable and makes whole-index assisted operations stop rather than
+silently claim a complete result.
+
+## Three workflows, one bar
+
+### 1. Local Launcher
+
+Ordinary input is always local. JBar searches names and metadata in a bounded launcher-owned index;
+it does not send the query anywhere and does not depend on Spotlight for interactive results.
+
+Examples:
+
+| Type | Finds |
 |---|---|
-| `vsc`, `code` | Visual Studio Code (acronym + fuzzy matching) |
-| `xc` | Xcode |
-| `微信`, `weixin`, `wx` | a matching localized app name or pinyin alias |
-| `报告` | Chinese-named documents |
-| `report pdf` | multi-term results, including extension matches |
-| `~/Dow` then `Tab` | live path browsing |
-| `.md` | extension-only search |
+| `vsc`, `code` | Visual Studio Code through acronym/fuzzy matching |
+| `微信`, `weixin`, `wx` | localized application names and pinyin aliases |
+| `report pdf` | multi-term filename/extension matches |
+| `.md` | Markdown files by extension |
+| `~/Dow` then `Tab` | live, bounded path browsing |
 
-Application rows use Finder's display name for the current locale and retain bundle/plist/localized names as searchable aliases. JBar's own labels and messages are currently English-only.
+Apps can be grouped above files, recent successful choices receive a bounded frecency boost, and
+dependency/cache trees such as `node_modules`, `.git`, `.venv`, and `DerivedData` are excluded by
+default.
 
-### Keys
+### 2. Assistant — `?` / `？`
+
+Use Assistant when a natural-language description is easier than guessing a filename:
+
+```text
+？ 找到上周修改的所有 PDF 报告
+? find the presentation I edited this month
+```
+
+After Return, Codex receives the submitted question, locale, time zone, and a fixed scope label. It
+may return only a validated `SearchPlan` containing name terms, extensions, file kinds, date/size
+filters, sort order, and a bounded limit. It receives no index, paths, candidate metadata, or file
+tools. JBar executes the plan over one immutable local index generation.
+
+Assistant result interaction:
+
+- single-click selects a file;
+- double-click or Return opens it;
+- right-click offers **Open**, **Reveal in Finder**, and **Copy Path**;
+- the bottom actions reveal/open the exact selected row;
+- closing or stopping cancels the bounded search and its one-shot Codex child.
+
+### 3. Copy Organize — `!` / `！`
+
+Copy Organize searches across all configured `fileRoots`, not merely one selected folder:
+
+```text
+！ 把所有文件名包含 receipt 的 PDF 复制到按月份整理的文件夹
+! copy this month's invoice PDFs into month folders
+```
+
+The safety sequence is fixed:
+
+1. Codex creates a restricted metadata search plan.
+2. JBar scans the complete local index generation and rejects incomplete results.
+3. If more than 40 files match, JBar asks you to narrow the request so every file can be reviewed.
+4. You explicitly choose one destination folder.
+5. Codex sees only opaque IDs, names, sizes, and dates—not source or destination paths.
+6. JBar shows every proposed copy, collision, skip, and planner omission.
+7. Only the separate **Copy** button performs native file operations.
+
+Originals are never moved, renamed, edited, or deleted. Existing destinations are never overwritten.
+Sources must be user-owned regular files with a single hard link; symlinks, hard links, changed files,
+unsafe names, destination races, and incomplete indexes fail closed.
+
+### Developer Agent — `>` / `＞`
+
+Developer Agent is intentionally separate from search and organization. It keeps an ephemeral,
+terminal-style Codex conversation rooted in the existing owner-controlled `~/jbar` repository.
+Return sends, Shift-Return inserts a newline, Stop interrupts the current turn, and closing the window
+stops the app-server child and discards JBar's in-memory transcript.
+
+The agent may edit `~/jbar` when asked. Its window shows commands, bounded output, exit codes, and
+reported file changes. It is an advanced development surface, not a general file-management mode.
+
+## Keyboard controls
 
 | Key | Action |
 |---|---|
-| `↑ ↓` / `⌃N ⌃P` | move selection; scrolling continues beyond the visible rows |
-| `Page Up` / `Page Down` | move by the number of rows that actually fit on the current screen |
-| `Return` | open |
-| `⌘Return` | reveal in Finder |
-| `⌘C` | copy the selected path, unless text is selected in the query field |
+| `↑ ↓` / `⌃N ⌃P` | move through results |
+| `Page Up` / `Page Down` | move by the number of visible rows |
+| `Return` | open a local result, or explicitly submit `?`, `!`, `>` |
+| `⌘Return` | reveal the selected local result in Finder |
+| `⌘C` | copy the selected path unless query text is selected |
 | `⌘1`–`⌘8` | open result 1–8 using the physical top-row number keys |
-| `Tab` | autocomplete a folder into path-browsing mode |
-| `Esc` | close after any active input-method composition has finished |
-| `⌘,` | open the config file |
+| `Tab` | autocomplete a folder in path mode |
+| `Esc` | clear; press again on an empty launcher to close |
+| `⌘,` | open the JSON config file |
 
-Control by itself and the physical Delete key do not close the panel. While an IME has marked text, JBar returns Escape, Command shortcuts, navigation, and editing commands to AppKit's text-input system. This behavior is covered by automated policy/marked-text fixtures, but the physical Sequoia Chinese, Korean, Japanese, and keyboard-layout matrix remains a release gate.
+JBar preserves marked-text behavior for Chinese, Japanese, Korean, and other input methods. Hotkey
+letters/digits refer to physical US-ANSI key positions, so switching input sources does not move a
+configured shortcut.
 
-### Result pool, viewport, and path mode
+## Settings
 
-Normal search requests at most `maxResults` rows (40 by default). The current bounded rerank window can produce at most 300 scored normal/extension rows even if `maxResults` is configured higher. `visibleRows` controls only how many rows are shown without scrolling (8 by default); on a short screen, one geometry calculation reduces the effective row count and uses that same count for panel height, overflow indication, and page movement.
+The menu-bar item provides **Open JBar**, **Rebuild Index**, **Clear Search History…**,
+**Launch at Login**, **Open Config File…**, build identity, About, and Quit. It also reports index
+progress, permission gaps, scan caps, unsafe entries, hotkey conflicts, and config errors.
 
-Path mode streams a directory and retains a bounded best-result pool instead of materializing every entry. It currently keeps at most `maxResults × 4` rows, while still counting matches if enumeration completes. A `PATH · shown/total` badge makes truncation visible; `PATH · ?` means the directory could not be read completely.
+Advanced settings live in `~/.config/jbar/config.json`, or
+`$XDG_CONFIG_HOME/jbar/config.json` when `XDG_CONFIG_HOME` is an absolute path. JBar creates the file
+on first launch and hot-reloads valid edits. Invalid values keep the last-known-good configuration
+and show a menu warning.
 
-## Configuration
+```json
+{
+  "hotkey": "option+space",
+  "launchAtLogin": true,
+  "maxResults": 40,
+  "visibleRows": 8,
+  "appsFirstCap": 5,
+  "screen": "mouse",
+  "restoreQueryOnReopen": false,
+  "showRecentsOnEmpty": true,
+  "fileRoots": ["~"],
+  "includeHidden": false,
+  "maxDepth": 12,
+  "maxIndexedItems": 1000000
+}
+```
 
-Hand-edit `~/.config/jbar/config.json` (or `$XDG_CONFIG_HOME/jbar/config.json` when `XDG_CONFIG_HOME` is absolute). The file is created on first launch and hot-reloaded. Invalid or unsafe values keep the last valid configuration and surface a warning.
+Missing keys use defaults; unknown keys are ignored. The generated file also includes the complete
+default application roots, exclusions, and downranking lists.
 
-| key | default | meaning |
+| Setting | Default | Purpose |
 |---|---:|---|
-| `hotkey` | `"option+space"` | fixed US-ANSI physical key names; input-source changes do not move the binding |
-| `launchAtLogin` | `true` | register via `SMAppService` when installed in an Applications folder |
-| `maxResults` | `40` | requested scrollable pool (`1...500`); scored normal/extension results currently cap at 300 |
-| `visibleRows` | `8` | requested viewport height (`1...20`, reduced if the screen is shorter) |
-| `appsFirstCap` | `5` | app slots before file results (`0...maxResults`) |
-| `screen` | `"mouse"` | `mouse`, `main`, or `active`; unknown values fall back to mouse |
-| `restoreQueryOnReopen` | `false` | preserve the previous query when reopening |
-| `showRecentsOnEmpty` | `true` | show local frecency history for an empty query; `false` shows only the hint |
-| `fileRoots` | `["~"]` | roots to index (at most 128) |
-| `excludeNames` / `excludePaths` | see [DESIGN.md](docs/DESIGN.md) | never descend into matching entries |
-| `downrankNames` | build/dist/vendor/… | index but rank lower |
-| `includeHidden` | `false` | include dot-files in the persistent index |
-| `maxDepth` | `12` | crawl depth (`0...64`) |
-| `maxIndexedItems` | `1000000` | shared app+file hard cap (`1...2000000`) |
+| `hotkey` | `"option+space"` | global launcher shortcut; supports `cmd`, `option`, `ctrl`, `shift` plus one physical key |
+| `launchAtLogin` | `true` | register with `SMAppService` when JBar is installed in an Applications folder |
+| `maxResults` | `40` | scrollable result pool (`1...500`) |
+| `visibleRows` | `8` | requested visible rows (`1...20`); short screens reduce it safely |
+| `appsFirstCap` | `5` | maximum app rows before file rows (`0...maxResults`) |
+| `screen` | `"mouse"` | show on `mouse`, `main`, or `active` screen |
+| `restoreQueryOnReopen` | `false` | restore the previous draft when reopened |
+| `showRecentsOnEmpty` | `true` | show local recent choices when the query is empty |
+| `appDirectories` | system defaults | application roots such as `/Applications` and `~/Applications` |
+| `fileRoots` | `["~"]` | file trees included in local search and whole-index `!` search (maximum 128) |
+| `excludePaths` | curated defaults | absolute/`~/` paths never descended; final-component `*` globs are supported |
+| `excludeNames` | curated defaults | directory names never descended at any depth |
+| `downrankNames` | curated defaults | searchable directory trees that receive a junk penalty |
+| `includeHidden` | `false` | include dotfiles in the persistent index |
+| `maxDepth` | `12` | maximum file-tree crawl depth (`0...64`) |
+| `maxIndexedItems` | `1000000` | shared apps+files hard cap (`1...2000000`) |
 
-There is no `useSpotlightFallback` setting. Spotlight is used only by the explicit benchmark reference, not by interactive search.
+Changing roots, exclusions, depth, hidden-file policy, or the item cap invalidates the old snapshot
+and rebuilds the index. A completed crawl with denied paths or scan caps is not persisted as complete.
 
-To reuse **⌘Space**, first disable “Show Spotlight search” in System Settings → Keyboard → Keyboard Shortcuts → Spotlight, then set `"hotkey": "cmd+space"`.
+To reuse **⌘Space**, first disable “Show Spotlight search” in System Settings → Keyboard → Keyboard
+Shortcuts → Spotlight, then set `"hotkey": "cmd+space"`.
 
-## Privacy
+## Codex connection
 
-The index, configuration, and frecency history stay on the Mac. The persistent index contains filename/path metadata, not document contents. History contains exact opened paths and normalized query-pick strings, so it can still be sensitive. See [PRIVACY.md](docs/PRIVACY.md) for locations, retention, permissions, logging, clipboard behavior, and precise clear steps.
+Codex-backed workflows require the official Codex CLI 0.149.0 or newer. JBar looks in supported CLI
+locations and inside an installed ChatGPT desktop app; it does not bundle or silently install Codex.
 
-## Design
+JBar uses a separate `~/Library/Application Support/JBar/CodexHome` and official ChatGPT OAuth. It
+does not read the token, accept an API key/provider fallback, or proxy requests through a JBar server.
+Each submitted request uses the signed-in user's Codex allowance or credits. Connections fail closed
+unless the expected ChatGPT account, OpenAI provider, Luna model, approval policy, tool restrictions,
+and workspace boundary are present.
 
-```text
-Hotkey (Carbon)  →  NSPanel + NSTableView  →  SearchEngine (actor)
-                                                    ↓ reads
-                          IndexStore  ←  AppScanner · Crawler · FSEvents · Snapshot
-```
+See [PRIVACY.md](docs/PRIVACY.md) for the exact data flow and [ASSISTED-WORKFLOWS-DESIGN.md](docs/ASSISTED-WORKFLOWS-DESIGN.md)
+for the complete capability model.
 
-- `JBarCore` contains configuration, the bounded flat index, crawler, snapshot, query parser, scorer, ranking, pinyin aliases, and frecency.
-- `JBarApp` contains the AppKit panel, Carbon hotkey, menu-bar integration, launch actions, and CLI/benchmark entry points.
-- Search and directory work run off the main thread; newer requests supersede older scans.
-- Index and history files are atomically replaced with owner-only permissions and bounded reads.
+## Privacy and safety
 
-See [DESIGN.md](docs/DESIGN.md) for the current implementation contract and known release gaps.
-
-## Development and validation
-
-```bash
-swift test
-swift test -c release
-
-# Assemble the default ad-hoc Universal 2 development bundle.
-scripts/build-app.sh
-
-# Explicit isolated path-mode latency gate (release only).
-JBAR_RUN_PATH_BENCHMARK=1 swift test -c release \
-  --filter PathModeStreamingTests/testPathModeTwentyThousandIsolatedReleaseBenchmark
-
-# Packaged AppKit lifecycle/event smoke. The source app is read-only; the script runs a private clone.
-scripts/tests/appkit-smoke.sh /absolute/path/JBar.app
-```
-
-Test counts are intentionally not copied into documentation because they change frequently. The
-packaged smoke drives synthetic Control `flagsChanged`, text, Delete, Down, and Return events through
-a real `NSApplication`, but uses an in-memory fixture and recording workspace in an ad-hoc private
-clone. It does not exercise a physical keyboard/IME, the real workspace or LaunchServices, the global
-hotkey, production index/history, login item, Gatekeeper, or notarization. Universal build checks can
-inspect both slices and the macOS 13 minimum. CI is configured to repeat packaged CLI and synthetic
-AppKit checks on its listed native arm64 and x86_64 hosted runners; a local Rosetta CLI launch alone
-is not native Intel AppKit evidence, and even a hosted synthetic smoke is not physical keyboard/IME
-or clean-machine Gatekeeper proof. A green suite therefore does not complete the physical
-input-method, OS-version, signing, notarization, or Gatekeeper matrix. Follow
-[UX-TESTS.md](docs/UX-TESTS.md), [SUPPORT.md](docs/SUPPORT.md), and
-[RELEASING.md](docs/RELEASING.md) before publishing.
-
-## Uninstall
-
-```bash
-make uninstall
-make uninstall PURGE=1    # prompts before deleting config, cache, and history
-```
-
-For selective data clearing without uninstalling, use the exact-file steps in [PRIVACY.md](docs/PRIVACY.md).
+- Local launcher typing, indexing, ranking, recents, and path browsing stay on the Mac.
+- The index stores filename/path metadata, not document contents.
+- Only a non-empty `?`, `!`, or `>` request explicitly submitted with Return can start Codex.
+- Assistant sends the question but never the local index, result paths, history, or files.
+- Copy Organize is preview-first, copy-only, no-overwrite, and bounded to 40 reviewed files.
+- Owner-only state files use bounded reads and atomic replacement; logs omit raw queries and paths.
+- JBar never asks for Accessibility, Input Monitoring, or Full Disk Access.
 
 ## Troubleshooting
 
-- **Gatekeeper warning:** do not remove quarantine from a downloaded build. Until a signed and notarized release exists, build the development version from a trusted source checkout.
-- **Hotkey does nothing:** another app may own it. JBar warns in the menu and attempts `ctrl+option+space` as a fallback.
-- **A protected folder is absent:** check System Settings → Privacy & Security → Files and Folders for JBar.
-- **Rebuild the index:** choose **Rebuild Index** from the menu-bar item.
-- **Diagnostics:** `log show --last 10m --predicate 'subsystem == "com.linji.jbar"' --style compact`. Current app logs omit raw queries, names, and paths; see [PRIVACY.md](docs/PRIVACY.md).
+- **Hotkey does nothing:** another app may own it. JBar reports the conflict and tries
+  `ctrl+option+space` as a fallback.
+- **A protected folder is absent:** open System Settings → Privacy & Security → Files and Folders.
+- **`?` or `!` says indexing is incomplete:** let the crawl finish, fix reported permissions, or use
+  **Rebuild Index**. A broad `!` request with more than 40 matches must be narrowed.
+- **Codex cannot connect:** install/update the official Codex CLI, then submit a workflow again to
+  start a fresh ChatGPT sign-in.
+- **Config warning:** use **Open Config File…** and correct the invalid key/value; JBar continues with
+  the previous valid settings.
+- **Diagnostics:** `log show --last 10m --predicate 'subsystem == "com.linji.jbar"' --style compact`.
+
+## Uninstall
+
+From a source checkout:
+
+```bash
+make uninstall
+make uninstall PURGE=1   # asks before removing config, index, history, and isolated Codex state
+```
+
+See [PRIVACY.md](docs/PRIVACY.md) for selective clearing and retention details.
+
+## Development
+
+```bash
+swift test -Xswiftc -warnings-as-errors -Xswiftc -strict-concurrency=complete
+swift test -c release -Xswiftc -warnings-as-errors -Xswiftc -strict-concurrency=complete
+
+scripts/build-app.sh /absolute/temporary/output
+scripts/tests/appkit-smoke.sh /absolute/temporary/output/JBar.app
+```
+
+Architecture and validation references:
+
+- [Design](docs/DESIGN.md)
+- [Assisted workflow design](docs/ASSISTED-WORKFLOWS-DESIGN.md)
+- [UX and real-use test matrix](docs/UX-TESTS.md)
+- [Privacy](docs/PRIVACY.md)
+- [Performance](docs/PERFORMANCE.md)
+- [Support matrix](docs/SUPPORT.md)
+- [Release process](docs/RELEASING.md)
 
 ## Requirements
 
-The intended v1 artifact targets macOS 13 Ventura or later and contains `arm64` and `x86_64` slices. Xcode command-line tools are required only for the current source-build workflow. The exact validation matrix is in [SUPPORT.md](docs/SUPPORT.md).
+- macOS 13 Ventura or later
+- Apple Silicon or Intel (Universal 2 build)
+- Xcode Command Line Tools only when building from source
+- official Codex CLI 0.149.0+ only for `?`, `!`, and `>` workflows
 
 ## License
 

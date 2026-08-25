@@ -1,5 +1,10 @@
 # JBar design and current product contract
 
+For the proposed product roadmap that evolves the development-only Codex slice into lightweight
+Assisted Find, safe organization, and local-first voice input, see
+[ASSISTED-WORKFLOWS-DESIGN.md](ASSISTED-WORKFLOWS-DESIGN.md). This document continues to describe the
+current implementation contract.
+
 JBar is a native Swift/AppKit menu-bar launcher for macOS. It searches a local, bounded index of application and file **names/metadata**, opens or reveals a selected item, and maintains local frecency history. Interactive search does not depend on Spotlight.
 
 This is a description of the current implementation, not a declaration that v1 is released. The intended support contract is macOS 13+, Apple Silicon and Intel in one Universal 2 artifact, any system language/input source, and an English v1 interface. The physical compatibility matrix, Developer ID signing, notarization, Gatekeeper, and clean-machine release verification remain mandatory gates; see [SUPPORT.md](SUPPORT.md) and [RELEASING.md](RELEASING.md).
@@ -17,6 +22,8 @@ Implemented product capabilities:
 - keyboard selection, scrolling, open, reveal, and copy-path actions;
 - local binary index snapshot, FSEvents updates, JSON config hot reload, and JSON history;
 - menu-bar status, rebuild, login-item, config, about, and quit actions; and
+- development-only metadata Assistant (`?`) and reviewed Organize (`!`) surfaces plus an explicitly
+  separate Developer Agent (`>`); and
 - source-build, packaging, CI, benchmark, and release-gate tooling.
 
 Important non-capabilities/current gaps:
@@ -26,6 +33,7 @@ Important non-capabilities/current gaps:
 - no translated JBar interface yet (localized Finder application names are separate from UI localization);
 - no in-app settings or clear-history window;
 - no Open With, calculator, clipboard history, window switching, or web-search feature;
+- assisted workflows remain development-only and have not completed release, billing, and compatibility gates;
 - launch failures still use limited feedback rather than a full inline recovery UI; and
 - no public build should be called released until the support and notarization gates are recorded against the exact artifact.
 
@@ -36,17 +44,17 @@ Carbon hotkey
       │
       ▼
 SearchPanel (AppKit, MainActor) ──► AppLauncher / Finder / pasteboard
-      │
-      ▼ await
-SearchEngine actor ──► immutable IndexStore + thread-safe FrecencyStore
-      ▲
-      │ generation swap
-IndexCoordinator ──► AppScanner + Crawler + FSEventsWatcher + Snapshot
+      ├── local text ──► SearchEngine actor ──► immutable IndexStore + thread-safe FrecencyStore
+      ├── explicit ? + Return ──► tool-free Luna SearchPlan ──► native assistedSearch ──► result window
+      ├── explicit !/！ + Return ──► typed global search ──► destination + ID-only copy plan ──► Preview / Copy
+      └── explicit > + Return ──► Developer Agent ──► isolated ~/jbar Codex thread
+IndexCoordinator ──► AppScanner + Crawler + FSEventsWatcher + Snapshot ──► generation swap
 ```
 
-The Swift package has two main layers:
+The Swift package has three main layers:
 
 - `JBarCore` is independent of AppKit and owns configuration, exclusions, index structures, crawl/merge/snapshot logic, parsing, matching, ranking, path enumeration, pinyin aliases, and frecency.
+- `JBarActions` owns side-effect-free palette intent routing and the narrowly scoped Codex app-server transport, account/config/model/thread gates, and event validation.
 - `JBarApp` owns the AppKit panel/table, Carbon hotkey, menu bar, LaunchServices actions, login item, headless CLI, and benchmark harness.
 
 The search store is immutable after construction. The coordinator publishes monotonically numbered generations; the engine rejects an older generation that arrives after a newer one. Heavy search and directory work runs on a private worker queue while the actor remains re-entrant. Each new request advances a counter that older workers poll so superseded results can be abandoned, and the UI also maintains its own epoch before rendering a response.
@@ -185,6 +193,87 @@ Automated tests exercise these policies and Chinese/Korean marked-text fixtures.
 
 An application open is not treated as success until LaunchServices calls back with an application and no error. Only confirmed success records frecency and hides the panel. Synchronous file/folder failures and missing paths likewise do not record history. Current failure feedback is intentionally conservative but limited (primarily an audible beep/log); a richer inline recovery state remains product work.
 
+### 5.4 Development-only Assistant, Organize, and Developer Agent
+
+A leading `?` selects Ask mode locally. Editing updates only local draft rows; the action handler is
+called solely by a non-empty Return submission. That submission opens the Assistant result window and
+closes the launcher. Codex receives the question, locale, time zone, and a JBar-authored `Indexed
+files` scope ID. `turn/start.outputSchema` requires a versioned `SearchPlan` with bounded name,
+extension, kind, date, size, sort, and limit fields. JBar rejects unknown keys, a changed scope,
+unsupported values, invalid ranges, and traversal-like terms before running a local search.
+
+The Assistant thread is ephemeral and rooted in JBar's owner-only scratch directory with no runtime
+workspace roots, instruction sources, writable user roots, dynamic tools, or network-enabled agent
+tools. It never receives candidate metadata or paths in this slice. `SearchEngine.assistedSearch`
+executes the validated plan over an immutable index snapshot in a cancellable child task and retains
+at most 40 rows. Size is not present in the compact index, so size-filtered plans inspect at most
+10,000 matching paths and report an incomplete result if the cap is reached. Open, Reveal, and Copy
+Path use native JBar actions. Stop or window close cancels planning/search.
+
+A leading `!` or `！` selects Organize locally and submits only on Return. Codex first returns a
+typed metadata `SearchPlan`; JBar executes it over one complete immutable index generation across all
+configured file roots. An incomplete/capped scan, more than 40 matches, or a non-file-only plan stops
+safely. Only then does the user choose one owned copy destination. Directories, apps, packages,
+symlinks, hard links, and special files are excluded. Codex receives opaque source IDs, filenames,
+byte sizes, and modification dates; it does not receive source/destination paths or file contents. A
+closed `OrganizePlan` schema permits only direct-child destination folders and names for known IDs.
+
+The preview is generated and revalidated locally and lists every ready, colliding, changed, invalid,
+or planner-omitted match before enabling a separate Copy button. Native descriptor-relative
+operations recheck destination and source identities, open each source read-only, create only
+direct-child folders, and create every destination with exclusive semantics. A racing/existing target
+is skipped. A failed partial copy is removed. Original files are never moved, renamed, edited, or
+deleted, so this workflow intentionally has no destructive Undo phase. Assistant follow-ups, metadata
+reranking, multi-selection, content reading, and voice are also not implemented.
+
+A leading `>` is the explicit Developer Agent route. It opens a terminal-style transcript and reuses
+one app-server process and one ephemeral Codex thread for explicit follow-up turns. Return sends,
+Shift-Return inserts a newline, Stop interrupts only the current turn, and closing the window stops the
+app-server and discards JBar's in-memory transcript. The deterministic workspace is the existing
+`~/jbar` directory. It must be a real, user-owned,
+non-group/world-writable directory rather than a symlink, and its device/inode identity is rechecked
+before connection and every turn. A repository-root `AGENTS.md` defines project scope, implementation
+conventions, safe mutation rules, and verification expectations so each new ephemeral thread starts
+with useful local context and no workspace picker or persistent session database is needed.
+
+The client requires Codex 0.149.0 or newer, launches `codex app-server --listen stdio://` directly,
+and sets `CODEX_HOME` to `~/Library/Application Support/JBar/CodexHome`. First use delegates ChatGPT
+OAuth to Codex. JBar opens the HTTPS authorization URL but does not register its own OAuth client or
+read the resulting access token. Binary discovery includes standard user CLI locations and the
+official Codex executable in an installed ChatGPT desktop app, so a stale Homebrew CLI does not make
+the GUI integration depend on a development-only environment override.
+
+Opening the browser must not tear down the owning assisted window: the same app-server owns the
+temporary localhost callback listener. While login is pending, the window reports that the browser
+must finish sign-in; closing the window cancels the login and terminates the listener. Its old browser URL is
+not replayable. Later milestones report account/safety validation, Luna preparation, and answer
+generation without including prompts, account data, or URLs.
+
+Before `turn/start`, the implementation validates a ChatGPT account, no provider/endpoint override,
+the live Luna catalog entry, and the complete thread response. The requested thread is ephemeral,
+`openai`/Luna-only with fallback disabled, rooted exactly at `~/jbar`, approval `never`, and a
+workspace-write sandbox with network access disabled. Every turn repeats those constraints. Shell and
+patch execution stay enabled; broad apps, browser/web, plugins, computer use, images, skill discovery,
+workspace dependencies, and multi-agent features remain disabled. No dynamic tool is supplied and no
+capability-root override is sent. Instruction sources and reported command/file paths must remain inside the workspace.
+Unexpected server requests, model reroutes, unsafe account changes, or tool families interrupt and
+fail the task. A normal post-login account refresh is revalidated against the same ChatGPT-only gate.
+
+Agent-message and command-output deltas update the visible transcript at a bounded frame rate, but
+they are not treated as authoritative completion. Completed commands show authoritative output and
+exit code; completed file-change items show their paths and kinds. The final answer is accepted only
+after matching successful item and turn completion. Only one turn may be active per window.
+
+`workspaceWrite` is a write boundary, not a complete read boundary in the installed Codex 0.149
+schema. The command sandbox can also use its standard temporary directories, and the Codex child has
+the current macOS account's readable filesystem view. JBar rejects a command whose reported working
+directory or file-change path escapes `~/jbar`, but it cannot infer every path a shell command may
+read. Restricted read policy support plus adversarial packaged-app verification is a release gate.
+
+This source implementation is local test work, not a shipping claim. OAuth against the packaged app,
+user allowance/credits disclosure, usage attribution, endpoint/provider hostility, notarization, TCC,
+and real-account billing evidence remain release gates.
+
 ## 6. Configuration contract
 
 The config defaults to `~/.config/jbar/config.json`, or `$XDG_CONFIG_HOME/jbar/config.json` only when that environment variable is absolute. Missing files are created with documented defaults. Unknown keys are ignored, missing keys use defaults, and a wrong type/out-of-range value is rejected as one invalid configuration. Hot reload keeps the last valid state on error.
@@ -217,11 +306,22 @@ The current record is a precisely captured clean-candidate development-machine c
 
 ## 8. Privacy and security boundaries
 
-JBar has no telemetry/network client and does not request Accessibility, Input Monitoring, or Full Disk Access. It may encounter Files and Folders consent for protected configured roots. Normal logs contain operational metadata and numeric errors but omit raw queries, names, and paths.
+JBar has no telemetry or JBar cloud service and does not request Accessibility, Input Monitoring, or
+Full Disk Access. Ordinary search is local. A `?` question leaves the Mac only after Return through the
+user's isolated local Codex client; JBar does not send its index, search history, or files. It may
+encounter Files and Folders consent for protected configured roots. Normal logs contain operational
+metadata and numeric errors but omit raw queries, names, paths, assisted prompts, plans, and answers.
 
 The local index and history are not encrypted. History contains exact opened paths and normalized query picks. Copy Path exposes a selected path to the general pasteboard, and apps opened through LaunchServices can maintain their own state. Locations, retention, and exact-file deletion steps are in [PRIVACY.md](PRIVACY.md).
 
-Security boundaries currently enforced in core code include input/config allocation limits, a shared hard index cap, fail-closed snapshot validation, descriptor-based no-symlink bounded reads, owner-only atomic product-state writes, and stale/cancelled response rejection. Automated local evidence includes Debug/Release strict-concurrency-complete builds with warnings as errors; the local ASan runtime was blocked by the installed Xcode platform policy and is not claimed as passing. Release review must still include hostile filesystem races, runnable sanitizers, installer rollback, notarization, and physical runtime evidence.
+Security boundaries currently enforced include input/config allocation limits, a shared hard index cap,
+fail-closed snapshot validation, descriptor-based no-symlink bounded reads, owner-only atomic product-state
+writes, stale/cancelled response rejection, owner-only isolated Codex directories, credential environment
+scrubbing, and protocol-level Codex billing/model/tool gates. Automated local evidence includes
+Debug/Release strict-concurrency-complete builds with warnings as errors; the local ASan runtime was
+blocked by the installed Xcode platform policy and is not claimed as passing. Release review must still
+include hostile filesystem races, runnable sanitizers, installer rollback, notarization, and physical
+runtime evidence.
 
 ## 9. Build and distribution
 

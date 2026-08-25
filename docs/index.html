@@ -3,404 +3,575 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>JBar — a local filename launcher for macOS</title>
-<meta name="description" content="A keyboard-first Swift/AppKit launcher for macOS apps and filenames, with a bounded local index and explicit release evidence.">
-<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>">
-<meta property="og:title" content="JBar — a local filename launcher for macOS">
-<meta property="og:description" content="Keyboard-first macOS app and filename search with a bounded local index. Development preview; release validation is explicit.">
+<title>JBar — local launcher and assisted file workflows for macOS</title>
+<meta name="description" content="JBar is a native macOS launcher: local app and filename search, a restricted Codex file-finding Assistant, copy-only organization, and a separate Developer Agent.">
+<meta name="theme-color" content="#0b1020">
+<meta property="og:title" content="JBar — launch locally, find with intent">
+<meta property="og:description" content="A keyboard-first native macOS launcher with explicit, bounded Codex workflows and copy-only file organization.">
 <meta property="og:type" content="website">
 <meta property="og:url" content="https://linjiw.github.io/jbar/">
 <meta property="og:image" content="https://linjiw.github.io/jbar/images/jbar-panel.png">
 <meta name="twitter:card" content="summary_large_image">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@600;700;800&amp;family=IBM+Plex+Mono:wght@400;500;600&amp;family=IBM+Plex+Sans:wght@400;500;600&amp;display=swap">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='24' fill='%235b6cff'/><path d='M58 12 25 57h23l-6 31 33-46H52z' fill='white'/></svg>">
 <style>
-  :root{
-    --bg:#eef1f6; --panel:#fff; --panel-2:#f6f8fb; --line:#dde3ec;
-    --ink:#0d1220; --muted:#5a6474; --faint:#8a93a3;
-    --jbar:#1e5bff; --jbar-soft:#dbe5ff; --spot:#9aa6b6; --amber:#cf7a2e; --good:#1f9d63;
-    --shadow:0 1px 2px rgba(13,18,32,.05),0 14px 34px -14px rgba(13,18,32,.20);
-    --mono:'IBM Plex Mono',ui-monospace,SFMono-Regular,Menlo,monospace;
-    --sans:'IBM Plex Sans',system-ui,-apple-system,sans-serif;
-    --disp:'Archivo','IBM Plex Sans',system-ui,sans-serif;
+  :root {
+    --bg: #f4f5f9;
+    --surface: #ffffff;
+    --surface-2: #eceef5;
+    --ink: #111423;
+    --muted: #62697a;
+    --line: #dfe2eb;
+    --brand: #5a64f4;
+    --brand-2: #7b48e8;
+    --brand-soft: #eaebff;
+    --green: #087f5b;
+    --green-soft: #e3f8f1;
+    --amber: #a85d08;
+    --amber-soft: #fff2dc;
+    --code: #0d1220;
+    --code-ink: #edf1ff;
+    --shadow: 0 18px 50px rgba(27, 31, 55, .10);
+    --radius: 22px;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    --sans: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", sans-serif;
   }
-  @media (prefers-color-scheme:dark){
-    :root:not([data-theme="light"]){
-      --bg:#080b12; --panel:#131b28; --panel-2:#0f1621; --line:#243141;
-      --ink:#e9edf4; --muted:#9aa6b6; --faint:#69748a;
-      --jbar:#5488ff; --jbar-soft:#1d2c4d; --spot:#6b7788; --amber:#e0954a; --good:#38b981;
-      --shadow:0 1px 2px rgba(0,0,0,.4),0 20px 44px -18px rgba(0,0,0,.65);
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #090b12;
+      --surface: #121621;
+      --surface-2: #1a1f2c;
+      --ink: #f0f2fa;
+      --muted: #a2a9ba;
+      --line: #2a3040;
+      --brand: #8990ff;
+      --brand-2: #b47aff;
+      --brand-soft: #242849;
+      --green: #54d3ac;
+      --green-soft: #12352e;
+      --amber: #ffc16f;
+      --amber-soft: #392a18;
+      --code: #05070d;
+      --code-ink: #f2f4ff;
+      --shadow: 0 20px 60px rgba(0, 0, 0, .35);
     }
   }
-  :root[data-theme="dark"]{
-    --bg:#080b12; --panel:#131b28; --panel-2:#0f1621; --line:#243141;
-    --ink:#e9edf4; --muted:#9aa6b6; --faint:#69748a;
-    --jbar:#5488ff; --jbar-soft:#1d2c4d; --spot:#6b7788; --amber:#e0954a; --good:#38b981;
-    --shadow:0 1px 2px rgba(0,0,0,.4),0 20px 44px -18px rgba(0,0,0,.65);
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0;
+    background:
+      radial-gradient(circle at 15% -5%, color-mix(in srgb, var(--brand) 17%, transparent), transparent 30rem),
+      radial-gradient(circle at 95% 8%, color-mix(in srgb, var(--brand-2) 13%, transparent), transparent 26rem),
+      var(--bg);
+    color: var(--ink);
+    font-family: var(--sans);
+    font-size: 16px;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
   }
-  *{box-sizing:border-box}
-  html{scroll-behavior:smooth}
-  body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);font-size:16px;
-    line-height:1.6;-webkit-font-smoothing:antialiased;}
-  a{color:var(--jbar);text-decoration:none}
-  a:hover{text-decoration:underline}
-  a:focus-visible,button:focus-visible{outline:2px solid var(--jbar);outline-offset:3px;border-radius:4px}
-  .wrap{max-width:1000px;margin:0 auto;padding:0 clamp(18px,4vw,40px)}
-  code{font-family:var(--mono);font-size:.9em;background:var(--panel-2);border:1px solid var(--line);
-    padding:1px 6px;border-radius:5px}
+  a { color: var(--brand); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  a:focus-visible, button:focus-visible, summary:focus-visible {
+    outline: 3px solid color-mix(in srgb, var(--brand) 65%, white);
+    outline-offset: 3px;
+    border-radius: 8px;
+  }
+  code, kbd { font-family: var(--mono); }
+  code { font-size: .9em; }
+  .wrap { width: min(1160px, calc(100% - 40px)); margin-inline: auto; }
+  .skip { position: fixed; left: 16px; top: -60px; z-index: 100; padding: 10px 14px; background: var(--surface); }
+  .skip:focus { top: 12px; }
 
-  /* nav */
-  nav{border-bottom:1px solid var(--line);background:color-mix(in srgb,var(--bg) 85%,transparent);
-    position:sticky;top:0;z-index:20;backdrop-filter:blur(10px)}
-  nav .wrap{display:flex;align-items:center;gap:22px;height:58px}
-  .brand{font-family:var(--disp);font-weight:800;font-size:19px;letter-spacing:-.02em;color:var(--ink)}
-  .brand:hover{text-decoration:none}
-  .brand .z{color:var(--jbar)}
-  nav .links{margin-left:auto;display:flex;gap:20px;font-size:14px;flex-wrap:wrap}
-  nav .links a{color:var(--muted)}
-  nav .links a:hover{color:var(--jbar)}
+  nav {
+    position: sticky;
+    top: 0;
+    z-index: 30;
+    border-bottom: 1px solid color-mix(in srgb, var(--line) 78%, transparent);
+    background: color-mix(in srgb, var(--bg) 84%, transparent);
+    backdrop-filter: blur(18px);
+  }
+  .nav-inner { min-height: 64px; display: flex; align-items: center; gap: 22px; }
+  .brand { color: var(--ink); font-weight: 800; font-size: 20px; letter-spacing: -.04em; }
+  .brand:hover { text-decoration: none; }
+  .brand-mark { color: var(--brand); }
+  .nav-links { margin-left: auto; display: flex; align-items: center; gap: 22px; font-size: 14px; }
+  .nav-links a { color: var(--muted); }
+  .nav-github { padding: 7px 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
 
-  /* hero */
-  header{padding:clamp(44px,7vw,86px) 0 0}
-  .eyebrow{font-family:var(--mono);font-size:12px;letter-spacing:.14em;text-transform:uppercase;
-    color:var(--jbar);font-weight:600;display:flex;align-items:center;gap:10px}
-  .eyebrow::before{content:"";width:26px;height:2px;background:var(--jbar);border-radius:2px}
-  h1{font-family:var(--disp);font-weight:800;font-size:clamp(34px,6.4vw,58px);line-height:1.03;
-    letter-spacing:-.025em;margin:18px 0 0;text-wrap:balance;max-width:17ch}
-  h1 .em{color:var(--jbar)}
-  .lede{color:var(--muted);font-size:clamp(16px,2.1vw,19px);max-width:62ch;margin:18px 0 0}
-  .cta{display:flex;flex-wrap:wrap;gap:12px;margin-top:26px;align-items:center}
-  .btn{display:inline-flex;align-items:center;gap:8px;font-weight:600;font-size:14.5px;
-    padding:11px 18px;border-radius:9px;border:1px solid var(--line);background:var(--panel);
-    color:var(--ink);box-shadow:var(--shadow);cursor:pointer}
-  .btn:hover{text-decoration:none;border-color:var(--jbar)}
-  .btn.primary{background:var(--jbar);border-color:var(--jbar);color:#fff}
-  .btn.primary:hover{filter:brightness(1.08)}
-  .install{display:flex;align-items:center;gap:10px;font-family:var(--mono);font-size:13.5px;
-    background:var(--panel);border:1px solid var(--line);border-radius:9px;padding:10px 12px;
-    box-shadow:var(--shadow);color:var(--ink)}
-  .install .p{color:var(--faint)}
-  .install button{font-family:var(--sans);font-size:12px;font-weight:600;border:1px solid var(--line);
-    background:var(--panel-2);color:var(--muted);border-radius:6px;padding:4px 9px;cursor:pointer}
-  .install button:hover{color:var(--jbar);border-color:var(--jbar)}
-  .shot{margin:clamp(30px,5vw,52px) 0 0;border-radius:14px;overflow:hidden;border:1px solid var(--line);
-    box-shadow:var(--shadow);background:var(--panel-2);line-height:0}
-  .shot img{width:100%;height:auto;display:block}
-  .shot-cap{font-family:var(--mono);font-size:12px;color:var(--faint);margin-top:10px;line-height:1.5}
+  header { padding: clamp(64px, 9vw, 112px) 0 54px; text-align: center; }
+  .kicker {
+    display: inline-flex;
+    gap: 8px;
+    align-items: center;
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--surface) 86%, transparent);
+    padding: 7px 12px;
+    color: var(--muted);
+    font: 600 12px/1 var(--mono);
+    text-transform: uppercase;
+    letter-spacing: .08em;
+  }
+  .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--green); box-shadow: 0 0 0 4px var(--green-soft); }
+  h1 { margin: 24px auto 0; max-width: 900px; font-size: clamp(45px, 7vw, 84px); line-height: .98; letter-spacing: -.065em; text-wrap: balance; }
+  .gradient { background: linear-gradient(110deg, var(--brand), var(--brand-2)); color: transparent; background-clip: text; -webkit-background-clip: text; }
+  .lede { max-width: 720px; margin: 26px auto 0; color: var(--muted); font-size: clamp(17px, 2vw, 21px); text-wrap: balance; }
+  .hero-actions { margin-top: 30px; display: flex; justify-content: center; flex-wrap: wrap; gap: 12px; }
+  .button {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 46px;
+    padding: 0 18px;
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    background: var(--surface);
+    color: var(--ink);
+    font-weight: 700;
+    box-shadow: 0 8px 24px rgba(25, 30, 55, .08);
+  }
+  .button:hover { text-decoration: none; transform: translateY(-1px); }
+  .button.primary { border-color: transparent; color: white; background: linear-gradient(120deg, #5363f5, #7d46df); }
+  .hero-note { margin: 16px auto 0; color: var(--muted); font-size: 13px; }
 
-  /* sections */
-  section{margin-top:clamp(52px,8vw,88px)}
-  h2{font-family:var(--disp);font-weight:700;font-size:clamp(22px,3.2vw,30px);letter-spacing:-.015em;margin:0 0 6px}
-  .sub{color:var(--muted);font-size:15px;margin:0 0 24px;max-width:66ch}
+  .command {
+    max-width: 790px;
+    margin: 38px auto 0;
+    display: grid;
+    grid-template-columns: auto 1fr auto;
+    align-items: center;
+    gap: 12px;
+    padding: 12px 14px;
+    border: 1px solid #242b3b;
+    border-radius: 14px;
+    background: var(--code);
+    color: var(--code-ink);
+    text-align: left;
+    box-shadow: var(--shadow);
+  }
+  .prompt { color: #94a0bb; font-family: var(--mono); }
+  .command code { overflow-x: auto; white-space: nowrap; scrollbar-width: none; }
+  .copy {
+    border: 1px solid #343d52;
+    border-radius: 8px;
+    background: #192031;
+    color: #dce2f3;
+    padding: 6px 10px;
+    cursor: pointer;
+    font-weight: 700;
+  }
 
-  .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(158px,1fr));gap:14px}
-  .stat{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:18px;box-shadow:var(--shadow)}
-  .stat .n{font-family:var(--disp);font-weight:800;font-size:clamp(25px,3.6vw,32px);letter-spacing:-.02em;line-height:1}
-  .stat .n.j{color:var(--jbar)}
-  .stat .n span{font-size:.5em;font-weight:700}
-  .stat .k{font-family:var(--mono);font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--faint);margin-top:9px}
-  .stat .d{font-size:13px;color:var(--muted);margin-top:5px}
+  .mode-grid { margin: 22px 0 0; display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; text-align: left; }
+  .mode {
+    position: relative;
+    overflow: hidden;
+    min-height: 194px;
+    padding: 22px;
+    border: 1px solid var(--line);
+    border-radius: 18px;
+    background: color-mix(in srgb, var(--surface) 92%, transparent);
+    box-shadow: var(--shadow);
+  }
+  .mode::after { content: ""; position: absolute; width: 105px; height: 105px; right: -45px; bottom: -50px; border-radius: 50%; background: var(--mode-soft, var(--brand-soft)); }
+  .sigil { font: 800 30px/1 var(--mono); color: var(--mode-color, var(--brand)); }
+  .mode h3 { margin: 18px 0 5px; font-size: 17px; letter-spacing: -.02em; }
+  .mode p { margin: 0; color: var(--muted); font-size: 14px; }
+  .mode.local { --mode-color: var(--green); --mode-soft: var(--green-soft); }
+  .mode.organize { --mode-color: var(--amber); --mode-soft: var(--amber-soft); }
 
-  .card{background:var(--panel);border:1px solid var(--line);border-radius:16px;box-shadow:var(--shadow);
-    padding:clamp(18px,3vw,26px)}
-  .evidence-note{font-family:var(--mono);font-size:12px;color:var(--faint);margin-top:14px;line-height:1.6}
+  .product-shot { margin-top: 22px; overflow: hidden; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); box-shadow: var(--shadow); }
+  .product-shot img { width: 100%; height: auto; display: block; }
+  .caption { margin: 10px 8px 0; color: var(--muted); font-size: 13px; }
 
-  .tbl-wrap{overflow-x:auto}
-  table{width:100%;border-collapse:collapse;font-size:14.5px}
-  th,td{text-align:left;padding:11px 12px;border-bottom:1px solid var(--line);vertical-align:top}
-  th{font-family:var(--mono);font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--faint);font-weight:500}
-  td.n{font-family:var(--mono);text-align:right;font-variant-numeric:tabular-nums}
-  .j{color:var(--jbar);font-weight:600}
+  main section { padding-top: 100px; }
+  .section-head { display: grid; grid-template-columns: .8fr 1.2fr; gap: 50px; align-items: end; margin-bottom: 30px; }
+  .eyebrow { margin: 0 0 9px; color: var(--brand); font: 700 12px/1 var(--mono); text-transform: uppercase; letter-spacing: .1em; }
+  h2 { margin: 0; font-size: clamp(31px, 4.4vw, 49px); line-height: 1.04; letter-spacing: -.045em; text-wrap: balance; }
+  .section-copy { margin: 0; color: var(--muted); font-size: 17px; }
 
-  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:14px}
-  .feat{background:var(--panel);border:1px solid var(--line);border-radius:13px;padding:18px 20px;box-shadow:var(--shadow)}
-  .feat h3{font-family:var(--disp);font-size:15.5px;margin:0 0 6px;font-weight:700}
-  .feat p{margin:0;font-size:13.5px;color:var(--muted)}
-  .feat .kbd{font-family:var(--mono);font-size:12px;color:var(--jbar)}
+  .card-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+  .card { padding: 26px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); box-shadow: var(--shadow); }
+  .card h3 { margin: 0 0 8px; font-size: 19px; letter-spacing: -.025em; }
+  .card p { margin: 0; color: var(--muted); }
+  .card ul { margin: 14px 0 0; padding-left: 19px; color: var(--muted); }
+  .card li + li { margin-top: 7px; }
+  .icon { width: 42px; height: 42px; display: grid; place-items: center; margin-bottom: 20px; border-radius: 12px; background: var(--brand-soft); color: var(--brand); font: 800 19px/1 var(--mono); }
+  .card.safe .icon { color: var(--green); background: var(--green-soft); }
+  .card.copyonly .icon { color: var(--amber); background: var(--amber-soft); }
 
-  .why{background:var(--panel);border:1px solid var(--line);border-left:3px solid var(--amber);
-    border-radius:0 14px 14px 0;padding:22px 24px;box-shadow:var(--shadow)}
-  .why p{margin:0 0 12px}
-  .why p:last-child{margin-bottom:0}
-  .why .log{font-family:var(--mono);font-size:12px;color:var(--muted);background:var(--panel-2);
-    border:1px solid var(--line);border-radius:9px;padding:12px 14px;overflow-x:auto;white-space:pre;margin:14px 0}
+  .workflow { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+  .workflow-card { padding: clamp(24px, 4vw, 38px); border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); box-shadow: var(--shadow); }
+  .workflow-card.full { grid-column: 1 / -1; display: grid; grid-template-columns: .8fr 1.2fr; gap: 42px; }
+  .workflow-card h3 { margin: 8px 0 10px; font-size: 27px; letter-spacing: -.04em; }
+  .workflow-card p { color: var(--muted); }
+  .example { margin-top: 20px; padding: 14px 16px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface-2); font-family: var(--mono); font-size: 14px; }
+  .steps { counter-reset: step; display: grid; gap: 12px; }
+  .step { position: relative; padding: 14px 16px 14px 54px; border: 1px solid var(--line); border-radius: 13px; background: var(--surface-2); color: var(--muted); }
+  .step::before { counter-increment: step; content: counter(step); position: absolute; left: 14px; top: 13px; width: 27px; height: 27px; display: grid; place-items: center; border-radius: 9px; background: var(--brand); color: white; font: 700 12px/1 var(--mono); }
 
-  pre{font-family:var(--mono);font-size:13px;background:var(--panel);border:1px solid var(--line);
-    border-radius:11px;padding:16px 18px;overflow-x:auto;box-shadow:var(--shadow);line-height:1.7}
-  pre .c{color:var(--faint)}
+  .install-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+  .install-card { display: flex; flex-direction: column; padding: 24px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); box-shadow: var(--shadow); }
+  .install-card.recommended { border-color: color-mix(in srgb, var(--brand) 55%, var(--line)); }
+  .pill { align-self: flex-start; padding: 4px 8px; border-radius: 999px; background: var(--brand-soft); color: var(--brand); font: 700 11px/1.4 var(--mono); text-transform: uppercase; letter-spacing: .05em; }
+  .install-card h3 { margin: 16px 0 6px; }
+  .install-card p { margin: 0; color: var(--muted); font-size: 14px; }
+  .mini-command { position: relative; margin-top: 18px; padding: 14px 42px 14px 14px; border-radius: 11px; background: var(--code); color: var(--code-ink); font: 12px/1.55 var(--mono); overflow-wrap: anywhere; flex: 1; }
+  .mini-copy { position: absolute; right: 8px; top: 8px; border: 0; border-radius: 7px; padding: 5px 7px; cursor: pointer; background: #252d40; color: #dce2f3; }
+  .first-run { margin-top: 18px; display: grid; grid-template-columns: repeat(4, 1fr); gap: 1px; overflow: hidden; border: 1px solid var(--line); border-radius: 18px; background: var(--line); }
+  .first-run div { padding: 20px; background: var(--surface); }
+  .first-run strong { display: block; margin-bottom: 5px; }
+  .first-run span { color: var(--muted); font-size: 13px; }
 
-  footer{margin-top:clamp(56px,8vw,96px);padding:26px 0 60px;border-top:1px solid var(--line);
-    font-family:var(--mono);font-size:12.5px;color:var(--faint);display:flex;flex-wrap:wrap;gap:8px 20px;
-    justify-content:space-between}
+  .settings-shell { overflow: hidden; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); box-shadow: var(--shadow); }
+  .settings-top { display: grid; grid-template-columns: .9fr 1.1fr; gap: 28px; padding: 28px; border-bottom: 1px solid var(--line); }
+  .settings-top p { color: var(--muted); }
+  pre { margin: 0; padding: 18px; overflow-x: auto; border-radius: 14px; background: var(--code); color: var(--code-ink); font: 13px/1.65 var(--mono); }
+  .table-wrap { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th, td { padding: 13px 16px; text-align: left; vertical-align: top; border-bottom: 1px solid var(--line); }
+  th { color: var(--muted); background: var(--surface-2); font: 700 11px/1.3 var(--mono); text-transform: uppercase; letter-spacing: .06em; }
+  td:first-child, td:nth-child(2) { white-space: nowrap; font-family: var(--mono); }
+  tr:last-child td { border-bottom: 0; }
+  .menu-strip { margin-top: 16px; display: flex; flex-wrap: wrap; gap: 9px; }
+  .menu-strip span { padding: 7px 10px; border: 1px solid var(--line); border-radius: 9px; background: var(--surface); color: var(--muted); font-size: 13px; }
+
+  .safety { display: grid; grid-template-columns: .8fr 1.2fr; gap: 18px; }
+  .safety-callout { padding: 30px; border-radius: var(--radius); background: linear-gradient(140deg, #4f5ff0, #7e43df); color: white; box-shadow: var(--shadow); }
+  .safety-callout h3 { margin: 0; font-size: 29px; line-height: 1.1; letter-spacing: -.04em; }
+  .safety-callout p { margin-bottom: 0; color: #e9eaff; }
+  .checks { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .check { padding: 17px; border: 1px solid var(--line); border-radius: 15px; background: var(--surface); color: var(--muted); }
+  .check strong { display: block; margin-bottom: 4px; color: var(--ink); }
+  .check strong::before { content: "✓"; margin-right: 8px; color: var(--green); }
+
+  .notice { margin-top: 18px; padding: 18px 20px; border: 1px solid color-mix(in srgb, var(--amber) 35%, var(--line)); border-radius: 14px; background: var(--amber-soft); color: color-mix(in srgb, var(--amber) 85%, var(--ink)); }
+  .links-card { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-top: 18px; }
+  .links-card a { padding: 18px; border: 1px solid var(--line); border-radius: 14px; background: var(--surface); color: var(--ink); font-weight: 700; }
+  .links-card a:hover { border-color: var(--brand); text-decoration: none; }
+
+  footer { margin-top: 100px; padding: 32px 0 54px; border-top: 1px solid var(--line); color: var(--muted); font-size: 13px; }
+  .footer-inner { display: flex; justify-content: space-between; gap: 18px; flex-wrap: wrap; }
+
+  @media (max-width: 900px) {
+    .mode-grid, .card-grid, .install-grid { grid-template-columns: 1fr 1fr; }
+    .section-head, .settings-top, .safety { grid-template-columns: 1fr; gap: 18px; }
+    .workflow-card.full { grid-template-columns: 1fr; gap: 18px; }
+    .first-run { grid-template-columns: 1fr 1fr; }
+    .links-card { grid-template-columns: 1fr 1fr; }
+  }
+  @media (max-width: 650px) {
+    .wrap { width: min(100% - 26px, 1160px); }
+    .nav-inner { min-height: 56px; }
+    .nav-links a:not(.nav-github) { display: none; }
+    header { padding-top: 56px; }
+    h1 { font-size: clamp(42px, 14vw, 62px); }
+    .command { grid-template-columns: auto minmax(0, 1fr) auto; }
+    .mode-grid, .card-grid, .workflow, .install-grid, .checks, .first-run, .links-card { grid-template-columns: 1fr; }
+    main section { padding-top: 78px; }
+    .section-head { margin-bottom: 22px; }
+    .workflow-card.full { grid-column: auto; }
+    th, td { padding: 11px 12px; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    html { scroll-behavior: auto; }
+    .button:hover { transform: none; }
+  }
 </style>
 </head>
 <body>
+<a class="skip" href="#content">Skip to content</a>
 
-<nav><div class="wrap">
-  <a class="brand" href="#top">J<span class="z">Bar</span></a>
-  <div class="links">
-    <a href="#benchmark">Benchmark</a>
-    <a href="#install">Install</a>
-    <a href="#why">Why</a>
-    <a href="#how">How it works</a>
-    <a href="https://github.com/linjiw/jbar/blob/main/docs/PRIVACY.md">Privacy</a>
-    <a href="https://github.com/linjiw/jbar">GitHub</a>
-  </div>
-</div></nav>
-
-<div class="wrap" id="top">
-
-<header>
-  <div class="eyebrow">macOS launcher · Swift + AppKit · MIT</div>
-  <h1>Local filename search, <span class="em">built for macOS</span>.</h1>
-  <p class="lede">JBar is a keyboard-first launcher for macOS apps and files. It searches a bounded
-    <strong>local name/metadata index</strong>, ranks for launching, and leaves document-content search
-    to Spotlight. It is currently a source-built development preview while the physical compatibility
-    and notarized-release matrix is completed.</p>
-  <div class="cta">
-    <a class="btn primary" href="#install">Build from source</a>
-    <a class="btn" href="https://github.com/linjiw/jbar">View source</a>
-    <div class="install">
-      <span class="p">$</span><span id="cmd">git clone https://github.com/linjiw/jbar &amp;&amp; cd jbar &amp;&amp; make install</span>
-      <button id="copy" type="button">Copy</button>
+<nav aria-label="Primary">
+  <div class="wrap nav-inner">
+    <a class="brand" href="#top">J<span class="brand-mark">Bar</span></a>
+    <div class="nav-links">
+      <a href="#features">Features</a>
+      <a href="#workflows">Workflows</a>
+      <a href="#install">Install</a>
+      <a href="#settings">Settings</a>
+      <a href="#safety">Safety</a>
+      <a class="nav-github" href="https://github.com/linjiw/jbar">GitHub ↗</a>
     </div>
   </div>
+</nav>
 
-  <div class="shot">
-    <img src="images/jbar-panel.png" width="1360" height="904"
-         alt="JBar's search panel: the query 's' shows Safari, Visual Studio Code and System Settings grouped as apps above a divider, then DESIGN.md, DIAGNOSIS.md, Package.swift, Info.plist and build-app.sh as files — each row with an icon, the matched letter highlighted, a shortened path, and a type badge.">
-  </div>
-  <p class="shot-cap">⌥Space → type → Return. Apps group above files; matched characters are highlighted;
-    ⌘Return reveals in Finder, ⌘C copies the path.</p>
-</header>
+<div class="wrap" id="top">
+  <header>
+    <div class="kicker"><span class="dot"></span> Native macOS · Developer preview</div>
+    <h1>Your Mac, one bar.<br><span class="gradient">You stay in control.</span></h1>
+    <p class="lede">Launch apps and files locally. Ask for files in natural language. Organize safe
+      copies with a complete preview. Open a separate Codex workspace only when you mean to develop.</p>
+    <div class="hero-actions">
+      <a class="button primary" href="#install">Install JBar</a>
+      <a class="button" href="#workflows">See the workflows</a>
+    </div>
+    <p class="hero-note">Ordinary typing is always local. AI begins only after a submitted <code>?</code>, <code>!</code>, or <code>&gt;</code>.</p>
 
-<section id="numbers">
-  <h2>Current evidence</h2>
-  <p class="sub">Current local release-mode evidence uses one immutable binary, versioned correctness
-    reports, and independent processes. It is development-machine evidence, not a notarized artifact,
-    cross-machine percentile, or advertised SLA.</p>
-  <div class="stats">
-    <div class="stat"><div class="n j">3 × 100</div><div class="k">Processes × samples</div><div class="d">for each synthetic size</div></div>
-    <div class="stat"><div class="n">1<span> M</span></div><div class="k">Largest fixed fixture</div><div class="d">schema 1 · workload 2</div></div>
-    <div class="stat"><div class="n">172–182<span> ms</span></div><div class="k">1M cold-x p50</div><div class="d">range across three processes</div></div>
-    <div class="stat"><div class="n">251–270<span> ms</span></div><div class="k">1M serial-typing r p50</div><div class="d">engine call, not key-to-paint</div></div>
-    <div class="stat"><div class="n">900/900</div><div class="k">Older scans cancelled</div><div class="d">newest unexpected: 0</div></div>
-    <div class="stat"><div class="n">Pending</div><div class="k">Release matrix</div><div class="d">physical IME, Intel, notarization</div></div>
-  </div>
-</section>
+    <div class="command" aria-label="Source installation command">
+      <span class="prompt">$</span>
+      <code id="hero-command">git clone https://github.com/linjiw/jbar.git &amp;&amp; cd jbar &amp;&amp; make install</code>
+      <button class="copy" type="button" data-copy="hero-command">Copy</button>
+    </div>
 
-<section id="benchmark">
-  <h2>Reproducible benchmark, honest semantics</h2>
-  <p class="sub">JBar fuzzy ranking and Spotlight filename-substring metadata gathers are not equivalent
-    workloads. The harness reports each separately and deliberately omits a speedup ratio.</p>
-  <div class="card">
-    <p style="margin-top:0">The release harness uses fixed-seed 300k/500k/1M fixtures in three sequential
-      independent processes per size, prints the environment/fingerprint/sample plan, and reports
-      nearest-rank p50/p95/p99/max without best-of-N selection. Every timed response must retain the same
-      complete ordered rows and exact total across matching workloads. An opt-in real crawl uses a
-      temporary isolated snapshot and then runs a semantically different same-root Spotlight reference.</p>
-<pre>scripts/benchmark-release.sh 100
-JBAR_BENCHMARK_INCLUDE_REAL=1 scripts/benchmark-release.sh 100</pre>
-    <p class="evidence-note">The current local campaign passed nine synthetic processes from clean candidate
-      commit <code>183fc3c2e526e21dccc7976203e5f00ba371426c</code>; its evidence manifest is
-      <code>7a64cb87…0de6ab</code>. The opt-in real crawl was not part of this run. Publication still requires the
-      supported OS/CPU matrix, exact signed artifact checksum, and separately stated cache/system load.</p>
-  </div>
-</section>
+    <div class="mode-grid" aria-label="JBar modes">
+      <article class="mode local">
+        <div class="sigil">Aa</div>
+        <h3>Local Launcher</h3>
+        <p>Type normally to search apps and filenames on this Mac. No model, no network request.</p>
+      </article>
+      <article class="mode">
+        <div class="sigil">? ？</div>
+        <h3>Assistant</h3>
+        <p>Codex creates a restricted search plan. JBar performs the search and file actions locally.</p>
+      </article>
+      <article class="mode organize">
+        <div class="sigil">! ！</div>
+        <h3>Copy Organize</h3>
+        <p>Search all configured roots, choose a destination, review every copy and collision, then confirm.</p>
+      </article>
+      <article class="mode">
+        <div class="sigil">&gt; ＞</div>
+        <h3>Developer Agent</h3>
+        <p>A visibly separate terminal-style Codex session rooted in your <code>~/jbar</code> repository.</p>
+      </article>
+    </div>
 
-<section id="performance">
-  <h2>Cold-search optimization preview</h2>
-  <p class="sub">A reviewed development patch makes cache-cold name searches start from the rarest
-    safe character posting instead of walking the entire index. The official evidence above remains
-    unchanged until the complete multi-process release campaign is rerun.</p>
-  <div class="stats">
-    <div class="stat"><div class="n j">~10<span> ms</span></div><div class="k">300K cold x</div><div class="d">previous recorded p50 range: 43.7–55.2 ms</div></div>
-    <div class="stat"><div class="n j">~16<span> ms</span></div><div class="k">300K first r</div><div class="d">previous recorded p50 range: 71.3–84.2 ms</div></div>
-    <div class="stat"><div class="n j">~34<span> ms</span></div><div class="k">1M cold x</div><div class="d">previous recorded p50 range: 171.5–181.6 ms</div></div>
-    <div class="stat"><div class="n j">~54<span> ms</span></div><div class="k">1M first r</div><div class="d">previous recorded p50 range: 251.1–269.9 ms</div></div>
-  </div>
-  <div class="card" style="margin-top:14px">
-    <p style="margin-top:0">The fast path adds 38 packed character-presence bitsets—about 4.75 bytes per
-      indexed item—plus a one-pass scorer for the broad first character and at most four balanced scan
-      workers. Apps remain in every posting so aliases cannot disappear; extension-like queries fall
-      back whenever a filename filter would be unsafe.</p>
-    <p><strong>File-content search is a separate project, not a hidden switch.</strong> For a bounded,
-      supported text corpus, JBar can reasonably target lower warm-query latency than Spotlight with a
-      standalone inverted index. It should not claim to beat Spotlight across the whole Mac, every
-      document format, OCR, semantic search, or initial ingestion.</p>
-    <p style="margin-bottom:0">The proposed architecture, privacy boundaries, benchmark gates, and next
-      optimization queue are in the
-      <a href="https://github.com/linjiw/jbar/blob/main/docs/PERFORMANCE.md">performance program →</a></p>
-    <p class="evidence-note">These are few-sample local spot checks from the same M4 development machine
-      and deterministic fixtures on 2026-08-21—not replacement release evidence or an SLA. Ordered rows,
-      totals, and fingerprints remained stable; the full clean-candidate campaign is still required.</p>
-  </div>
-</section>
+    <figure class="product-shot">
+      <img src="images/jbar-panel.png" width="1360" height="904" alt="JBar's native launcher showing application results above file results, with matched letters highlighted and file locations visible.">
+    </figure>
+    <p class="caption">⌥Space → type → Return. Use arrows to select, ⌘Return to reveal, and ⌘C to copy a path.</p>
+  </header>
 
-<section id="compare">
-  <h2>Side by side</h2>
-  <p class="sub">Two tools with different jobs. JBar is a launcher that maintains a bounded local index
-    of configured app/file roots; Spotlight is macOS's system metadata and content-search service.</p>
-  <div class="card tbl-wrap">
-    <table>
-      <thead><tr><th>Dimension</th><th>JBar</th><th>Spotlight</th></tr></thead>
-      <tbody>
-        <tr><td>Primary job</td><td>launch by name/alias</td><td>system metadata and content search</td></tr>
-        <tr><td>Benchmark semantics</td><td>fuzzy terms + aliases + ranking</td><td>filename-substring metadata gathers</td></tr>
-        <tr><td>Ranking for launching</td><td>apps-first · acronyms · pinyin · frecency</td><td>system-defined</td></tr>
-        <tr><td>Localized app names / pinyin</td><td>Finder display name + bundled aliases</td><td>system behavior</td></tr>
-        <tr><td>Searches file <em>contents</em></td><td>no — names + metadata</td><td class="j">yes</td></tr>
-        <tr><td>Scope</td><td>configured readable roots, exclusions, hard cap</td><td>macOS-managed scope</td></tr>
-        <tr><td>Interactive dependency</td><td>no Spotlight query</td><td>Spotlight service</td></tr>
-      </tbody>
-    </table>
-  </div>
-  <p class="sub" style="margin-top:14px">Full methodology, coverage analysis and the honest limitations:
-    <a href="https://github.com/linjiw/jbar/blob/main/docs/COMPARISON.md">docs/COMPARISON.md</a>.</p>
-</section>
+  <main id="content">
+    <section id="features">
+      <div class="section-head">
+        <div><p class="eyebrow">The product contract</p><h2>Fast when simple. Explicit when powerful.</h2></div>
+        <p class="section-copy">JBar separates everyday launching, natural-language file finding,
+          reviewed copy organization, and development into distinct capability layers.</p>
+      </div>
+      <div class="card-grid">
+        <article class="card safe"><div class="icon">⌕</div><h3>Launcher-owned local index</h3><p>Search app names, localized aliases, pinyin, filenames, extensions, dates, and bounded metadata without relying on Spotlight for interactive results.</p></article>
+        <article class="card"><div class="icon">↗</div><h3>Useful file actions</h3><p>Local results open quickly. Assistant results select on one click, open on double-click, and provide Open, Reveal in Finder, and Copy Path.</p></article>
+        <article class="card copyonly"><div class="icon">⧉</div><h3>Copy-only organization</h3><p>Original files never move, rename, change, or disappear. Existing destinations are never overwritten, including when a collision appears after preview.</p></article>
+        <article class="card"><div class="icon">拼</div><h3>Chinese and pinyin</h3><p><code>微信</code>, <code>weixin</code>, and <code>wx</code> can find localized apps. Both ASCII and full-width workflow symbols are recognized.</p></article>
+        <article class="card"><div class="icon">40</div><h3>Bounded and complete</h3><p>Normal results are scrollable and bounded. Copy Organize refuses more than 40 matches or any incomplete index so every proposed action remains reviewable.</p></article>
+        <article class="card safe"><div class="icon">⌁</div><h3>Narrow permissions</h3><p>No Accessibility, Input Monitoring, or Full Disk Access. JBar uses ordinary folder consent and exposes permission/index gaps instead of hiding them.</p></article>
+      </div>
+    </section>
 
-<section id="why">
-  <h2>Why this exists</h2>
-  <p class="sub">Not because Spotlight is badly built — because a whole-Mac content index is fragile in
-    ways a launcher can't tolerate.</p>
-  <div class="why">
-    <p>On <strong>2026-08-19</strong>, Spotlight on the development machine could not find a single one
-      of the <strong>1,101 files in <code>~/Downloads</code></strong>. An unclean shutdown had caused
-      macOS to throw away an index that had been silently corrupt since 03:27, and it spent the next two
-      hours rebuilding 1.77 million records:</p>
-    <div class="log">14:11:07  CIMetaInfoOpenAndLock failed 68 → Index shut down → Creating New Index
-14:11:10  *** PRESCAN SCAN STARTED fullScan:1 bootCacheUUIDMismatch:1 ***
-14:14:26  SyncScanComplete result:0 fullScan:1 (import records:1,767,279)</div>
-    <p>Meanwhile <strong>34%</strong> of everything it had indexed under the home directory was
-      <code>node_modules</code>, and <code>mds</code> burned 160–400% CPU for over an hour importing
-      dependency trees while the user's documents waited in the queue.</p>
-    <p>That incident motivated a narrower launcher-owned index with explicit exclusions and FSEvents
-      updates. The current formal benchmark covers deterministic synthetic fixtures; a real-corpus
-      run must be repeated from the exact release binary before any refresh-time figure is published.
-      <a href="https://github.com/linjiw/jbar/blob/main/docs/DIAGNOSIS.md">Read the full forensic write-up →</a></p>
-  </div>
-</section>
+    <section id="workflows">
+      <div class="section-head">
+        <div><p class="eyebrow">Assisted workflows</p><h2>Codex plans. JBar decides what is allowed.</h2></div>
+        <p class="section-copy">A submitted prompt never becomes a shell command or an unbounded file capability. Typed plans are validated before local execution.</p>
+      </div>
+      <div class="workflow">
+        <article class="workflow-card">
+          <p class="eyebrow">? or ？</p>
+          <h3>Find files by describing them</h3>
+          <p>Codex receives your question, locale, time zone, and a fixed scope label. It does not receive your index, paths, results, history, or file tools.</p>
+          <div class="example">？ 找到上周修改的所有 PDF 报告</div>
+          <ul>
+            <li>strict name, extension, kind, date, size, and sort schema</li>
+            <li>one immutable local-index generation</li>
+            <li>single-click select, double-click open, right-click actions</li>
+          </ul>
+        </article>
+        <article class="workflow-card">
+          <p class="eyebrow">&gt; or ＞</p>
+          <h3>Develop in a separate workspace</h3>
+          <p>The Developer Agent is a terminal-style, ephemeral Codex conversation rooted in an owner-controlled <code>~/jbar</code>. Its commands and file changes stay visible in the transcript.</p>
+          <div class="example">&gt; review the index crawler and run focused tests</div>
+          <ul>
+            <li>Return sends; Shift-Return inserts a newline</li>
+            <li>Stop interrupts the active turn</li>
+            <li>closing stops the app-server child</li>
+          </ul>
+        </article>
+        <article class="workflow-card full">
+          <div>
+            <p class="eyebrow">! or ！</p>
+            <h3>Organize copies across the complete configured index</h3>
+            <p>“Global” means every readable root in <code>fileRoots</code>, after your exclusions and macOS permissions. JBar does not bypass protected folders or scan an unconfigured disk.</p>
+            <div class="example">！ 把所有 receipt PDF 复制到按月份整理的文件夹</div>
+          </div>
+          <div class="steps">
+            <div class="step"><strong>Plan the search.</strong> Codex returns restricted metadata filters.</div>
+            <div class="step"><strong>Prove completeness.</strong> JBar rejects active, denied, capped, cancelled, or oversized searches.</div>
+            <div class="step"><strong>Choose a destination.</strong> No write scope is inferred from the prompt.</div>
+            <div class="step"><strong>Review every row.</strong> Copies, collisions, skips, and omissions are visible.</div>
+            <div class="step"><strong>Copy once.</strong> Native APIs use read-only sources and exclusive destinations; originals stay unchanged.</div>
+          </div>
+        </article>
+      </div>
+    </section>
 
-<section id="features">
-  <h2>What it does</h2>
-  <div class="grid">
-    <div class="feat"><h3>Acronyms &amp; fuzzy</h3><p><span class="kbd">vsc</span> → Visual Studio Code,
-      <span class="kbd">xc</span> → Xcode. An fzf-style Smith-Waterman scorer with word-boundary and
-      camelCase bonuses, behind a 64-bit character-mask prefilter.</p></div>
-    <div class="feat"><h3>Chinese &amp; pinyin</h3><p><span class="kbd">wx</span>, <span class="kbd">weixin</span>
-      and <span class="kbd">微信</span> can find WeChat. Pinyin aliases (with heteronym overrides) are
-      precomputed for CJK application display/localized names.</p></div>
-    <div class="feat"><h3>Learns what you open</h3><p>Mozilla-style frecency with a 7-day half-life, plus
-      a bounded query-pick boost for the last successful selection from the same normalized query.</p></div>
-    <div class="feat"><h3>Bounded path browsing</h3><p>Type <span class="kbd">~/Dow</span> and press Tab.
-      JBar streams one directory, retains a bounded best-result set, cancels stale scans, and shows
-      <span class="kbd">PATH · shown/total</span> when results are truncated.</p></div>
-    <div class="feat"><h3>Screen-aware result viewport</h3><p>The scrollable result pool is separate from
-      visible rows. Short displays reduce panel height and Page Up/Down stride through the same layout
-      calculation, while overflow remains reachable and visibly indicated.</p></div>
-    <div class="feat"><h3>Knows what's junk</h3><p><code>node_modules</code>, <code>.venv</code>,
-      conda stores and <code>go/pkg</code> are excluded by default; <code>vendor/</code>, <code>build/</code>,
-      <code>dist/</code> and similar trees remain searchable but are de-ranked.</p></div>
-    <div class="feat"><h3>IME-aware keyboard flow</h3><p>Return opens, ⌘Return reveals, and ⌘C copies.
-      Control/Delete never close the panel; marked text keeps Escape and commands in AppKit's input
-      system. Physical Chinese/Korean/Japanese verification is still a release gate.</p></div>
-    <div class="feat"><h3>Confirmed application opens</h3><p>JBar waits for LaunchServices' asynchronous
-      result before hiding the panel or recording application history. Failed or missing launches stay
-      unrecorded; richer inline failure feedback is still planned.</p></div>
-    <div class="feat"><h3>Narrow permissions</h3><p>The hotkey uses Carbon's
-      <code>RegisterEventHotKey</code>, so JBar never asks for Accessibility, Input Monitoring or Full
-      Disk Access — only the standard folder prompts.</p></div>
-    <div class="feat"><h3>Local, bounded state</h3><p>Config, filename-metadata snapshot, and frecency
-      history remain local, use bounded reads and owner-only atomic writes, and can be cleared
-      independently. History still contains sensitive paths and query picks.</p></div>
-  </div>
-</section>
+    <section id="install">
+      <div class="section-head">
+        <div><p class="eyebrow">Installation</p><h2>Choose the path that matches your build.</h2></div>
+        <p class="section-copy">The current source tree contains the newest assisted workflows. Published GitHub and npm previews may trail it; check release notes before choosing a prebuilt app.</p>
+      </div>
+      <div class="install-grid">
+        <article class="install-card recommended">
+          <span class="pill">Newest features</span>
+          <h3>Build current source</h3>
+          <p>macOS 13+ and Xcode Command Line Tools. Builds, validates, installs, and launches a Universal 2 development app without sudo.</p>
+          <div class="mini-command"><span id="source-command">git clone https://github.com/linjiw/jbar.git<br>cd jbar<br>make install</span><button class="mini-copy" type="button" data-copy="source-command" aria-label="Copy source installation command">Copy</button></div>
+        </article>
+        <article class="install-card">
+          <span class="pill">No toolchain</span>
+          <h3>GitHub Release</h3>
+          <p>Downloads a versioned ad-hoc Universal 2 preview and verifies its checksum, signature, identity, architectures, and minimum OS.</p>
+          <div class="mini-command"><span id="release-command">curl -fsSL https://raw.githubusercontent.com/linjiw/jbar/main/scripts/install-from-github.sh | bash</span><button class="mini-copy" type="button" data-copy="release-command" aria-label="Copy GitHub Release installation command">Copy</button></div>
+        </article>
+        <article class="install-card">
+          <span class="pill">Node 18+</span>
+          <h3>npm</h3>
+          <p>A small installer for the same native GitHub Release. npm is not a runtime dependency and JBar is not an Electron application.</p>
+          <div class="mini-command"><span id="npm-command">npm install --global @linjiw/jbar<br>jbar</span><button class="mini-copy" type="button" data-copy="npm-command" aria-label="Copy npm installation command">Copy</button></div>
+        </article>
+      </div>
+      <div class="first-run" aria-label="First-run steps">
+        <div><strong>1 · Launch</strong><span>Open JBar from Applications.</span></div>
+        <div><strong>2 · Approve roots</strong><span>Allow only the macOS folders you want indexed.</span></div>
+        <div><strong>3 · Let it index</strong><span>Wait for the menu status to report a completed item count.</span></div>
+        <div><strong>4 · Press ⌥Space</strong><span>Search locally, or explicitly submit an assisted prefix.</span></div>
+      </div>
+      <div class="notice"><strong>Developer preview:</strong> current builds are ad-hoc signed and not notarized. Keep Gatekeeper enabled and do not remove quarantine. Building from a trusted checkout avoids downloading a prebuilt app but still produces a development signature.</div>
+    </section>
 
-<section id="install">
-  <h2>Install</h2>
-  <p class="sub">JBar is a free developer preview. GitHub Releases and npm both use the same ad-hoc-signed
-    Universal 2 ZIP; Apple Silicon Macs run the native arm64 slice. macOS may ask you to approve its first launch.</p>
-<pre><span class="c"># GitHub Release</span>
-curl -fsSL https://raw.githubusercontent.com/linjiw/jbar/main/scripts/install-from-github.sh | bash
+    <section id="settings">
+      <div class="section-head">
+        <div><p class="eyebrow">Settings</p><h2>Simple menu. Precise JSON when you need it.</h2></div>
+        <p class="section-copy">Open the menu-bar item for everyday controls or press ⌘, to edit the hot-reloaded configuration. Invalid changes keep the last-known-good settings.</p>
+      </div>
+      <div class="settings-shell">
+        <div class="settings-top">
+          <div>
+            <h3>Configuration file</h3>
+            <p><code>~/.config/jbar/config.json</code><br>or <code>$XDG_CONFIG_HOME/jbar/config.json</code> when the environment value is absolute.</p>
+            <p>Missing keys use defaults. The generated file includes complete app roots, excluded paths/names, and downranked names. Changes that affect index scope invalidate the old snapshot.</p>
+          </div>
+<pre>{
+  "hotkey": "option+space",
+  "launchAtLogin": true,
+  "maxResults": 40,
+  "visibleRows": 8,
+  "appsFirstCap": 5,
+  "screen": "mouse",
+  "fileRoots": ["~"],
+  "includeHidden": false,
+  "maxDepth": 12,
+  "maxIndexedItems": 1000000
+}</pre>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Setting</th><th>Default</th><th>What it controls</th></tr></thead>
+            <tbody>
+              <tr><td>hotkey</td><td>option+space</td><td>Global shortcut using fixed physical US-ANSI key positions.</td></tr>
+              <tr><td>launchAtLogin</td><td>true</td><td>Login item registration through macOS <code>SMAppService</code>.</td></tr>
+              <tr><td>maxResults</td><td>40</td><td>Scrollable result pool, from 1 to 500.</td></tr>
+              <tr><td>visibleRows</td><td>8</td><td>Requested on-screen rows, from 1 to 20; reduced on short screens.</td></tr>
+              <tr><td>appsFirstCap</td><td>5</td><td>Maximum app rows before file results.</td></tr>
+              <tr><td>screen</td><td>mouse</td><td>Show on the <code>mouse</code>, <code>main</code>, or <code>active</code> screen.</td></tr>
+              <tr><td>restoreQueryOnReopen</td><td>false</td><td>Restore the previous draft when the launcher reopens.</td></tr>
+              <tr><td>showRecentsOnEmpty</td><td>true</td><td>Show local frecency history for an empty query.</td></tr>
+              <tr><td>appDirectories</td><td>system roots</td><td>Directories scanned for applications and localized aliases.</td></tr>
+              <tr><td>fileRoots</td><td>["~"]</td><td>Up to 128 roots used by local file search and complete <code>!</code> search.</td></tr>
+              <tr><td>excludePaths</td><td>curated</td><td>Absolute or <code>~/</code> paths never descended; final-component <code>*</code> globs are allowed.</td></tr>
+              <tr><td>excludeNames</td><td>curated</td><td>Directory names never descended at any depth.</td></tr>
+              <tr><td>downrankNames</td><td>curated</td><td>Searchable build/vendor trees that receive a ranking penalty.</td></tr>
+              <tr><td>includeHidden</td><td>false</td><td>Include dotfiles in the persistent index.</td></tr>
+              <tr><td>maxDepth</td><td>12</td><td>Maximum file crawl depth, from 0 to 64.</td></tr>
+              <tr><td>maxIndexedItems</td><td>1,000,000</td><td>Shared application and file hard cap, up to 2,000,000.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+      <div class="menu-strip" aria-label="Menu-bar controls">
+        <span>Open JBar</span><span>Rebuild Index</span><span>Clear Search History…</span><span>Launch at Login</span><span>Open Config File…</span><span>Index &amp; permission status</span><span>Build identity</span>
+      </div>
+    </section>
 
-<span class="c"># npm (Node 18+)</span>
-npm install --global @linjiw/jbar
-jbar
+    <section id="safety">
+      <div class="section-head">
+        <div><p class="eyebrow">Privacy and safety</p><h2>Small capabilities, visible boundaries.</h2></div>
+        <p class="section-copy">JBar is designed so a natural-language request does not silently become broad file access, destructive mutation, or an arbitrary tool call.</p>
+      </div>
+      <div class="safety">
+        <div class="safety-callout">
+          <h3>Local first is a behavior, not a slogan.</h3>
+          <p>The local launcher, persistent index, ranking, path browsing, and frecency remain on the Mac. Only an explicit submitted assisted request starts Codex.</p>
+        </div>
+        <div class="checks">
+          <div class="check"><strong>No document contents</strong>The persistent index stores filename and path metadata, not file contents.</div>
+          <div class="check"><strong>No path disclosure in Assistant</strong>Codex creates the plan; JBar searches and exposes exact paths locally.</div>
+          <div class="check"><strong>No destructive organize</strong>Copies only, exclusive destinations, no overwrite, and no original mutation.</div>
+          <div class="check"><strong>No silent incomplete result</strong>Denied paths, crawl caps, cancellation, or more than 40 organize matches stop the workflow.</div>
+          <div class="check"><strong>Isolated ChatGPT state</strong>JBar uses its own Codex home and no API-key or alternate-provider fallback.</div>
+          <div class="check"><strong>No elevated input permission</strong>The Carbon hotkey avoids Accessibility and Input Monitoring access.</div>
+        </div>
+      </div>
+      <div class="notice">Codex-backed workflows use the signed-in user's Codex allowance or credits and require the official Codex CLI 0.149.0 or newer. JBar does not bundle Codex, read its OAuth token, or add a separate AI charge.</div>
+      <div class="links-card">
+        <a href="https://github.com/linjiw/jbar/blob/main/docs/PRIVACY.md">Privacy details →</a>
+        <a href="https://github.com/linjiw/jbar/blob/main/docs/ASSISTED-WORKFLOWS-DESIGN.md">Workflow design →</a>
+        <a href="https://github.com/linjiw/jbar/blob/main/docs/UX-TESTS.md">UX test matrix →</a>
+        <a href="https://github.com/linjiw/jbar/blob/main/docs/PERFORMANCE.md">Performance evidence →</a>
+      </div>
+    </section>
 
-<span class="c"># Or run once without installing globally</span>
-npx --yes @linjiw/jbar</pre>
-  <h3>Build from source</h3>
-  <p class="sub">The best option if you prefer not to approve an unsigned preview. Requires macOS 13+
-    and Xcode command-line tools.</p>
-<pre><span class="c"># Build, validate, stage, and install the development app.</span>
-git clone https://github.com/linjiw/jbar.git
-cd jbar
-make install</pre>
-  <p class="sub" style="margin-top:16px">Press <strong>⌥Space</strong>. On your first search macOS asks
-    for protected-folder access as needed by configured roots. The prebuilt installers verify the
-    release checksum and preserve quarantine metadata; do not disable Gatekeeper or remove quarantine.</p>
-</section>
+    <section id="limits">
+      <div class="section-head">
+        <div><p class="eyebrow">Honest boundaries</p><h2>Know which search tool you are using.</h2></div>
+        <p class="section-copy">Spotlight searches document contents across a macOS-managed scope. JBar searches names and bounded metadata across roots you configure. They solve different problems.</p>
+      </div>
+      <div class="card-grid">
+        <article class="card"><h3>JBar is best for</h3><ul><li>opening apps by acronym, alias, or pinyin</li><li>finding files by name, type, date, and bounded size</li><li>safe reviewed copy organization</li></ul></article>
+        <article class="card"><h3>Spotlight is best for</h3><ul><li>phrases inside PDFs and documents</li><li>OCR and system-managed metadata</li><li>content search outside JBar's configured roots</li></ul></article>
+        <article class="card"><h3>Still a preview</h3><ul><li>ad-hoc signed, not notarized</li><li>physical IME and complete OS/CPU release matrix pending</li><li>published builds may trail current source</li></ul></article>
+      </div>
+    </section>
+  </main>
 
-<section id="how">
-  <h2>How it works</h2>
-  <p class="sub">Three targets, zero dependencies, system frameworks only.</p>
-<pre>Hotkey (Carbon)  →  NSPanel + NSTableView  →  SearchEngine (actor)
-                                                     ↓ reads
-                       IndexStore  ←  Indexer: AppScanner · Crawler · FSEvents · Snapshot</pre>
-  <div class="grid" style="margin-top:16px">
-    <div class="feat"><h3>Flat, bounded index</h3><p>Parallel arrays plus UTF-8 name
-      arenas. Paths are reconstructed on demand from a directory table rather
-      than stored per file.</p></div>
-    <div class="feat"><h3>Packed postings, mask, then DP</h3><p>A cache-cold query enters through the
-      rarest safe one of 38 packed character postings; each remaining item still carries a full 64-bit
-      mask before fuzzy scoring. A bounded rerank window limits later path/frecency work.</p></div>
-    <div class="feat"><h3>Shared hard cap</h3><p>Application scan, full crawl, and incremental updates
-      share the configured item budget. Invalid or oversized generations fail closed instead of being
-      published.</p></div>
-    <div class="feat"><h3>Incremental, not periodic</h3><p>One FSEvents stream covers every root;
-      changed directories are re-listed and the index is rebuilt as an immutable generation and swapped
-      atomically.</p></div>
-  </div>
-  <p class="sub" style="margin-top:16px">Architecture, data model, input behavior, persistence, ranking,
-    evidence, and release boundaries:
-    <a href="https://github.com/linjiw/jbar/blob/main/docs/DESIGN.md">docs/DESIGN.md</a>.</p>
-</section>
-
-<section id="limits">
-  <h2>Boundaries and release status</h2>
-  <div class="card">
-    <p style="margin:0 0 10px"><strong>Spotlight searches file contents. JBar does not.</strong> If you
-      need to find a phrase inside a PDF or a Pages document, Spotlight is the right tool — JBar (v1)
-      indexes names and metadata only.</p>
-    <p style="margin:0 0 10px">Spotlight also covers a macOS-managed scope; JBar covers readable roots
-      you configure after exclusions, depth, and a shared item cap. A bounded top-K can omit one of many
-      duplicate filenames even when it is indexed.</p>
-    <p style="margin:0">Automated marked-text/layout regressions, a packaged synthetic AppKit event smoke,
-      and a Universal 2 build with native arm64/Rosetta CLI checks are useful evidence. They do not prove
-      a physical IME, native Intel, macOS 13 runtime, LaunchServices, or release trust. Physical Sequoia
-      Chinese input, the remaining OS/language/layout matrix, native Intel runtime, and the Developer ID
-      notarized/stapled/Gatekeeper artifact remain pending. See the
-      <a href="https://github.com/linjiw/jbar/blob/main/docs/SUPPORT.md">support policy</a> and
-      <a href="https://github.com/linjiw/jbar/blob/main/docs/UX-TESTS.md">executable UX matrix</a>.</p>
-  </div>
-</section>
-
-<footer>
-  <span>JBar · MIT · <a href="https://github.com/linjiw/jbar">github.com/linjiw/jbar</a></span>
-  <span>Swift + AppKit · intended macOS 13+ Universal 2 release</span>
-</footer>
-
+  <footer>
+    <div class="footer-inner">
+      <span>JBar · Swift + AppKit · MIT © Linji Wang</span>
+      <span><a href="https://github.com/linjiw/jbar">Source</a> · <a href="https://github.com/linjiw/jbar/blob/main/docs/SUPPORT.md">Support</a> · <a href="https://github.com/linjiw/jbar/blob/main/LICENSE">License</a></span>
+    </div>
+  </footer>
 </div>
 
 <script>
-  var copyBtn = document.getElementById("copy");
-  copyBtn.addEventListener("click", function(){
-    var text = document.getElementById("cmd").textContent;
-    navigator.clipboard.writeText(text).then(function(){
-      copyBtn.textContent = "Copied";
-      setTimeout(function(){ copyBtn.textContent = "Copy"; }, 1600);
-    }, function(){ copyBtn.textContent = "Press ⌘C"; });
+  function copyText(button) {
+    var target = document.getElementById(button.getAttribute("data-copy"));
+    if (!target) return;
+    var text = target.innerText.replace(/\u00a0/g, " ").trim();
+    var previous = button.textContent;
+    button.textContent = "Copying…";
+    var done = function () {
+      button.textContent = "Copied";
+      window.setTimeout(function () { button.textContent = previous; }, 1500);
+    };
+    var failed = function () {
+      button.textContent = "Select & copy";
+      window.setTimeout(function () { button.textContent = previous; }, 1800);
+    };
+    if (window.navigator && window.navigator.clipboard && window.isSecureContext) {
+      window.navigator.clipboard.writeText(text).then(done, failed);
+    } else {
+      var area = document.createElement("textarea");
+      area.value = text;
+      area.setAttribute("readonly", "");
+      area.style.position = "fixed";
+      area.style.opacity = "0";
+      document.body.appendChild(area);
+      area.select();
+      try { document.execCommand("copy") ? done() : failed(); } catch (error) { failed(); } finally { area.remove(); }
+    }
+  }
+  document.querySelectorAll("[data-copy]").forEach(function (button) {
+    button.addEventListener("click", function () { copyText(button); });
   });
 </script>
 </body>

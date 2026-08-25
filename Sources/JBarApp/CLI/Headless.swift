@@ -20,6 +20,8 @@ enum CLI {
         guard args.count > 1 else { return nil }
         switch args[1] {
         case "--version", "-v":
+            // Keep this machine-readable contract stable for the packager and external launchers.
+            // The richer local-build fingerprint remains visible in About, the status menu, and logs.
             print("JBar \(Runtime.version)")
             exit(0)
         case "--help", "-h":

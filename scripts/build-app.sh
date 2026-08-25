@@ -462,7 +462,8 @@ fi
 
 codesign "${SIGN_ARGS[@]}" "$STAGED_APP"
 codesign --verify --deep --strict --verbose=2 "$STAGED_APP"
-if [ "$("$STAGED_APP/Contents/MacOS/JBar" --version)" != "JBar $VERSION" ]; then
+EXECUTABLE_VERSION="$("$STAGED_APP/Contents/MacOS/JBar" --version)"
+if [[ "$EXECUTABLE_VERSION" != "JBar $VERSION" && "$EXECUTABLE_VERSION" != "JBar $VERSION ("* ]]; then
   echo "error: executable version does not match staged Info.plist version '$VERSION'" >&2
   exit 1
 fi

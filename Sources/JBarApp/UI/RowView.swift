@@ -10,6 +10,9 @@ enum PanelRow: Equatable {
     case hint(String)
     /// Path-mode listing taking longer than ~300 ms.
     case loading
+    /// A non-selectable action prompt, state, or response. Action rows never carry a path and
+    /// cannot be opened/revealed/copied through the launcher result pipeline.
+    case action(message: String, symbol: String)
 
     var result: ResultRow? {
         if case .result(let r) = self { return r }
@@ -51,19 +54,35 @@ final class ResultRowView: NSTableRowView {
     static let selectionAlpha: CGFloat = 0.18
     static let selectionRadius: CGFloat = 8
 
-    override func drawSelection(in dirtyRect: NSRect) {
-        guard selectionHighlightStyle != .none else { return }
+    /// AppKit can ask a freshly-created row to draw before the table has received its constrained
+    /// size. `insetBy` turns a zero-sized placeholder into a negative rectangle, which produces
+    /// runtime geometry faults even though the final row looks correct. Drawing is simply deferred
+    /// until both dimensions are positive.
+    nonisolated static func selectionRect(in bounds: NSRect) -> NSRect? {
         let rect = bounds.insetBy(dx: 8, dy: 2)
+        return rect.width > 0 && rect.height > 0 ? rect : nil
+    }
+
+    nonisolated static func separatorRect(in bounds: NSRect, isFlipped: Bool) -> NSRect? {
+        let width = bounds.width - 32
+        guard width > 0, bounds.height >= 1 else { return nil }
+        let y: CGFloat = isFlipped ? 0 : bounds.height - 1
+        return NSRect(x: 16, y: y, width: width, height: 1)
+    }
+
+    override func drawSelection(in dirtyRect: NSRect) {
+        guard selectionHighlightStyle != .none,
+              let rect = Self.selectionRect(in: bounds) else { return }
         NSColor.controlAccentColor.withAlphaComponent(Self.selectionAlpha).setFill()
         NSBezierPath(roundedRect: rect, xRadius: Self.selectionRadius, yRadius: Self.selectionRadius).fill()
     }
 
     override func drawBackground(in dirtyRect: NSRect) {
         super.drawBackground(in: dirtyRect)
-        guard drawsTopSeparator else { return }
-        let y: CGFloat = isFlipped ? 0 : bounds.height - 1
+        guard drawsTopSeparator,
+              let rect = Self.separatorRect(in: bounds, isFlipped: isFlipped) else { return }
         NSColor.separatorColor.setFill()
-        NSRect(x: 16, y: y, width: bounds.width - 32, height: 1).fill()
+        rect.fill()
     }
 }
 
@@ -133,6 +152,7 @@ final class ResultCellView: NSTableCellView {
     /// Show a search result.
     func configure(with row: ResultRow) {
         path = row.path
+        toolTip = row.path
         iconView.isHidden = false
         iconView.image = IconCache.icon(forPath: row.path)
         let matched = TextAnalyzer.characterIndices(display: row.name, matchedFoldedByteOffsets: row.matchedByteOffsets)
@@ -148,6 +168,7 @@ final class ResultCellView: NSTableCellView {
     /// Show an informational message (empty state, hint, loading).
     func configure(message: String, symbol: String?) {
         path = nil
+        toolTip = message
         if let s = symbol, let img = NSImage(systemSymbolName: s, accessibilityDescription: nil) {
             iconView.isHidden = false
             iconView.image = img
