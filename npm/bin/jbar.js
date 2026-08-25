@@ -127,10 +127,17 @@ function run(command, args, options = {}) {
 
 async function resolveTag(requestedTag) {
   if (requestedTag !== "latest") return requestedTag;
-  const release = JSON.parse((await request(`https://api.github.com/repos/${repository}/releases/latest`, {
+  const releases = JSON.parse((await request(`https://api.github.com/repos/${repository}/releases?per_page=1`, {
     maxBytes: 1024 * 1024,
   })).toString("utf8"));
-  if (!release || typeof release.tag_name !== "string") throw new Error("GitHub returned no stable release tag");
+  return latestPublishedReleaseTag(releases);
+}
+
+function latestPublishedReleaseTag(releases) {
+  const release = Array.isArray(releases) ? releases[0] : undefined;
+  if (!release || release.draft === true || typeof release.tag_name !== "string") {
+    throw new Error("GitHub returned no published release tag");
+  }
   return normalizeTag(release.tag_name);
 }
 
@@ -187,4 +194,8 @@ async function main() {
   await install(options);
 }
 
-main().catch((error) => fail(error instanceof Error ? error.message : String(error)));
+if (require.main === module) {
+  main().catch((error) => fail(error instanceof Error ? error.message : String(error)));
+}
+
+module.exports = { latestPublishedReleaseTag };

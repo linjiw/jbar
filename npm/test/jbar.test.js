@@ -4,6 +4,7 @@ const { spawnSync } = require("node:child_process");
 const test = require("node:test");
 
 const entrypoint = path.resolve(__dirname, "../bin/jbar.js");
+const { latestPublishedReleaseTag } = require(entrypoint);
 
 function run(...args) {
   return spawnSync(process.execPath, [entrypoint, ...args], { encoding: "utf8" });
@@ -25,4 +26,14 @@ test("rejects malformed release selectors before downloading", () => {
   const result = run("--tag", "not-a-version");
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /release tag must be latest or vMAJOR\.MINOR\.PATCH/);
+});
+
+test("latest includes a published developer preview", () => {
+  assert.equal(latestPublishedReleaseTag([
+    { tag_name: "v0.1.0", draft: false, prerelease: true },
+  ]), "v0.1.0");
+  assert.throws(() => latestPublishedReleaseTag([]), /no published release tag/);
+  assert.throws(() => latestPublishedReleaseTag([
+    { tag_name: "v0.1.0", draft: true, prerelease: false },
+  ]), /no published release tag/);
 });
