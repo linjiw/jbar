@@ -370,6 +370,20 @@ final class IndexCoordinatorTests: XCTestCase {
         coord.stop()
     }
 
+    func testCappedDirectoryGenerationIsNotPersistedAsCompleteSnapshot() throws {
+        try makeFiles(in: tempHome.appendingPathComponent("Documents"), count: 6)
+        var opts = makeOptions(fileRoots: ["~/Documents"])
+        opts.exclusions.maxDirEntries = 2
+        let coord = IndexCoordinator(options: opts)
+        startAndWait(coord, minCount: 1)
+        coord.flushSnapshot()
+
+        XCTAssertFalse(coord.status.cappedDirs.isEmpty)
+        XCTAssertFalse(fm.fileExists(atPath: snapshotURL.path),
+                       "a directory-capped generation must not masquerade as a complete snapshot")
+        coord.stop()
+    }
+
     func testAppRescanKeepsStoreCappedAndReportsOmission() throws {
         try makeApp("First")
         try makeFiles(in: tempHome.appendingPathComponent("Documents"), count: 8)

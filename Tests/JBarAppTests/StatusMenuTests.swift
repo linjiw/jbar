@@ -45,4 +45,18 @@ final class StatusMenuTests: XCTestCase {
         menu.update(status: status)
         XCTAssertTrue(menu.itemTitles.contains("⚠ Skipped 1 unsafe filesystem entry"))
     }
+
+    func testBuildIdentityMakesAssistantCapabilityAndBinaryFingerprintVisible() {
+        _ = NSApplication.shared
+        let menu = StatusMenu(hotkeyDisplay: "⌥Space")
+        let buildLine = menu.itemTitles.first { $0.hasPrefix("Build: ") }
+
+        XCTAssertNotNil(buildLine)
+        XCTAssertTrue(buildLine?.contains("Assistant") == true)
+        XCTAssertTrue(buildLine?.contains("Organize") == true)
+        XCTAssertTrue(buildLine?.contains(Runtime.buildChannel) == true)
+        XCTAssertEqual(Runtime.buildFingerprint == "unavailable"
+                       || Runtime.buildFingerprint.count == 12, true)
+        XCTAssertFalse(Runtime.buildIdentity.contains(NSHomeDirectory()))
+    }
 }

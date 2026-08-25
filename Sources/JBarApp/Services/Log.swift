@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 import os
 
 /// Process-wide loggers. Read with:
@@ -30,10 +31,44 @@ enum Runtime {
     /// `JBAR_SNAPSHOT_DOWN=n` → move the selection down n rows before rendering, so a snapshot can show
     /// the list scrolled past the visible window.
     static var snapshotDown: Int { Int(ProcessInfo.processInfo.environment["JBAR_SNAPSHOT_DOWN"] ?? "") ?? 0 }
+    /// Source-build acceptance runs can isolate all mutable app state inside an explicit directory.
+    /// Production launches leave this unset and retain the normal macOS locations.
+    static var testStateRoot: URL? {
+        guard let raw = ProcessInfo.processInfo.environment["JBAR_TEST_STATE_ROOT"],
+              raw.hasPrefix("/"), !raw.utf8.contains(0) else { return nil }
+        return URL(fileURLWithPath: raw, isDirectory: true).standardizedFileURL
+    }
+    /// Keeps the transient launcher panel visible while an accessibility test driver inspects it.
+    /// It is never enabled by a normal launch and does not change Return/action behavior.
+    static var keepPanelOpenForUITesting: Bool { flag("JBAR_UI_TEST_KEEP_PANEL_OPEN") }
 
     /// Marketing version from the bundle's Info.plist, or a dev marker when run from the SwiftPM binary.
     static var version: String {
         (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "0.1.0-dev"
+    }
+
+    static var buildNumber: String {
+        (Bundle.main.infoDictionary?["CFBundleVersion"] as? String) ?? "swiftpm"
+    }
+
+    static var buildChannel: String {
+        if let provenance = Bundle.main.infoDictionary?["JBarBuildProvenance"] as? String,
+           !provenance.isEmpty { return "local bundle" }
+        return Bundle.main.bundleIdentifier == "com.linji.jbar" ? "bundle" : "SwiftPM source"
+    }
+
+    /// Short exact-executable hash, useful when an old installed app and a current source build are
+    /// both present. It is calculated once and never includes a user path in UI or logs.
+    static let buildFingerprint: String = {
+        guard let executable = Bundle.main.executableURL,
+              let data = try? Data(contentsOf: executable, options: .mappedIfSafe) else {
+            return "unavailable"
+        }
+        return SHA256.hash(data: data).prefix(6).map { String(format: "%02x", $0) }.joined()
+    }()
+
+    static var buildIdentity: String {
+        "\(version) (\(buildNumber)) · \(buildChannel) · \(buildFingerprint) · Assistant + Organize"
     }
 
     private static func flag(_ name: String) -> Bool {

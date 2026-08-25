@@ -623,9 +623,13 @@ assert_plain_bundle_tree "$SOURCE_APP"
   fail "source bundle already contains the private smoke marker"
 /usr/bin/codesign --verify --deep --strict "$SOURCE_APP" >/dev/null 2>&1 || fail "source app signature is invalid"
 SOURCE_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$SOURCE_PLIST")"
+SOURCE_BUILD="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$SOURCE_PLIST")"
 bundle_manifest "$SOURCE_APP" "$SOURCE_BEFORE"
-[ "$("$SOURCE_EXECUTABLE" --version)" = "JBar $SOURCE_VERSION" ] ||
-  fail "source executable version does not match Info.plist"
+SOURCE_VERSION_OUTPUT="$("$SOURCE_EXECUTABLE" --version)"
+case "$SOURCE_VERSION_OUTPUT" in
+  "JBar $SOURCE_VERSION"|"JBar $SOURCE_VERSION ($SOURCE_BUILD) · "*) ;;
+  *) fail "source executable version does not match Info.plist" ;;
+esac
 
 /usr/bin/ditto --noqtn "$SOURCE_APP" "$CLONE_APP"
 assert_plain_bundle_tree "$CLONE_APP"
@@ -650,8 +654,11 @@ assert_plain_bundle_tree "$CLONE_APP"
   fail "derived executable identity mismatch"
 [ "$(/usr/libexec/PlistBuddy -c "Print :$SMOKE_MARKER_KEY" "$CLONE_PLIST")" = "$SMOKE_MARKER_VERSION" ] ||
   fail "derived smoke version marker mismatch"
-[ "$("$DERIVED_EXECUTABLE_PATH" --version)" = "JBar $SOURCE_VERSION" ] ||
-  fail "derived executable version does not match the verified source"
+DERIVED_VERSION_OUTPUT="$("$DERIVED_EXECUTABLE_PATH" --version)"
+case "$DERIVED_VERSION_OUTPUT" in
+  "JBar $SOURCE_VERSION"|"JBar $SOURCE_VERSION ($SOURCE_BUILD) · "*) ;;
+  *) fail "derived executable version does not match the verified source" ;;
+esac
 
 for directory in "$STATE_ROOT" "$ISOLATION_ROOT" "$ISOLATED_HOME" "$ISOLATED_CONFIG" "$ISOLATED_TMP"; do
   /bin/mkdir -m 700 "$directory"

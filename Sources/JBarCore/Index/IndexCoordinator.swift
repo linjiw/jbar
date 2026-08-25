@@ -528,18 +528,19 @@ public final class IndexCoordinator: @unchecked Sendable {
             return
         }
         let completed = builder.build(generation: nextGeneration(), fsEventId: eventId)
-        let truncated = appHitCap || stats.hitItemCap
-        // A capped item/work budget or elapsed-time deadline produces a useful partial generation,
-        // but it is not an exact filesystem view: do not enable incremental updates or persist it as
-        // a complete snapshot. A later explicit rebuild may prove completeness.
-        guard publish(completed, complete: !truncated) else { return }
+        let hitBudget = appHitCap || stats.hitItemCap
+        let incomplete = hitBudget || !stats.deniedPaths.isEmpty || !stats.cappedDirs.isEmpty
+        // A capped budget/directory or denied location produces a useful launcher generation, but it
+        // is not an exact filesystem view: do not enable incremental updates or persist it as a
+        // complete snapshot. A later explicit rebuild may prove completeness.
+        guard publish(completed, complete: !incomplete) else { return }
         appliedEventId = eventId
-        dirty = !truncated
+        dirty = !incomplete
         setStatus {
             $0.phase = .idle; $0.deniedPaths = stats.deniedPaths; $0.cappedDirs = stats.cappedDirs
             $0.unsafeEntriesSkipped = stats.skippedUnsafe
             $0.appCount = completed.appItems.count
-            $0.hitItemCap = truncated; $0.lastBuilt = completed.builtAt
+            $0.hitItemCap = hitBudget; $0.lastBuilt = completed.builtAt
         }
         writeSnapshotIfDirty()
     }

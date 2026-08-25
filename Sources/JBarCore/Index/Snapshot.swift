@@ -526,6 +526,10 @@ public enum Snapshot {
         for r in appRoots.sorted() { h.update(r); h.update("\u{1}") }
         h.update("jbar.snapshot.max-items.v1")
         h.update(UInt64(IndexStoreLimits.normalizedMaxItems(maxItems)))
+        // v2 requires a crawl with no denied paths, capped directories, or global item cap before
+        // it may be persisted as complete. Invalidate older snapshots because they did not encode
+        // those completeness conditions and could otherwise make a global operation omit files.
+        h.update("jbar.snapshot.completeness-policy.v2")
         h.update(BonusConstants.hash)
         h.update(UInt64(schemaVersion))
         return h.value

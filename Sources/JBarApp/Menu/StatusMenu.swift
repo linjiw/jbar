@@ -119,6 +119,7 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         cfg.keyEquivalentModifierMask = [.command]
         menu.addItem(cfg)
         menu.addItem(.separator())
+        menu.addItem(disabled("Build: " + Runtime.buildIdentity))
         menu.addItem(action(title: "About JBar", selector: #selector(aboutAction)))
         menu.addItem(action(title: "Quit JBar", selector: #selector(quitAction)))
     }
@@ -192,7 +193,9 @@ final class StatusMenu: NSObject, NSMenuDelegate {
     @objc private func openConfigAction() { onOpenConfig?() }
     @objc private func aboutAction() {
         NSApp.activate(ignoringOtherApps: true)
-        NSApp.orderFrontStandardAboutPanel(nil)
+        NSApp.orderFrontStandardAboutPanel(options: [
+            .applicationVersion: Runtime.buildIdentity,
+        ])
     }
     @objc private func quitAction() {
         if let q = onQuit { q() } else { NSApp.terminate(nil) }

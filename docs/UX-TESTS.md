@@ -50,6 +50,8 @@ Test counts are deliberately omitted because they change with the implementation
 | AUTO-OPEN-01 | async app failure never records history; success records only after LaunchServices confirmation; dead history is pruned/persisted at startup | `swift test --filter AppLauncherTests` | Automated + Physical real app/failure |
 | AUTO-CONFIG-01 | range/size validation, legacy row migration, no-symlink bounded reads, atomic writes, and hot-reload last-good behavior | `swift test --filter ConfigTests` | Automated + Runtime |
 | AUTO-STATE-01 | owner-only atomic state, symlink/special-file refusal, and oversized history rejection | `swift test --filter SecureFileIOTests` | Automated + Runtime permission inspection |
+| AUTO-ASSIST-01 | strict closed `SearchPlan`, local metadata execution, bounded completeness, index-readiness fail-closed behavior, and explicit presentation boundary | `swift test --filter 'SearchPlanTests|AssistedSearchTests|PanelGeometryTests'` | Automated + real-account isolated E2E |
+| AUTO-ORG-01 | closed search + ID-only organize plans; whole-index completeness; collision/race/change handling; exclusive copy; originals unchanged; symlink/hard-link/40-result refusal | `swift test --filter 'OrganizePlanTests|CopyOperationExecutorTests|PanelGeometryTests'` | Automated + real-account isolated E2E |
 | AUTO-BENCH-01 | schema-1/workload-2 matrix, deterministic in-memory history, complete/non-cancelled responses, exact ordered-row + total parity, sample bounds, isolated state, safe report output, and no cross-tool speedup wording | `swift test --filter BenchmarkTests`; `scripts/tests/benchmark-report-gate.rb --self-test`; `scripts/tests/benchmark-release-tests.sh` | Automated + repeated benchmark evidence |
 | AUTO-APPKIT-01 | packaged-clone `NSApplication` lifecycle; dispatched Control `flagsChanged`, text, Delete, Down, Return; panel remains visible until the exact second fixture is recorded; clean termination and bounded crash-report diff | `scripts/tests/appkit-smoke.sh /absolute/path/JBar.app /absolute/new-evidence-directory` | Automated packaged smoke + Physical IME/keyboard + Release artifact |
 
@@ -218,7 +220,65 @@ JBAR_RUN_PATH_BENCHMARK=1 swift test -c release \
 
 The semantic and catastrophic-regression gates remain automated, but the older local timing distribution is not current-candidate evidence. Re-run this command on the candidate and retain every sample; do not copy values from another machine or source state.
 
-## 8. Performance and soak
+## 8. Assisted-workflow acceptance
+
+Use two disposable source folders and a separate destination inside an isolated test-state root.
+Include dated matching files in both sources, one unrelated file, and an existing destination that
+collides with one proposed copy. Record file lists, hashes, modes, and process tree before/after.
+
+1. Type a normal filename query. Confirm results update locally and no Codex child starts.
+2. Type `? find ...` without Return. Confirm no child starts. Press Return, complete isolated ChatGPT
+   sign-in if required, and confirm the result came from the local index. Single-click selects,
+   double-click opens, and right-click offers Open/Reveal/Copy Path for the exact row.
+3. Type `！ ...` without Return. Confirm no child or picker. Press Return, confirm both source roots
+   are found from the local index, choose the destination, and inspect every copy/skip/collision.
+4. Close one preview and verify hashes/paths are unchanged. Repeat, press Copy once, and verify ready
+   destinations were created, every original hash/path is unchanged, and the colliding destination is
+   byte-for-byte untouched. Confirm no move, rename, edit, delete, or overwrite occurred.
+5. During planning and after completion, close the assisted window and confirm its child process exits.
+6. Type `> ...` without Return. Confirm no child starts. Submit a read-only repository request, confirm
+   the separate Developer Agent window shows `~/jbar`, network-off, and ephemeral boundaries, then
+   close it and confirm its Codex app-server child exits.
+
+### 2026-08-25 candidate records
+
+The earlier locally installed Universal 2 candidate established the ordinary search, Assistant,
+index-readiness, and Developer Agent baselines. Its destructive organize prototype is superseded by
+the copy-only workflow below and is not current product behavior.
+
+The temporary Universal 2 global-copy candidate
+(`47ce1fda8b51bc5597569132560a4bdcdece35031994bb3d59fd8c7321a78c0b`) completed this isolated
+acceptance path on the development Mac:
+
+- ordinary typing returned fixture files without a JBar child process;
+- full-width `？ 找到所有 receipt-global PDF` started Codex only after Return and returned the two
+  exact files from separate Desktop and Downloads fixture roots;
+- single-click selected without opening, double-click opened the exact file, and the right-click menu
+  exposed Open, Reveal in Finder, and Copy Path; Finder selected the exact Downloads result;
+- full-width `！` searched the complete local fixture index, required an explicit destination, and
+  previewed one safe copy plus one collision before enabling Copy;
+- Copy left both source hashes and the colliding destination hash unchanged, created only the safe
+  destination with mode `0600`, and produced a byte-identical copy;
+- the accepted readiness policy stops before Codex when a crawl is incomplete, globally capped,
+  directory-capped, or permission-denied, and the snapshot compatibility marker forces older
+  pre-policy snapshots to rebuild; and
+- a read-only `>` request ran in the visibly separate `~/jbar`, network-off, ephemeral Developer Agent
+  window and its direct Codex app-server child exited after the window closed.
+
+The final temporary Universal 2 candidate binary
+(`a9ff10258d80960fb7cd1b9af7d41ff76e3b1b4add800394bc7d56f36d3e5927`) passed strict codesign
+verification and the packaged AppKit lifecycle smoke. Both strict-concurrency Debug and Release
+suites passed with 643 tests executed, 2 skipped, and zero failures in each configuration. The
+100,000-item assisted-search structural test took 0.848 seconds in Release while retaining only the
+40 preview rows. Transactional build safety, all 34 isolated installer cases, and all 38 isolated
+package cases passed. The global-copy preview screenshot, fixture hashes, copied output, and smoke
+evidence are retained under `.build/jbar-e2e/`.
+
+This is focused local development and exact installed-app evidence. It is not a Developer ID/notarized
+release, physical IME result, native Intel runtime result, multi-OS result, or a substitute for the
+remaining release matrix.
+
+## 9. Performance and soak
 
 Run the reproducible harness without selecting a best run:
 
@@ -241,7 +301,7 @@ The complete p95/p99/max distributions and retained high-tail samples live in th
 
 For a two-hour soak, repeatedly open/hide, type/delete, switch input sources, rebuild, edit config atomically/in place, sleep/wake, attach/detach displays, and open items. Record peak/steady RSS, CPU/energy while idle and indexing, index generation/count, responsiveness, crash/hang reports, and state-file validity after force quit/relaunch. Define acceptance numbers before interpreting the output.
 
-## 9. OS, CPU, and release matrix
+## 10. OS, CPU, and release matrix
 
 The exact required combinations are in [SUPPORT.md](SUPPORT.md). At minimum the release record must contain runtime evidence for macOS 13 Ventura, 14 Sonoma, 15 Sequoia, and the current shipping macOS, across both `arm64` and `x86_64`. Cross-compiling or seeing both `lipo` slices is not Intel runtime evidence.
 
@@ -256,7 +316,7 @@ lipo -archs JBar.app/Contents/MacOS/JBar
 
 Then test first launch, Gatekeeper with quarantine intact, protected-folder consent, hotkey conflict/fallback, login-item approval/relaunch, upgrade replacement, rollback after an injected install failure, and uninstall/purge. Do not use `xattr -d`/`xattr -dr` as an acceptance step.
 
-## 10. Evidence record template
+## 11. Evidence record template
 
 ```text
 ID:

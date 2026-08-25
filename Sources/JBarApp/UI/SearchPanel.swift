@@ -1,5 +1,6 @@
 import AppKit
 import Carbon.HIToolbox
+import JBarActions
 import JBarCore
 
 /// One immutable answer to every question derived from `visibleRows`: how many complete rows the
@@ -109,6 +110,8 @@ final class SearchPanel: NSPanel, NSTextFieldDelegate {
     }
     /// Answers queries (the engine, or the demo provider).
     var provider: SearchProviding
+    /// Handles an action only after the user explicitly submits a populated action mode with Enter.
+    private let actionHandler: any PaletteActionHandling
     let launcher: AppLauncher
     /// ⌘, handler (AppDelegate opens the config file).
     var onOpenConfig: (() -> Void)?
@@ -132,16 +135,26 @@ final class SearchPanel: NSPanel, NSTextFieldDelegate {
     /// they still supersede an in-flight query and must make its eventual rows ineligible to render.
     private var searchEpoch: UInt64 = 0
     private var currentMode: QueryMode = .empty
+    private let intentRouter = IntentRouter()
+    /// Non-nil while a leading palette sigil owns the current query. This makes action modes unable
+    /// to fall through into file-result actions such as Open, Reveal, Copy, or Tab autocomplete.
+    private var activeIntent: PaletteIntent?
+    /// Separately invalidates in-flight action previews when the text changes or the panel hides.
+    private var actionEpoch: UInt64 = 0
+    private var actionTask: Task<Void, Never>?
+    private var actionSubmissionInFlight = false
     private var keyMonitor: Any?
     private var loadingWork: DispatchWorkItem?
     private var observers: [NSObjectProtocol] = []
 
     // MARK: - Init
 
-    init(provider: SearchProviding, launcher: AppLauncher, settings: Settings) {
+    init(provider: SearchProviding, launcher: AppLauncher, settings: Settings,
+         actionHandler: any PaletteActionHandling = CodexActionHandler()) {
         self.provider = provider
         self.launcher = launcher
         self.settings = settings
+        self.actionHandler = actionHandler
         let rect = NSRect(x: 0, y: 0, width: Self.panelWidth, height: Self.inputRowHeight + Self.bottomPadding)
         super.init(contentRect: rect, styleMask: [.borderless, .nonactivatingPanel, .fullSizeContentView], backing: .buffered, defer: false)
         configureWindow()
@@ -220,9 +233,11 @@ final class SearchPanel: NSPanel, NSTextFieldDelegate {
     private func handleResignKey(hadMarkedText: Bool, modifiers: NSEvent.ModifierFlags) {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
+            if Runtime.keepPanelOpenForUITesting { return }
             if Self.shouldHideAfterResign(isVisible: isVisible, isKeyWindow: isKeyWindow,
                                           hadMarkedText: hadMarkedText,
                                           hasMarkedText: field.hasMarkedText,
+                                          actionSubmissionInFlight: actionSubmissionInFlight,
                                           modifiers: modifiers) {
                 hide()
             }
@@ -231,9 +246,11 @@ final class SearchPanel: NSPanel, NSTextFieldDelegate {
 
     static func shouldHideAfterResign(isVisible: Bool, isKeyWindow: Bool, hadMarkedText: Bool,
                                       hasMarkedText: Bool,
+                                      actionSubmissionInFlight: Bool = false,
                                       modifiers: NSEvent.ModifierFlags) -> Bool {
         let flags = modifiers.intersection(.deviceIndependentFlagsMask)
-        return isVisible && !isKeyWindow && !hadMarkedText && !hasMarkedText && !flags.contains(.control)
+        return isVisible && !isKeyWindow && !hadMarkedText && !hasMarkedText
+            && !actionSubmissionInFlight && !flags.contains(.control)
     }
 
     // MARK: - Show / hide
@@ -254,6 +271,10 @@ final class SearchPanel: NSPanel, NSTextFieldDelegate {
     /// Hide the panel; clears the query unless `restoreQueryOnReopen`.
     func hide() {
         guard isVisible else { return }
+        actionEpoch &+= 1
+        actionTask?.cancel()
+        actionTask = nil
+        actionSubmissionInFlight = false
         if settings.restoreQueryOnReopen {
             field.commitMarkedText()
         } else {
@@ -282,6 +303,10 @@ final class SearchPanel: NSPanel, NSTextFieldDelegate {
         // text before clearing. This matters when Ctrl+Space changes input source while the panel resigns.
         field.setText("")
         currentMode = .empty
+        activeIntent = nil
+        actionTask?.cancel()
+        actionTask = nil
+        actionSubmissionInFlight = false
         pathBadge.text = "PATH"
         pathBadge.isHidden = true
         results.setRows([])
@@ -415,8 +440,30 @@ final class SearchPanel: NSPanel, NSTextFieldDelegate {
 
     private func runSearch() {
         searchEpoch &+= 1
+        actionEpoch &+= 1
+        actionTask?.cancel()
+        actionTask = nil
+        actionSubmissionInFlight = false
         let epoch = searchEpoch
         let q = field.stringValue
+        let intent = intentRouter.route(q)
+        if intent.isAction {
+            activeIntent = intent
+            currentMode = .search
+            loadingWork?.cancel()
+            pathBadge.isHidden = false
+            pathBadge.text = Self.badgeText(for: intent)
+            pathBadge.setAccessibilityLabel(Self.badgeAccessibilityLabel(for: intent))
+            results.setRows(Self.actionDraftRows(for: intent))
+            applyHeight()
+            return
+        }
+        activeIntent = nil
+        // Do not leave an ASK/ORGANIZE/TERMINAL badge on a normal local search while its async
+        // response is pending. `apply(_:)` will restore a PATH badge if that local result needs one.
+        pathBadge.text = "PATH"
+        pathBadge.isHidden = true
+        pathBadge.setAccessibilityLabel(nil)
         // `showRecentsOnEmpty: false` means an empty query shows nothing but the hint row.
         if !settings.showRecentsOnEmpty, q.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             loadingWork?.cancel()
@@ -523,6 +570,57 @@ final class SearchPanel: NSPanel, NSTextFieldDelegate {
         "Type to search · ↩ open · ⌘↩ reveal · ⌘C copy path · \(hotkeyDisplay) toggle"
     }
 
+    /// The draft is local-only. It makes the Enter boundary and account-usage disclosure visible;
+    /// merely typing never starts Codex or transmits prompt text.
+    nonisolated static func actionDraftRows(for intent: PaletteIntent) -> [PanelRow] {
+        switch intent {
+        case .ask(let prompt):
+            guard !prompt.isEmpty else {
+                return [.action(message: "Ask mode — type a question, then press ↩", symbol: "sparkles")]
+            }
+            return [
+                .action(message: "Search: Indexed files · AI starts only after ↩", symbol: "magnifyingglass"),
+                .action(message: "↩ Ask with Codex · question only; file metadata stays local", symbol: "lock.shield"),
+            ]
+        case .organize(let task):
+            guard !task.isEmpty else {
+                return [.action(message: "Organize mode — describe a task, then press ↩", symbol: "folder")]
+            }
+            return [
+                .action(message: "Search all indexed files locally · AI starts only after ↩", symbol: "magnifyingglass"),
+                .action(message: "↩ Build copy preview · originals stay unchanged · no overwrite", symbol: "doc.on.doc"),
+            ]
+        case .shell(let command):
+            guard !command.isEmpty else {
+                return [.action(message: "Terminal mode — type a command, then press ↩", symbol: "terminal")]
+            }
+            return [
+                .action(message: "Developer Agent · GPT-5.6 Luna · workspace ~/jbar", symbol: "terminal"),
+                .action(message: "↩ Open explicit repository session · network off", symbol: "return"),
+            ]
+        case .search:
+            return []
+        }
+    }
+
+    nonisolated static func badgeText(for intent: PaletteIntent) -> String {
+        switch intent {
+        case .ask: return "ASK"
+        case .organize: return "ORGANIZE"
+        case .shell: return "TERMINAL"
+        case .search: return ""
+        }
+    }
+
+    nonisolated static func badgeAccessibilityLabel(for intent: PaletteIntent) -> String {
+        switch intent {
+        case .ask: return "Ask mode; submitting is required before any action"
+        case .organize: return "Organize mode; submitting is required before any action"
+        case .shell: return "Terminal mode; submitting is required before any action"
+        case .search: return ""
+        }
+    }
+
     // MARK: - Actions
 
     private var actionTarget: ResultRow? { results.selectedResult ?? results.firstResult }
@@ -535,9 +633,136 @@ final class SearchPanel: NSPanel, NSTextFieldDelegate {
     }
 
     private func openSelected() {
+        if activeIntent != nil {
+            submitActiveIntent()
+            return
+        }
         guard let row = actionTarget else { NSSound.beep(); return }
         open(row)
     }
+
+    /// The sole action-entry point. The `actionHandler` is never reached by `runSearch()` or text
+    /// editing; a non-empty prompt and a deliberate Return are both required.
+    private func submitActiveIntent() {
+        guard let intent = activeIntent, let payload = intent.payload, !payload.isEmpty else {
+            NSSound.beep()
+            return
+        }
+        guard !actionSubmissionInFlight else { return }
+        actionSubmissionInFlight = true
+        let epoch = actionEpoch
+        let progress: String = switch intent {
+        case .ask: "Opening read-only Assistant…"
+        case .organize: "Checking Organize preview availability…"
+        case .shell: "Opening Developer Agent in ~/jbar…"
+        case .search: "Preparing local search…"
+        }
+        results.setRows([.action(message: progress, symbol: "hourglass")])
+        applyHeight()
+        let handler = actionHandler
+        actionTask = Task { @MainActor [weak self] in
+            let result = await handler.submit(intent) { [weak self] progress in
+                guard let self, self.actionEpoch == epoch, self.activeIntent == intent,
+                      self.actionSubmissionInFlight else { return }
+                self.results.setRows(Self.actionProgressRows(for: intent, progress: progress))
+                self.applyHeight()
+            }
+            guard let self, self.actionEpoch == epoch, self.activeIntent == intent else { return }
+            self.actionSubmissionInFlight = false
+            self.actionTask = nil
+            if result.kind == .openedSession {
+                self.hide()
+                return
+            }
+            self.results.setRows(Self.actionResultRows(for: intent, result: result))
+            self.applyHeight()
+        }
+    }
+
+    nonisolated static func actionProgressRows(for intent: PaletteIntent,
+                                               progress: PaletteActionProgress) -> [PanelRow] {
+        let messages: [(String, String)]
+        switch progress {
+        case .connectingToCodex:
+            messages = [("Starting the local Codex app server…", "hourglass")]
+        case .waitingForChatGPTSignIn:
+            messages = [
+                ("Finish signing in with ChatGPT in your browser", "person.crop.circle.badge.checkmark"),
+                ("JBar is keeping the private localhost callback open · Esc cancels", "lock.shield"),
+            ]
+        case .checkingAccountAndSafety:
+            messages = [("Checking ChatGPT account and safety boundaries…", "checkmark.shield")]
+        case .preparingLuna:
+            if case .shell = intent {
+                messages = [("Preparing GPT-5.6 Luna in ~/jbar…", "terminal")]
+            } else {
+                messages = [("Preparing GPT-5.6 Luna for a read-only SearchPlan…", "sparkles")]
+            }
+        case .generatingAnswer:
+            if case .ask = intent {
+                messages = [("GPT-5.6 Luna is creating a typed SearchPlan…", "ellipsis.bubble")]
+            } else {
+                messages = [("GPT-5.6 Luna is responding…", "ellipsis.bubble")]
+            }
+        }
+        return messages.map { message, symbol in .action(message: message, symbol: symbol) }
+    }
+
+    nonisolated static func actionResultRows(for intent: PaletteIntent,
+                                             result: PaletteActionResult) -> [PanelRow] {
+        let symbol: String
+        let source: String
+        switch result.kind {
+        case .openedSession:
+            switch intent {
+            case .ask:
+                symbol = "sparkles"
+                source = "Read-only Assistant opened"
+            case .shell:
+                symbol = "terminal"
+                source = "Developer Agent opened"
+            case .organize, .search:
+                symbol = "checkmark"
+                source = "Session opened"
+            }
+        case .answer: symbol = "text.bubble"; source = "Codex · GPT-5.6 Luna"
+        case .notice: symbol = "checkmark.shield"; source = "Not enabled"
+        case .error: symbol = "xmark.octagon"; source = "Stopped safely"
+        }
+        let header = PanelRow.action(message: "\(badgeText(for: intent)) · \(source)", symbol: symbol)
+        return [header] + wrappedActionMessages(result.text, symbol: symbol)
+    }
+
+    /// Informational rows are intentionally single-line for launcher performance. Wrap bounded answer
+    /// text into rows so a real Codex response is readable and scrollable instead of tail-truncated.
+    nonisolated static func wrappedActionMessages(_ text: String, symbol: String,
+                                                  width: Int = 92, limit: Int = 39) -> [PanelRow] {
+        var lines: [String] = []
+        for paragraph in text.split(separator: "\n", omittingEmptySubsequences: false) {
+            var current = ""
+            for word in paragraph.split(whereSeparator: { $0.isWhitespace }) {
+                let value = String(word)
+                if current.isEmpty { current = value }
+                else if current.count + value.count + 1 <= width { current += " " + value }
+                else { lines.append(current); current = value }
+                while current.count > width {
+                    let split = current.index(current.startIndex, offsetBy: width)
+                    lines.append(String(current[..<split]))
+                    current = String(current[split...])
+                }
+            }
+            if !current.isEmpty { lines.append(current) }
+            else if paragraph.isEmpty { lines.append(" ") }
+            if lines.count >= limit { break }
+        }
+        if lines.count > limit { lines = Array(lines.prefix(limit)) }
+        if lines.isEmpty { lines = [text] }
+        return lines.prefix(limit).map { .action(message: $0, symbol: symbol) }
+    }
+
+    /// Allows the UI policy test to drive exactly the Enter path without synthesizing AppKit key
+    /// events. It is internal so it is unavailable to production callers outside this module.
+    func submitCurrentIntentForTesting() { openSelected() }
 
     private func revealSelected() {
         guard let row = actionTarget else { NSSound.beep(); return }
@@ -553,6 +778,7 @@ final class SearchPanel: NSPanel, NSTextFieldDelegate {
     /// Tab: path-mode autocomplete. Folder row → its path + "/" (entering path mode); file row in
     /// path mode → its path. `~` abbreviation is kept unless the query is an absolute `/` path.
     private func autocomplete() {
+        guard activeIntent == nil else { NSSound.beep(); return }
         guard let row = actionTarget else { NSSound.beep(); return }
         let inPath: Bool = { if case .path = currentMode { return true }; return false }()
         guard let target = Self.autocompleteTarget(for: row, query: field.stringValue, inPathMode: inPath) else {
@@ -588,7 +814,7 @@ final class SearchPanel: NSPanel, NSTextFieldDelegate {
         let hasMarkedText = field.hasMarkedText
         if Self.shouldCloseForKey(keyCode: event.keyCode, hasMarkedText: hasMarkedText,
                                   modifiers: event.modifierFlags) {
-            hide()
+            clearDraftOrHide()
             return nil
         }
         guard Self.shouldInterceptCommandShortcut(hasMarkedText: hasMarkedText,
@@ -668,7 +894,7 @@ final class SearchPanel: NSPanel, NSTextFieldDelegate {
         case kVK_Escape:
             if Self.shouldCloseForKey(keyCode: event.keyCode, hasMarkedText: field.hasMarkedText,
                                       modifiers: event.modifierFlags) {
-                hide()
+                clearDraftOrHide()
             } else {
                 super.keyDown(with: event)
             }
@@ -715,4 +941,17 @@ final class SearchPanel: NSPanel, NSTextFieldDelegate {
 
     /// The launcher only owns field-editor commands after composition has committed.
     static func shouldHandleFieldEditorCommand(hasMarkedText: Bool) -> Bool { !hasMarkedText }
+
+    /// First Escape clears the editable draft; a second Escape closes the already-empty palette.
+    private func clearDraftOrHide() {
+        if field.stringValue.isEmpty {
+            hide()
+        } else {
+            clearQuery()
+            runSearch()
+            makeFirstResponder(field)
+        }
+    }
+
+    func clearDraftOrHideForTesting() { clearDraftOrHide() }
 }

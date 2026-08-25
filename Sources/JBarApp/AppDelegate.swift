@@ -1,6 +1,7 @@
 import AppKit
 import Carbon.HIToolbox
 import Darwin
+import JBarActions
 import JBarCore
 
 /// Wires the product together (DESIGN.md §2.3, §8): config → frecency → engine → indexer → menu →
@@ -25,6 +26,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var configWatcher: ConfigWatcher?
     private var launcher: AppLauncher!
     private var panel: SearchPanel!
+    private var assistant: AssistantCoordinator!
+    private var organize: OrganizeCoordinator!
+    private var codexChat: CodexChatCoordinator!
     private var statusMenu: StatusMenu!
     private let hotkey = CarbonHotkey()
 
@@ -55,13 +59,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         NSApp.setActivationPolicy(.accessory)
-        Log.app.notice("JBar \(Runtime.version, privacy: .public) launching (demo=\(self.demo))")
+        Log.app.notice("JBar \(Runtime.buildIdentity, privacy: .public) launching (demo=\(self.demo))")
         MainMenu.install(openConfig: #selector(openConfigFile(_:)), target: self)
 
         if !demo { loadConfig() }
         let provider: SearchProviding = demo ? DemoSearchProvider() : makeEngine()
         launcher = AppLauncher(frecency: frecency)
-        panel = SearchPanel(provider: provider, launcher: launcher, settings: SearchPanel.Settings(config: config, hotkeyDisplay: hotkeyDisplay))
+        let chat = CodexChatCoordinator(applicationSupportRoot: Runtime.testStateRoot)
+        codexChat = chat
+        let planner = CodexTaskSession(applicationSupportRoot: Runtime.testStateRoot)
+        let assistedSearch = AssistantCoordinator(provider: provider, launcher: launcher,
+                                                   planner: planner,
+                                                   indexStatus: { [weak self] in
+                                                       self?.coordinator?.status ?? IndexStatus()
+                                                   })
+        assistant = assistedSearch
+        let organizer = OrganizeCoordinator(
+            provider: provider, searchPlanner: planner, organizePlanner: planner,
+            indexStatus: { [weak self] in
+                self?.coordinator?.status ?? IndexStatus()
+            }
+        )
+        organize = organizer
+        let actionHandler = CodexActionHandler(
+            presentAssistant: { [weak assistedSearch] prompt in
+                assistedSearch?.present(prompt: prompt) ?? false
+            },
+            presentOrganize: { [weak organizer] instruction in
+                organizer?.present(instruction: instruction) ?? false
+            },
+            presentDeveloperAgent: { [weak chat] prompt in
+                chat?.present(prompt: prompt) ?? false
+            }
+        )
+        panel = SearchPanel(provider: provider, launcher: launcher,
+                            settings: SearchPanel.Settings(config: config, hotkeyDisplay: hotkeyDisplay),
+                            actionHandler: actionHandler)
         panel.onOpenConfig = { [weak self] in self?.openConfigFile(nil) }
 
         statusMenu = StatusMenu(hotkeyDisplay: hotkeyDisplay)
@@ -133,6 +166,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         hotkey.unregister()
         configWatcher?.stop()
         coordinator?.stop()
+        assistant?.close()
+        organize?.close()
+        codexChat?.close()
         launcher?.flush()
         frecency?.save()
     }
@@ -256,13 +292,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// ~/Library/Application Support/JBar/history.json
     nonisolated static func historyURL() -> URL {
+        if let root = Runtime.testStateRoot {
+            return root.appendingPathComponent("history.json")
+        }
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
             ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/Application Support")
         return base.appendingPathComponent("JBar", isDirectory: true).appendingPathComponent("history.json")
     }
 
     private func startIndexer() {
-        let c = IndexCoordinator(options: config.coordinatorOptions())
+        var options = config.coordinatorOptions()
+        if let root = Runtime.testStateRoot {
+            options.snapshotURL = root.appendingPathComponent("index.bin")
+            options.watchFileSystem = false
+        }
+        let c = IndexCoordinator(options: options)
         c.onStoreChanged = { [weak self] store in
             Task { @MainActor [weak self] in
                 guard let engine = self?.engine else { return }

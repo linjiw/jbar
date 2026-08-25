@@ -1,5 +1,6 @@
 import XCTest
 import Carbon.HIToolbox
+import JBarActions
 import JBarCore
 @testable import JBarApp
 
@@ -396,6 +397,11 @@ final class PanelGeometryTests: XCTestCase {
         XCTAssertFalse(SearchPanel.shouldHideAfterResign(isVisible: true, isKeyWindow: true,
                                                          hadMarkedText: false, hasMarkedText: false,
                                                          modifiers: []))
+        XCTAssertFalse(SearchPanel.shouldHideAfterResign(isVisible: true, isKeyWindow: false,
+                                                         hadMarkedText: false, hasMarkedText: false,
+                                                         actionSubmissionInFlight: true,
+                                                         modifiers: []),
+                       "opening the OAuth browser must not hide the panel and kill its localhost callback")
 
         XCTAssertTrue(SearchPanel.shouldCloseForKey(keyCode: UInt16(kVK_Escape), hasMarkedText: false))
         XCTAssertFalse(SearchPanel.shouldCloseForKey(keyCode: UInt16(kVK_Escape), hasMarkedText: true))
@@ -531,6 +537,363 @@ extension PanelGeometryTests {
         await Task.yield()
         XCTAssertEqual(panel.displayedRows, [.hint(SearchPanel.hintText(hotkeyDisplay: settings.hotkeyDisplay))],
                        "a response superseded by the empty-query policy must never repaint stale results")
+    }
+
+    func testActionModeDoesNotSubmitWhileTypingButEnterSubmitsExactlyOnce() async {
+        let handler = RecordingActionHandler()
+        let panel = SearchPanel(provider: DemoSearchProvider(), launcher: AppLauncher(),
+                                settings: SearchPanel.Settings(), actionHandler: handler)
+
+        var prompt = "?"
+        for _ in 0..<100 {
+            prompt.append("x")
+            panel.setQuery(prompt)
+        }
+        let typedSubmissionCount = await handler.submissionCount()
+        XCTAssertEqual(typedSubmissionCount, 0,
+                       "editing an Ask prompt must not start an action")
+        XCTAssertEqual(panel.displayedRows,
+                       SearchPanel.actionDraftRows(for: .ask(prompt: String(repeating: "x", count: 100))))
+
+        panel.submitCurrentIntentForTesting()
+        await handler.waitUntilSubmitted()
+        for _ in 0..<4 { await Task.yield() }
+        let completedSubmissionCount = await handler.submissionCount()
+        let submittedIntents = await handler.submissions()
+        XCTAssertEqual(completedSubmissionCount, 1)
+        XCTAssertEqual(submittedIntents, [.ask(prompt: String(repeating: "x", count: 100))])
+        XCTAssertTrue(panel.displayedRows.contains {
+            if case .action(let message, _) = $0 { return message.contains("Local test answer") }
+            return false
+        }, "the completed action must replace the draft with its action result")
+    }
+
+    func testFirstEscapeClearsAnActionDraftWithoutSubmittingIt() async {
+        let handler = RecordingActionHandler()
+        let panel = SearchPanel(provider: DemoSearchProvider(), launcher: AppLauncher(),
+                                settings: SearchPanel.Settings(), actionHandler: handler)
+        panel.setQuery("? find budget PDFs")
+
+        panel.clearDraftOrHideForTesting()
+
+        XCTAssertEqual(panel.query, "")
+        let submissionCount = await handler.submissionCount()
+        XCTAssertEqual(submissionCount, 0)
+    }
+
+    func testActionAnswerWrapsIntoReadableScrollableRows() {
+        let result = PaletteActionResult(kind: .answer,
+                                         text: "One short paragraph that is deliberately long enough to wrap into multiple compact answer rows in the launcher panel without losing the remaining words.")
+        let rows = SearchPanel.actionResultRows(for: .ask(prompt: "question"), result: result)
+        XCTAssertGreaterThan(rows.count, 2)
+        XCTAssertEqual(rows.first, .action(message: "ASK · Codex · GPT-5.6 Luna", symbol: "text.bubble"))
+        let rendered = rows.dropFirst().compactMap { row -> String? in
+            if case .action(let message, _) = row { return message }
+            return nil
+        }.joined(separator: " ")
+        XCTAssertTrue(rendered.contains("remaining words"))
+    }
+
+    func testCodexAskOpensReadOnlyAssistantWithTheSubmittedPrompt() async {
+        let recorder = ChatPresentationRecorder()
+        let handler = CodexActionHandler(presentAssistant: { prompt in
+            recorder.prompts.append(prompt)
+            return true
+        })
+
+        let result = await handler.submit(.ask(prompt: "remember ORBIT"))
+
+        XCTAssertEqual(result.kind, .openedSession)
+        XCTAssertEqual(recorder.prompts, ["remember ORBIT"])
+    }
+
+    func testDeveloperAgentHasASeparateExplicitPresentationBoundary() async {
+        let recorder = ChatPresentationRecorder()
+        let handler = CodexActionHandler(presentDeveloperAgent: { prompt in
+            recorder.prompts.append(prompt)
+            return true
+        })
+
+        let result = await handler.submit(.shell(command: "review the dirty worktree"))
+
+        XCTAssertEqual(result.kind, .openedSession)
+        XCTAssertEqual(recorder.prompts, ["review the dirty worktree"])
+    }
+
+    func testOrganizeHasASeparateGlobalCopyReviewPresentationBoundary() async {
+        let recorder = ChatPresentationRecorder()
+        let handler = CodexActionHandler(presentOrganize: { instruction in
+            recorder.prompts.append(instruction)
+            return true
+        })
+
+        let result = await handler.submit(.organize(task: "group receipts by month"))
+
+        XCTAssertEqual(result.kind, .openedSession)
+        XCTAssertEqual(result.text, "Opened global Copy Organize review.")
+        XCTAssertEqual(recorder.prompts, ["group receipts by month"])
+    }
+
+    func testOrganizeFailsClosedWhenReviewSurfaceIsUnavailable() async {
+        let result = await CodexActionHandler().submit(.organize(task: "move everything"))
+        XCTAssertEqual(result.kind, .error)
+        XCTAssertTrue(result.text.contains("unavailable"))
+    }
+
+    func testAssistantPlanMapsToNativeMetadataRequestWithoutPromptOrScopePath() {
+        let plan = SearchPlan(scopeID: .indexedFiles, nameTerms: ["budget"],
+                              extensions: ["pdf"], kinds: [.document],
+                              modifiedAfter: Date(timeIntervalSinceReferenceDate: 100),
+                              modifiedBefore: Date(timeIntervalSinceReferenceDate: 200),
+                              minimumSizeBytes: 1_024, maximumSizeBytes: 4_096,
+                              sort: .modifiedDescending, limit: 3)
+
+        let request = AssistedSearchRequest(searchPlan: plan)
+
+        XCTAssertEqual(request.nameTerms, ["budget"])
+        XCTAssertEqual(request.extensions, ["pdf"])
+        XCTAssertEqual(request.kinds, [.document])
+        XCTAssertEqual(request.minimumSizeBytes, 1_024)
+        XCTAssertEqual(request.maximumSizeBytes, 4_096)
+        XCTAssertEqual(request.sort, .modifiedDescending)
+        XCTAssertEqual(request.limit, 3)
+    }
+
+    func testCopyOrganizeSearchesAllEligibleFileKindsAtTheFullPreviewLimit() throws {
+        let plan = SearchPlan(scopeID: .indexedFiles, nameTerms: ["receipt"],
+                              extensions: ["pdf"], kinds: [], limit: 2)
+        let request = try OrganizeWindowController.copySearchRequest(for: plan)
+
+        XCTAssertEqual(request.limit, AssistedSearchRequest.maximumResults)
+        XCTAssertFalse(request.kinds.contains(.app))
+        XCTAssertFalse(request.kinds.contains(.folder))
+        XCTAssertFalse(request.kinds.contains(.packageInternal))
+        XCTAssertEqual(request.kinds,
+                       [.document, .image, .video, .audio, .code, .archive, .other])
+    }
+
+    func testCopyOrganizeRejectsAnAppsOnlyPlan() {
+        let plan = SearchPlan(scopeID: .indexedFiles, nameTerms: ["Safari"],
+                              extensions: [], kinds: [.app])
+        XCTAssertThrowsError(try OrganizeWindowController.copySearchRequest(for: plan))
+    }
+
+    func testCopyOrganizeRejectsIncompleteAndTruncatedGlobalSearches() throws {
+        let row = ResultRow(itemIndex: 0, name: "receipt.pdf", path: "/receipt.pdf",
+                            parentDisplay: "/", kind: .document,
+                            matchedByteOffsets: [], score: 1, tier: 2)
+        let complete = AssistedSearchResponse(rows: [row], totalMatches: 1,
+                                              totalMatchesIsComplete: true, scannedItems: 100,
+                                              inspectedSizes: 0, generation: 1)
+        XCTAssertEqual(try OrganizeWindowController.completeCopyRows(from: complete), [row])
+
+        let incomplete = AssistedSearchResponse(rows: [row], totalMatches: 1,
+                                                totalMatchesIsComplete: false, scannedItems: 100,
+                                                inspectedSizes: 0, generation: 1)
+        XCTAssertThrowsError(try OrganizeWindowController.completeCopyRows(from: incomplete))
+
+        let truncated = AssistedSearchResponse(rows: [row], totalMatches: 41,
+                                               totalMatchesIsComplete: true, scannedItems: 100,
+                                               inspectedSizes: 0, generation: 1)
+        XCTAssertThrowsError(try OrganizeWindowController.completeCopyRows(from: truncated))
+    }
+
+    func testAssistantCanOptIntoSelectFirstWhileLauncherRetainsSingleClickOpen() {
+        let results = ResultsController()
+        XCTAssertTrue(results.opensOnSingleClick)
+        results.opensOnSingleClick = false
+        XCTAssertFalse(results.opensOnSingleClick)
+    }
+
+    func testCopyOrganizeUsesReadableSourceTailsAndCorrectCountGrammar() {
+        XCTAssertEqual(OrganizeWindowController.sourceDisplay(
+            parent: "~/jbar/.build/jbar-e2e/fixture/Desktop", name: "receipt.pdf"
+        ), "…/fixture/Desktop/receipt.pdf")
+        XCTAssertEqual(OrganizeWindowController.counted(1, singular: "file", plural: "files"),
+                       "1 file")
+        XCTAssertEqual(OrganizeWindowController.counted(2, singular: "file", plural: "files"),
+                       "2 files")
+    }
+
+    func testAssistantCopyDescribesPlanningAndLocalCompleteness() {
+        XCTAssertEqual(AssistantWindowController.progressText(.generatingAnswer),
+                       "Creating a read-only SearchPlan…")
+        let row = ResultRow(itemIndex: 0, name: "budget.pdf", path: "/budget.pdf",
+                            parentDisplay: "/", kind: .document,
+                            matchedByteOffsets: [], score: 1, tier: 2)
+        let complete = AssistedSearchResponse(rows: [row], totalMatches: 1,
+                                              totalMatchesIsComplete: true, scannedItems: 10,
+                                              inspectedSizes: 0, generation: 1)
+        XCTAssertEqual(AssistantWindowController.summaryText(for: complete),
+                       "Found 1 result in the local index.")
+        let capped = AssistedSearchResponse(rows: [row], totalMatches: 12,
+                                            totalMatchesIsComplete: true, scannedItems: 20,
+                                            inspectedSizes: 0, generation: 1)
+        XCTAssertEqual(AssistantWindowController.summaryText(for: capped),
+                       "Found 12 results in the local index; showing the first 1.")
+        let incomplete = AssistedSearchResponse(rows: [row], totalMatches: 1,
+                                                totalMatchesIsComplete: false, scannedItems: 10,
+                                                inspectedSizes: 0, generation: 1)
+        XCTAssertTrue(AssistantWindowController.summaryText(for: incomplete).contains("incomplete"))
+    }
+
+    func testAssistantWaitsForACompleteIndexBeforeStartingCodex() {
+        var status = IndexStatus()
+        XCTAssertNotNil(IndexReadiness.waitMessage(for: status))
+
+        status.phase = .crawling(progress: 136)
+        status.itemCount = 136
+        XCTAssertTrue(IndexReadiness.waitMessage(for: status)?.contains("136") == true)
+
+        status.phase = .idle
+        XCTAssertNil(IndexReadiness.waitMessage(for: status))
+
+        status.hitItemCap = true
+        XCTAssertTrue(IndexReadiness.waitMessage(for: status)?.contains("incomplete") == true)
+        status.hitItemCap = false
+        status.cappedDirs = ["private path not shown in UI"]
+        let capped = IndexReadiness.waitMessage(for: status)
+        XCTAssertTrue(capped?.contains("scan limit") == true)
+        XCTAssertFalse(capped?.contains("private path") == true)
+        status.cappedDirs = []
+        status.deniedPaths = ["private path not shown in UI"]
+        let denied = IndexReadiness.waitMessage(for: status)
+        XCTAssertTrue(denied?.contains("could not read") == true)
+        XCTAssertFalse(denied?.contains("private path") == true)
+        status.deniedPaths = []
+
+        status.phase = .failed("private diagnostic")
+        let failed = IndexReadiness.waitMessage(for: status)
+        XCTAssertTrue(failed?.contains("rebuild") == true)
+        XCTAssertFalse(failed?.contains("private diagnostic") == true)
+    }
+
+    func testResultRowDrawingNeverConstructsNegativeGeometry() {
+        XCTAssertNil(ResultRowView.selectionRect(in: .zero))
+        XCTAssertNil(ResultRowView.selectionRect(in: NSRect(x: 0, y: 0, width: 15, height: 3)))
+        XCTAssertNil(ResultRowView.separatorRect(in: .zero, isFlipped: false))
+        XCTAssertNil(ResultRowView.separatorRect(in: NSRect(x: 0, y: 0, width: 31, height: 48),
+                                                  isFlipped: true))
+
+        XCTAssertEqual(ResultRowView.selectionRect(in: NSRect(x: 0, y: 0, width: 100, height: 48)),
+                       NSRect(x: 8, y: 2, width: 84, height: 44))
+        XCTAssertEqual(ResultRowView.separatorRect(in: NSRect(x: 0, y: 0, width: 100, height: 48),
+                                                    isFlipped: false),
+                       NSRect(x: 16, y: 47, width: 68, height: 1))
+    }
+
+    func testCodexChatTranscriptKeepsTurnOrderAndRoleLabels() {
+        let messages = [
+            CodexChatMessage(role: .system, text: "Private chat"),
+            CodexChatMessage(role: .user, text: "Remember ORBIT"),
+            CodexChatMessage(role: .tool, text: "~/jbar $ pwd\n/Users/example/jbar\n[exit 0]"),
+            CodexChatMessage(role: .assistant, text: "ORBIT"),
+        ]
+
+        XCTAssertEqual(CodexChatTranscript.plainText(messages),
+                       "JBAR\nPrivate chat\n\nYOU\nRemember ORBIT\n\nTERMINAL\n~/jbar $ pwd\n/Users/example/jbar\n[exit 0]\n\nCODEX · LUNA\nORBIT")
+    }
+
+    func testEmptyStreamingMessageHasVisibleThinkingState() {
+        let message = CodexChatMessage(role: .assistant, text: "", isStreaming: true)
+        XCTAssertEqual(CodexChatTranscript.plainText([message]), "CODEX · LUNA\nThinking…")
+    }
+
+    func testCodexChatProgressCopyIsBoundedAndNonSensitive() {
+        XCTAssertEqual(CodexChatWindowController.progressText(.generatingAnswer),
+                       "Codex is responding…")
+        XCTAssertFalse(CodexChatWindowController.progressText(.checkingAccountAndSafety).contains("@"))
+    }
+
+    func testOAuthProgressExplainsBrowserAndCancellation() {
+        let rows = SearchPanel.actionProgressRows(for: .ask(prompt: "question"),
+                                                  progress: .waitingForChatGPTSignIn)
+        let messages = rows.compactMap { row -> String? in
+            if case .action(let message, _) = row { return message }
+            return nil
+        }
+        XCTAssertTrue(messages.contains { $0.contains("browser") })
+        XCTAssertTrue(messages.contains { $0.contains("localhost callback") })
+        XCTAssertTrue(messages.contains { $0.contains("Esc cancels") })
+    }
+
+    func testActionProgressReplacesConnectingStateBeforeFinalResult() async {
+        let handler = ProgressActionHandler()
+        let panel = SearchPanel(provider: DemoSearchProvider(), launcher: AppLauncher(),
+                                settings: SearchPanel.Settings(), actionHandler: handler)
+        panel.setQuery("? question")
+        panel.submitCurrentIntentForTesting()
+        await handler.waitUntilProgressSent()
+        for _ in 0..<4 { await Task.yield() }
+
+        XCTAssertEqual(panel.displayedRows,
+                       SearchPanel.actionProgressRows(for: .ask(prompt: "question"),
+                                                      progress: .waitingForChatGPTSignIn))
+        await handler.release()
+        for _ in 0..<4 { await Task.yield() }
+        XCTAssertTrue(panel.displayedRows.contains {
+            if case .action(let message, _) = $0 { return message.contains("Finished after progress") }
+            return false
+        })
+    }
+}
+
+@MainActor
+private final class ChatPresentationRecorder {
+    var prompts: [String] = []
+}
+
+private actor RecordingActionHandler: PaletteActionHandling {
+    private var submitted: [PaletteIntent] = []
+    private var submittedWaiters: [CheckedContinuation<Void, Never>] = []
+
+    func submit(_ intent: PaletteIntent,
+                progress: @escaping PaletteActionProgressHandler) async -> PaletteActionResult {
+        submitted.append(intent)
+        let waiters = submittedWaiters
+        submittedWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+        return PaletteActionResult(kind: .answer, text: "Local test answer")
+    }
+
+    func submissionCount() -> Int { submitted.count }
+    func submissions() -> [PaletteIntent] { submitted }
+
+    func waitUntilSubmitted() async {
+        if !submitted.isEmpty { return }
+        await withCheckedContinuation { submittedWaiters.append($0) }
+    }
+}
+
+private actor ProgressActionHandler: PaletteActionHandling {
+    private var progressSent = false
+    private var progressWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+    private var released = false
+
+    func submit(_ intent: PaletteIntent,
+                progress: @escaping PaletteActionProgressHandler) async -> PaletteActionResult {
+        await progress(.waitingForChatGPTSignIn)
+        progressSent = true
+        let waiters = progressWaiters
+        progressWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+        if !released {
+            await withCheckedContinuation { releaseWaiters.append($0) }
+        }
+        return PaletteActionResult(kind: .answer, text: "Finished after progress")
+    }
+
+    func waitUntilProgressSent() async {
+        if progressSent { return }
+        await withCheckedContinuation { progressWaiters.append($0) }
+    }
+
+    func release() {
+        released = true
+        let waiters = releaseWaiters
+        releaseWaiters.removeAll()
+        waiters.forEach { $0.resume() }
     }
 }
 
