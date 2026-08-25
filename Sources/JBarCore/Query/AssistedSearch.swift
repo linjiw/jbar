@@ -108,11 +108,9 @@ public extension SearchEngine {
             group.addTask(priority: .userInitiated) {
                 AssistedSearchScanner.scan(request, store: snapshot, home: searchHome)
             }
-            return await group.next() ?? AssistedSearchResponse(
-                rows: [], totalMatches: 0, totalMatchesIsComplete: false,
-                scannedItems: 0, inspectedSizes: 0, generation: snapshot.generation,
-                cancelled: true
-            )
+            let response = await group.next()
+            precondition(response != nil, "assisted search task group lost its only child")
+            return response!
         }
     }
 }
@@ -231,8 +229,6 @@ private enum AssistedSearchScanner {
         if insertion < request.limit {
             best.insert(candidate, at: insertion)
             if best.count > request.limit { best.removeLast() }
-        } else if best.count < request.limit {
-            best.append(candidate)
         }
     }
 
