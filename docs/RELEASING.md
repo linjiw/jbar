@@ -3,8 +3,9 @@
 JBar currently publishes a free **developer preview**. Its public artifact is
 one ad-hoc-signed Universal 2 `JBar.app`, distributed as a ZIP that preserves
 the application wrapper, executable bit, and macOS metadata. GitHub Releases
-is the source of truth; the public npm package downloads that exact versioned
-ZIP and verifies its SHA-256 checksum.
+is the source of truth. The matching npm wrapper is implemented but remains
+unpublished until the protected release job completes; once published, it
+downloads that exact versioned ZIP and verifies its SHA-256 checksum.
 
 The preview supports macOS 13 or later on Apple Silicon and Intel. It is not
 notarized and therefore is not a substitute for a Developer ID release. macOS

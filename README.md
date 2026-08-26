@@ -31,7 +31,8 @@ them:
 Typing alone never starts Codex. `?`, `!`, and `>` require an explicit **Return**.
 
 > **Developer preview:** JBar is currently ad-hoc signed and not notarized. The current source tree is
-> the canonical build for the newest assisted workflows; published GitHub/npm builds may trail it.
+> the canonical build for the newest assisted workflows; the GitHub preview may trail it, and the npm
+> installer has not been published yet.
 > Do not disable Gatekeeper or remove quarantine. See the [support matrix](docs/SUPPORT.md).
 
 ## Install
@@ -65,10 +66,13 @@ preserved so macOS remains in control of first-launch approval.
 
 ### npm
 
-The npm package is a small Node 18+ installer for the same native GitHub Release—not an Electron app
-or a second JBar implementation.
+The small Node 18+ installer for the same native GitHub Release is implemented, but
+`@linjiw/jbar` has not been published to npm yet. Until the release workflow completes npm
+publication, use the GitHub installer above. When published, it will remain a download wrapper—not
+an Electron app or a second JBar implementation.
 
 ```bash
+# Pending publication; these commands currently return npm 404.
 npm install --global @linjiw/jbar
 jbar
 

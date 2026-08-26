@@ -6,6 +6,11 @@ ZIP only when invoked and verifies the published SHA-256 checksum before
 installing. The preview is ad-hoc signed but not notarized, so macOS may ask the
 user to approve its first launch.
 
+> **Publication status:** the wrapper is implemented, but `@linjiw/jbar` is not
+> yet live in the npm registry. The commands below are the intended interface
+> after the protected release job completes. Until then, use the GitHub installer
+> shown at the end of this page.
+
 ```bash
 npx --yes @linjiw/jbar
 ```
