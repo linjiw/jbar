@@ -60,6 +60,6 @@ assembled as Universal 2 with a macOS 13 minimum version.
 That is not proof of a trusted public release. Synthetic events are not a physical keyboard or IME,
 and the current ad-hoc developer preview is not a Developer ID release. Before a fully trusted v1,
 the project still needs the physical matrix above, Developer ID credentials, Hardened Runtime signing,
-Apple notarization and stapling, and Gatekeeper verification on a clean Mac. The preview GitHub and
-npm channels publish the same checksum-verified Universal 2 ZIP; see the open GitHub issues for the
-live implementation and evidence checklist.
+Apple notarization and stapling, and Gatekeeper verification on a clean Mac. The GitHub preview
+publishes a checksum-verified Universal 2 ZIP. The matching npm wrapper is implemented but not yet
+published; see the open GitHub issues for the live implementation and evidence checklist.

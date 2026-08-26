@@ -328,8 +328,8 @@ runtime evidence.
 `scripts/build-app.sh` builds `arm64` and `x86_64` by default, checks both slices, validates bundle metadata/version, and strictly verifies the signature. Its default signature is ad-hoc for development. The current local gate verified both slices at minOS 13.0 plus native arm64 and Rosetta x86_64 CLI execution; Rosetta is not native Intel or macOS 13 runtime evidence. `scripts/package-app.sh` validates architecture, minimum OS, signature, version, archive structure, executable permission, and checksum.
 
 The current public channel is an explicitly labelled ad-hoc Universal 2 developer-preview ZIP on
-GitHub Releases. The npm package is a Node-18+ launcher that downloads and verifies that exact ZIP;
-it does not bundle Node or change the native app. A future paid Developer ID release can replace the
+GitHub Releases. A matching Node-18+ npm launcher is implemented but not yet published; when live,
+it will download and verify that exact ZIP without bundling Node or changing the native app. A future paid Developer ID release can replace the
 preview with a Hardened Runtime, notarized/stapled ZIP. Neither channel removes macOS signing,
 Gatekeeper, TCC, minimum-OS, or CPU requirements. Swift/AppKit avoids a second runtime and is the
 simplest architecture for the native panel, text-input, LaunchServices, FSEvents, login-item, and

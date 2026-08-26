@@ -408,7 +408,7 @@
     <section id="install">
       <div class="section-head">
         <div><p class="eyebrow">Installation</p><h2>Choose the path that matches your build.</h2></div>
-        <p class="section-copy">The current source tree contains the newest assisted workflows. Published GitHub and npm previews may trail it; check release notes before choosing a prebuilt app.</p>
+        <p class="section-copy">The current source tree contains the newest assisted workflows. The GitHub preview may trail it, and the npm installer is not published yet; check release notes before choosing a prebuilt app.</p>
       </div>
       <div class="install-grid">
         <article class="install-card recommended">
@@ -424,10 +424,10 @@
           <div class="mini-command"><span id="release-command">curl -fsSL https://raw.githubusercontent.com/linjiw/jbar/main/scripts/install-from-github.sh | bash</span><button class="mini-copy" type="button" data-copy="release-command" aria-label="Copy GitHub Release installation command">Copy</button></div>
         </article>
         <article class="install-card">
-          <span class="pill">Node 18+</span>
+          <span class="pill">Publication pending</span>
           <h3>npm</h3>
-          <p>A small installer for the same native GitHub Release. npm is not a runtime dependency and JBar is not an Electron application.</p>
-          <div class="mini-command"><span id="npm-command">npm install --global @linjiw/jbar<br>jbar</span><button class="mini-copy" type="button" data-copy="npm-command" aria-label="Copy npm installation command">Copy</button></div>
+          <p>The Node 18+ wrapper is implemented, but <code>@linjiw/jbar</code> is not live in the npm registry yet. Use the GitHub installer until publication completes.</p>
+          <div class="mini-command"><span id="npm-command"># Pending publication<br>npm view @linjiw/jbar version</span><button class="mini-copy" type="button" data-copy="npm-command" aria-label="Copy npm publication check">Copy</button></div>
         </article>
       </div>
       <div class="first-run" aria-label="First-run steps">
