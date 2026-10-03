@@ -160,7 +160,7 @@ public final class IndexStore: @unchecked Sendable {
     public let generation: UInt64
     /// FSEvents last event id the store is consistent with (0 = unknown → full recrawl on next start).
     public let fsEventId: UInt64
-    /// Wall-clock time the store was built.
+    /// Wall-clock time of the last full crawl. Metadata updates and incremental merges preserve it.
     public let builtAt: Date
 
     init(count: Int, dirId: [Int32], nameStart: [Int32], nameLen: [UInt16], displayStart: [Int32], displayLen: [UInt16],
@@ -181,6 +181,22 @@ public final class IndexStore: @unchecked Sendable {
         self.dirs = dirs; self.dirArena = dirArena
         self.extensions = extensions; self.appInfo = appInfo; self.appItems = appItems
         (self.maskBitsets, self.maskBitCounts) = Self.buildMaskBitsets(mask: mask, kind: kind)
+        self.generation = generation; self.fsEventId = fsEventId; self.builtAt = builtAt
+    }
+
+    /// Metadata-only generations share every immutable payload, including derived accelerators.
+    /// Rebuilding mask bitsets here would turn a no-op filesystem event into O(items) index work.
+    init(copying source: IndexStore, generation: UInt64, fsEventId: UInt64, builtAt: Date) {
+        self.count = source.count
+        self.dirId = source.dirId; self.nameStart = source.nameStart; self.nameLen = source.nameLen
+        self.displayStart = source.displayStart; self.displayLen = source.displayLen
+        self.mask = source.mask; self.initials = source.initials; self.mtime = source.mtime
+        self.kind = source.kind; self.flags = source.flags; self.depth = source.depth
+        self.extId = source.extId; self.foldedArena = source.foldedArena
+        self.bonusArena = source.bonusArena; self.displayArena = source.displayArena
+        self.dirs = source.dirs; self.dirArena = source.dirArena
+        self.extensions = source.extensions; self.appInfo = source.appInfo; self.appItems = source.appItems
+        self.maskBitsets = source.maskBitsets; self.maskBitCounts = source.maskBitCounts
         self.generation = generation; self.fsEventId = fsEventId; self.builtAt = builtAt
     }
 

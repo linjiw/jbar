@@ -31,6 +31,8 @@ public struct IndexStatus: Sendable, Equatable {
     public var appCount: Int = 0
     public var lastBuilt: Date? = nil
     public var deniedPaths: [String] = []
+    /// Selected file roots unavailable at discovery/crawl time. These invalidate snapshot coverage.
+    public var unavailableRoots: [String] = []
     public var cappedDirs: [String] = []
     /// Entries/directories skipped because descriptor identity, symlink, or root-boundary safety checks failed.
     /// This is a count only: unsafe paths are deliberately never retained or exposed.
@@ -86,7 +88,9 @@ public final class IndexCoordinator: @unchecked Sendable {
         get { lock.withLock { _status } }
         set { lock.withLock { _status = newValue } }
     }
-    /// Called (serially on callbackQueue) whenever a new store generation is published.
+    /// Called serially on callbackQueue with the latest published generation. Slow consumers may
+    /// skip intermediate generations; at most one delivery is queued instead of retaining a
+    /// potentially large immutable store for every partial-crawl publication.
     public var onStoreChanged: (@Sendable (IndexStore) -> Void)? {
         get { lock.withLock { _onStoreChanged } }
         set { lock.withLock { _onStoreChanged = newValue } }
@@ -111,6 +115,18 @@ public final class IndexCoordinator: @unchecked Sendable {
     private var storeComplete = false
     private var appliedEventId: UInt64 = 0
     private var lastCrawlStats: CrawlStats?
+    /// One descriptor-based root discovery per start/full crawl. Snapshot hashing, crawling and
+    /// watcher setup must use the same selected roots and must not rescan home for every publish.
+    private var cachedFileRootDiscovery: FileRootDiscovery?
+
+    private struct FileRootDiscovery {
+        var roots: [CrawlRoot] = []
+        var isComplete = true
+        var deniedPaths: [String] = []
+        var unavailableRoots: [String] = []
+        var cappedDirs: [String] = []
+        var skippedUnsafe = 0
+    }
 
     // Lock-protected mirrors.
     private let lock = NSLock()
@@ -118,6 +134,7 @@ public final class IndexCoordinator: @unchecked Sendable {
     private var _status = IndexStatus()
     private var cancelRequested = false
     private var statusCallbackPending = false
+    private var storeCallbackPending = false
     private var _onStoreChanged: (@Sendable (IndexStore) -> Void)?
     private var _onStatusChanged: (@Sendable (IndexStatus) -> Void)?
 
@@ -126,6 +143,7 @@ public final class IndexCoordinator: @unchecked Sendable {
     private let queueKey = DispatchSpecificKey<UInt8>()
     private let snapshotRemover: @Sendable (URL) throws -> Void
     private let appScanner: @Sendable ([String], [String], String) -> AppScanOutcome
+    private let defaultRootDiscoverer: @Sendable (String, Exclusions) -> DefaultRootDiscoveryOutcome
 
     public convenience init(options: Options, callbackQueue: DispatchQueue = .main) {
         self.init(options: options, callbackQueue: callbackQueue,
@@ -137,12 +155,16 @@ public final class IndexCoordinator: @unchecked Sendable {
          snapshotRemover: @escaping @Sendable (URL) throws -> Void,
          appScanner: @escaping @Sendable ([String], [String], String) -> AppScanOutcome = { roots, extraBundles, home in
              AppScanner.scanOutcome(roots: roots, extraBundles: extraBundles, home: home)
+         },
+         defaultRootDiscoverer: @escaping @Sendable (String, Exclusions) -> DefaultRootDiscoveryOutcome = { home, exclusions in
+             Crawler.defaultRootsOutcome(home: home, exclusions: exclusions)
          }) {
         self.options = IndexCoordinator.normalized(options)
         // Preserve generation/status ordering even when an embedding client supplies a concurrent target.
         self.callbackQueue = DispatchQueue(label: "com.linji.jbar.index.callbacks", target: callbackQueue)
         self.snapshotRemover = snapshotRemover
         self.appScanner = appScanner
+        self.defaultRootDiscoverer = defaultRootDiscoverer
         queue = DispatchQueue(label: "com.linji.jbar.index", qos: .utility)
         queue.setSpecific(key: queueKey, value: 1)
     }
@@ -157,14 +179,16 @@ public final class IndexCoordinator: @unchecked Sendable {
             guard !started, !stopped else { return }
             started = true
             scanAppsAndPublish()
+            refreshFileRootDiscovery()
             if let snap = loadSnapshot(),
                let rebuilt = IndexCoordinator.rebuildStore(apps: apps, filesFrom: snap,
                                                            generation: nextGeneration(), fsEventId: snap.fsEventId,
                                                            maxItems: options.maxItems,
                                                            rootAllowance: indexRootAllowance) {
-                publish(rebuilt.store, complete: true)
+                let complete = !appScanTruncated && !rebuilt.hitItemCap
+                publish(rebuilt.store, complete: complete)
                 appliedEventId = snap.fsEventId
-                dirty = true
+                dirty = complete
                 setStatus {
                     $0.phase = .idle; $0.lastBuilt = snap.builtAt
                     // Snapshot format does not persist crawl diagnostics; zero means no unsafe
@@ -174,7 +198,7 @@ public final class IndexCoordinator: @unchecked Sendable {
                         || (self.options.maxItems > 0 && snap.count == self.options.maxItems)
                 }
             } else {
-                fullCrawl()
+                fullCrawl(refreshRoots: false)
             }
             startWatcher()
             startTimer()
@@ -387,22 +411,31 @@ public final class IndexCoordinator: @unchecked Sendable {
     @discardableResult
     private func rescanAppsInternal(publishNow: Bool) -> Bool {
         let outcome = appScanner(options.appRoots, AppScanner.extraBundles, options.home)
+        let unchanged = apps == outcome.apps
         apps = outcome.apps
         appScanTruncated = outcome.truncated
         guard publishNow else { return true }
+        if unchanged {
+            // No catalog payload changed, so the current immutable generation and search caches
+            // remain valid. Noisy app-root events must not rebuild every unrelated file array.
+            setStatus { $0.hitItemCap = $0.hitItemCap || self.appScanTruncated }
+            if appScanTruncated { storeComplete = false; dirty = false }
+            return true
+        }
         guard let rebuilt = IndexCoordinator.rebuildStore(apps: apps, filesFrom: store,
                                                           generation: nextGeneration(), fsEventId: store.fsEventId,
                                                           maxItems: options.maxItems,
                                                           rootAllowance: indexRootAllowance) else { return false }
         let previouslyIncomplete = status.hitItemCap
-        guard publish(rebuilt.store, complete: storeComplete) else { return false }
+        let complete = storeComplete && !appScanTruncated && !rebuilt.hitItemCap
+        guard publish(rebuilt.store, complete: complete) else { return false }
         setStatus {
             $0.appCount = rebuilt.store.appItems.count
             // An earlier capped full crawl may have omitted files; only another full crawl can
             // prove completeness even if a later app rescan frees capacity.
             $0.hitItemCap = previouslyIncomplete || self.appScanTruncated || rebuilt.hitItemCap
         }
-        if storeComplete { dirty = true }
+        dirty = complete
         return true
     }
 
@@ -446,6 +479,7 @@ public final class IndexCoordinator: @unchecked Sendable {
 
     private func loadSnapshot() -> IndexStore? {
         setStatus { $0.phase = .loadingSnapshot }
+        guard fileRootDiscovery.isComplete else { return nil }
         guard let s = Snapshot.read(from: options.snapshotURL, expectedHeaderHash: headerHash,
                                     maxItems: options.maxItems, rootAllowance: indexRootAllowance) else { return nil }
         if Date().timeIntervalSince(s.builtAt) > options.fullRecrawlInterval { return nil }
@@ -454,7 +488,7 @@ public final class IndexCoordinator: @unchecked Sendable {
     }
 
     private func writeSnapshotIfDirty() {
-        guard dirty, storeComplete else { return }
+        guard dirty, storeComplete, fileRootDiscovery.isComplete else { return }
         let current = store
         let toWrite = current.fsEventId == appliedEventId ? current
             : StoreMerge.rebrand(current, generation: current.generation, fsEventId: appliedEventId, builtAt: current.builtAt)
@@ -477,20 +511,49 @@ public final class IndexCoordinator: @unchecked Sendable {
 
     // MARK: Crawl
 
-    private func fileRoots() -> [CrawlRoot] {
-        var out: [CrawlRoot] = []
+    private var fileRootDiscovery: FileRootDiscovery {
+        if cachedFileRootDiscovery == nil { refreshFileRootDiscovery() }
+        return cachedFileRootDiscovery!
+    }
+
+    private func refreshFileRootDiscovery() {
+        var discovery = FileRootDiscovery()
         var seen = Set<String>()
         for entry in options.fileRoots {
-            if out.count >= SafetyLimits.maxRootEntries { break }
-            let roots = entry == "~" ? Crawler.defaultRoots(home: options.home, exclusions: options.exclusions)
-                                      : [CrawlRoot(path: Exclusions.expandTilde(entry, home: options.home))]
+            let roots: [CrawlRoot]
+            if entry == "~" {
+                let outcome = defaultRootDiscoverer(options.home, options.exclusions)
+                roots = outcome.roots
+                discovery.isComplete = discovery.isComplete && outcome.isComplete
+                discovery.deniedPaths.append(contentsOf: outcome.deniedPaths)
+                discovery.skippedUnsafe += outcome.skippedUnsafe
+                if outcome.truncated { discovery.cappedDirs.append(options.home) }
+            } else {
+                roots = [CrawlRoot(path: Exclusions.expandTilde(entry, home: options.home))]
+            }
             for r in roots where seen.insert(r.path).inserted {
-                out.append(r)
-                if out.count >= SafetyLimits.maxRootEntries { break }
+                if discovery.roots.count < SafetyLimits.maxRootEntries {
+                    discovery.roots.append(r)
+                    // An unavailable selected root must not accept an old matching cache as an
+                    // authoritative current scope. Use the crawler's no-follow descriptor contract.
+                    if !Crawler.canOpenRoot(r.path) {
+                        discovery.isComplete = false
+                        if discovery.unavailableRoots.count < Crawler.maxReportedPaths {
+                            discovery.unavailableRoots.append(r.path)
+                        }
+                    }
+                } else {
+                    discovery.isComplete = false
+                    if discovery.cappedDirs.count < Crawler.maxReportedPaths {
+                        discovery.cappedDirs.append(r.path)
+                    }
+                }
             }
         }
-        return out
+        cachedFileRootDiscovery = discovery
     }
+
+    private func fileRoots() -> [CrawlRoot] { fileRootDiscovery.roots }
 
     private func fileRootPaths() -> [String] { fileRoots().map { $0.path } }
     private func appRootPaths() -> [String] { options.appRoots.map { Exclusions.expandTilde($0, home: options.home) } }
@@ -499,16 +562,25 @@ public final class IndexCoordinator: @unchecked Sendable {
         Crawler(roots: fileRoots(), exclusions: options.exclusions, maxItems: options.maxItems)
     }
 
-    private func fullCrawl() {
+    private func fullCrawl(refreshRoots: Bool = true) {
         guard !stopped else { return }
         clearCancel()
+        let previousRoots = cachedFileRootDiscovery?.roots
+        if refreshRoots { refreshFileRootDiscovery() }
+        let discovery = fileRootDiscovery
+        let rootsChanged = previousRoots != nil && previousRoots != discovery.roots
+        if rootsChanged { stopWatcher() }
+        // A newly discovered default root needs a watcher after explicit rebuilds and FSEvents
+        // full rescans, just as an options change does. Retaining the old paths strands new roots.
+        defer { if rootsChanged { startWatcher() } }
         // Keep the previous completeness signal while rebuilding. Only a successfully completed
         // full crawl can prove that an earlier capped generation is now complete.
         setStatus {
             $0.phase = .crawling(progress: 0)
-            $0.deniedPaths = []
-            $0.cappedDirs = []
-            $0.unsafeEntriesSkipped = 0
+            $0.deniedPaths = discovery.deniedPaths
+            $0.unavailableRoots = discovery.unavailableRoots
+            $0.cappedDirs = discovery.cappedDirs
+            $0.unsafeEntriesSkipped = discovery.skippedUnsafe
         }
         let eventId = options.watchFileSystem ? UInt64(FSEventsGetCurrentEventId()) : 0
         let builder = IndexBuilder()
@@ -529,7 +601,9 @@ public final class IndexCoordinator: @unchecked Sendable {
         }
         let completed = builder.build(generation: nextGeneration(), fsEventId: eventId)
         let hitBudget = appHitCap || stats.hitItemCap
-        let incomplete = hitBudget || !stats.deniedPaths.isEmpty || !stats.cappedDirs.isEmpty
+        let incomplete = hitBudget || !discovery.isComplete
+            || !stats.deniedPaths.isEmpty || !stats.cappedDirs.isEmpty
+            || !stats.unavailableRoots.isEmpty || stats.skippedUnsafe > 0
         // A capped budget/directory or denied location produces a useful launcher generation, but it
         // is not an exact filesystem view: do not enable incremental updates or persist it as a
         // complete snapshot. A later explicit rebuild may prove completeness.
@@ -537,8 +611,12 @@ public final class IndexCoordinator: @unchecked Sendable {
         appliedEventId = eventId
         dirty = !incomplete
         setStatus {
-            $0.phase = .idle; $0.deniedPaths = stats.deniedPaths; $0.cappedDirs = stats.cappedDirs
-            $0.unsafeEntriesSkipped = stats.skippedUnsafe
+            $0.phase = .idle
+            $0.deniedPaths = Array((discovery.deniedPaths + stats.deniedPaths).prefix(Crawler.maxReportedPaths))
+            $0.unavailableRoots = Array(Set(discovery.unavailableRoots + stats.unavailableRoots))
+                .sorted().prefix(Crawler.maxReportedPaths).map { $0 }
+            $0.cappedDirs = Array((discovery.cappedDirs + stats.cappedDirs).prefix(Crawler.maxReportedPaths))
+            $0.unsafeEntriesSkipped = discovery.skippedUnsafe + stats.skippedUnsafe
             $0.appCount = completed.appItems.count
             $0.hitItemCap = hitBudget; $0.lastBuilt = completed.builtAt
         }
@@ -571,6 +649,9 @@ public final class IndexCoordinator: @unchecked Sendable {
         let appRoots = appRootPaths()
         if batch.changes.contains(where: { c in appRoots.contains { IndexCoordinator.isUnder(c.path, root: $0) } }) {
             if !rescanAppsInternal(publishNow: true) { fullCrawl(); return }
+            // A capped catalog replacement may omit files too. Incremental publication must not
+            // turn that incomplete generation back into a complete one during the same batch.
+            guard storeComplete else { fullCrawl(); return }
         }
         let crawler = makeCrawler()
         let fileChanges = batch.changes.filter { IndexUpdater.isUnderRoots($0.path, crawler: crawler) }
@@ -606,11 +687,26 @@ public final class IndexCoordinator: @unchecked Sendable {
             setStatus { $0.phase = .failed("index exceeded configured resource limits") }
             return false
         }
-        store = s
+        let schedule = lock.withLock {
+            // Publication and the pending-delivery decision must share one critical section.
+            // Otherwise an existing callback could consume the new store between these steps,
+            // clear the flag, and make this publication queue a duplicate generation delivery.
+            _store = s
+            guard !storeCallbackPending else { return false }
+            storeCallbackPending = true
+            return true
+        }
         storeComplete = complete
         setStatus { $0.itemCount = s.count }
-        let cb = lock.withLock { _onStoreChanged }
-        callbackQueue.async { cb?(s) }
+        if schedule {
+            callbackQueue.async { [self] in
+                let delivery: (IndexStore, (@Sendable (IndexStore) -> Void)?) = lock.withLock {
+                    storeCallbackPending = false
+                    return (_store, _onStoreChanged)
+                }
+                delivery.1?(delivery.0)
+            }
+        }
         return true
     }
 

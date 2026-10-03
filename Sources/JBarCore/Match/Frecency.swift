@@ -300,11 +300,17 @@ public final class FrecencyStore: @unchecked Sendable {
     /// `weights.queryPick` if the exact (trimmed, folded) `query` last resulted in opening `path`, else 0.
     public func queryPickBoost(query: String, path: String, weights: RankingWeights = .default) -> Int {
         guard Self.validPath(path) else { return 0 }
+        return queryPickPath(query: query) == path ? weights.queryPick : 0
+    }
+
+    /// Snapshot the current pick once per result-window rerank. Normalizing the same query and
+    /// locking for every retained candidate otherwise adds hundreds of identical operations.
+    func queryPickPath(query: String) -> String? {
         let bounded = QueryParser.boundedRaw(query).trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !bounded.isEmpty else { return 0 }
+        guard !bounded.isEmpty else { return nil }
         let key = TextAnalyzer.fold(bounded)
         lock.lock(); defer { lock.unlock() }
-        return queryPicks[key] == path ? weights.queryPick : 0
+        return queryPicks[key]
     }
 
     /// Paths by decayed frecency, descending (ties: path ascending). `limit` ≤ maxEntries. Does NOT check existence (caller prunes).

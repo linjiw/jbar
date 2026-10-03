@@ -8,7 +8,8 @@ final class SnapshotTests: XCTestCase {
     private var tempDir: URL!
 
     override func setUpWithError() throws {
-        tempDir = FileManager.default.temporaryDirectory
+        tempDir = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+            .deletingLastPathComponent().appendingPathComponent(".build/core-review-tests", isDirectory: true)
             .appendingPathComponent("jbar-snapshot-tests-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
     }
@@ -194,20 +195,34 @@ final class SnapshotTests: XCTestCase {
         )
     }
 
-    private func copy(_ store: IndexStore, extensions: [String]) -> IndexStore {
+    private func copy(_ store: IndexStore, extensions: [String]? = nil,
+                      displayArena: [UInt8]? = nil) -> IndexStore {
         IndexStore(
             count: store.count, dirId: store.dirId, nameStart: store.nameStart,
             nameLen: store.nameLen, displayStart: store.displayStart,
             displayLen: store.displayLen, mask: store.mask, initials: store.initials,
             mtime: store.mtime, kind: store.kind, flags: store.flags, depth: store.depth,
             extId: store.extId, foldedArena: store.foldedArena, bonusArena: store.bonusArena,
-            displayArena: store.displayArena, dirs: store.dirs, dirArena: store.dirArena,
-            extensions: extensions, appInfo: store.appInfo, appItems: store.appItems,
+            displayArena: displayArena ?? store.displayArena, dirs: store.dirs, dirArena: store.dirArena,
+            extensions: extensions ?? store.extensions, appInfo: store.appInfo, appItems: store.appItems,
             generation: store.generation, fsEventId: store.fsEventId, builtAt: store.builtAt
         )
     }
 
     // MARK: - Round-trips
+
+    func testSnapshotRejectsMalformedUTF8ItemBytesOnEncodeAndDecode() throws {
+        let store = makeSingleItemStore(root: "/snapshot", name: "name")
+        let original = try Snapshot.encode(store, headerHash: 71)
+        let display = try XCTUnwrap(blobPayloadRange(14, in: original))
+        for bytes in [[0xF0, 0x8F, 0xBF, 0xBF], [0xED, 0xA0, 0x80, 0x61],
+                      [0xF4, 0x90, 0x80, 0x80], [0x61, 0x61, 0x61, 0xC2]] as [[UInt8]] {
+            var hostile = original
+            hostile.replaceSubrange(display, with: bytes)
+            XCTAssertNil(Snapshot.decode(hostile, expectedHeaderHash: 71))
+            XCTAssertThrowsError(try Snapshot.encode(copy(store, displayArena: bytes), headerHash: 71))
+        }
+    }
 
     func testEncodeDecodeRoundTripsEveryField() throws {
         let store = makeStore()
@@ -250,6 +265,33 @@ final class SnapshotTests: XCTestCase {
         try FileManager.default.createSymbolicLink(at: link, withDestinationURL: target)
         XCTAssertNil(Snapshot.read(from: link, expectedHeaderHash: hash),
                      "snapshot reads must classify the exact O_NOFOLLOW descriptor")
+    }
+
+    func testBorrowedParentDescriptorSnapshotReadAndWriteCannotBeRedirected() throws {
+        let parent = tempDir.appendingPathComponent("parent", isDirectory: true)
+        let parked = tempDir.appendingPathComponent("parked", isDirectory: true)
+        let attacker = tempDir.appendingPathComponent("attacker", isDirectory: true)
+        let file = parent.appendingPathComponent("index.bin")
+        let attackerFile = attacker.appendingPathComponent("index.bin")
+        let hash: UInt64 = 0xB0AA0
+        try Snapshot.write(makeStore(generation: 7), to: file, headerHash: hash)
+        try Snapshot.write(makeStore(generation: 999), to: attackerFile, headerHash: hash)
+        let attackerBytes = try Data(contentsOf: attackerFile)
+        let descriptor = Darwin.open(parent.path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
+        XCTAssertGreaterThanOrEqual(descriptor, 0)
+        defer { _ = Darwin.close(descriptor) }
+        try FileManager.default.moveItem(at: parent, to: parked)
+        try FileManager.default.createSymbolicLink(at: parent, withDestinationURL: attacker)
+        XCTAssertEqual(Snapshot.read(from: file, parentDirectoryDescriptor: descriptor,
+                                     expectedHeaderHash: hash)?.generation, 7)
+        XCTAssertNil(Snapshot.read(from: file, parentDirectoryDescriptor: descriptor,
+                                   expectedHeaderHash: hash + 1))
+        try Snapshot.write(makeStore(generation: 8), to: file,
+                           parentDirectoryDescriptor: descriptor, headerHash: hash)
+        XCTAssertEqual(Snapshot.read(from: parked.appendingPathComponent("index.bin"),
+                                     expectedHeaderHash: hash)?.generation, 8)
+        XCTAssertEqual(try Data(contentsOf: attackerFile), attackerBytes)
+        XCTAssertNotEqual(fcntl(descriptor, F_GETFD), -1, "Snapshot borrows and does not close the caller's descriptor")
     }
 
     func testOversizedSparseSnapshotFailsBeforeReadingContents() throws {
@@ -893,6 +935,39 @@ final class SnapshotTests: XCTestCase {
     }
 
     // MARK: - headerHash inputs
+
+    func testCompletenessPolicyV3RejectsLegacyV2Snapshot() throws {
+        let exclusions = Exclusions.defaults(home: "/home/u")
+        let fileRoots = ["/home/u/Documents", "/home/u/Desktop"]
+        let appRoots = ["/Applications", "/System/Applications"]
+        let maxItems = 500
+        // Frozen legacy header contract: v2 caches never recorded unavailable-root, unsafe-skip
+        // or catalog-replacement completeness diagnostics. Their byte format remains well formed.
+        var legacy = FNV1a()
+        legacy.update(exclusions.stableHash)
+        legacy.update("jbar.snapshot.file-roots.v1")
+        legacy.update(UInt64(fileRoots.count))
+        for root in fileRoots.sorted() { legacy.update(root); legacy.update("\u{1}") }
+        legacy.update("jbar.snapshot.app-roots.v1")
+        legacy.update(UInt64(appRoots.count))
+        for root in appRoots.sorted() { legacy.update(root); legacy.update("\u{1}") }
+        legacy.update("jbar.snapshot.max-items.v1")
+        legacy.update(UInt64(maxItems))
+        legacy.update("jbar.snapshot.completeness-policy.v2")
+        legacy.update(BonusConstants.hash)
+        legacy.update(UInt64(Snapshot.schemaVersion))
+        let current = Snapshot.headerHash(exclusions: exclusions, fileRoots: fileRoots,
+                                           appRoots: appRoots, maxItems: maxItems)
+        let encoded = try Snapshot.encode(makeStore(), headerHash: legacy.value)
+        XCTAssertNotNil(Snapshot.decode(encoded, expectedHeaderHash: legacy.value, maxItems: maxItems))
+        XCTAssertNil(Snapshot.decode(encoded, expectedHeaderHash: current, maxItems: maxItems),
+                     "a well-formed old cache must force a crawl under the stronger coverage policy")
+        let file = tempDir.appendingPathComponent("legacy-v2.bin")
+        try Snapshot.write(makeStore(), to: file, headerHash: legacy.value)
+        XCTAssertNil(Snapshot.read(from: file, expectedHeaderHash: current, maxItems: maxItems))
+        XCTAssertNotNil(Snapshot.decode(try Snapshot.encode(makeStore(), headerHash: current),
+                                        expectedHeaderHash: current, maxItems: maxItems))
+    }
 
     func testHeaderHashChangesWithExclusionsRootRolesAndCap() {
         let excl = Exclusions.defaults(home: "/home/u")

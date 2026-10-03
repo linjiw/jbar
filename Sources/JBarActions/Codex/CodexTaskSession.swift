@@ -160,7 +160,7 @@ public struct CodexTaskSession: Sendable {
             "clientInfo": .object([
                 "name": .string("jbar"),
                 "title": .string("JBar"),
-                "version": .string("0.1.0-dev"),
+                "version": .string("0.2.0-dev"),
             ]),
             "capabilities": .object([
                 "experimentalApi": .bool(true),

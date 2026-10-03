@@ -7,7 +7,8 @@ final class SecureFileIOTests: XCTestCase {
     private var root: URL!
 
     override func setUpWithError() throws {
-        root = FileManager.default.temporaryDirectory
+        root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+            .deletingLastPathComponent().appendingPathComponent(".build/core-review-tests", isDirectory: true)
             .appendingPathComponent("jbar-secure-io-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
     }
@@ -20,6 +21,68 @@ final class SecureFileIOTests: XCTestCase {
         var info = stat()
         XCTAssertEqual(lstat(url.path, &info), 0, url.path)
         return info.st_mode & 0o777
+    }
+
+    func testBorrowedParentDescriptorPinsReadsAndWritesAcrossPathReplacement() throws {
+        let parent = root.appendingPathComponent("parent", isDirectory: true)
+        let parked = root.appendingPathComponent("parked", isDirectory: true)
+        let attacker = root.appendingPathComponent("attacker", isDirectory: true)
+        try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: attacker, withIntermediateDirectories: true)
+        let original = parent.appendingPathComponent("state")
+        let attackerFile = attacker.appendingPathComponent("state")
+        try Data("original".utf8).write(to: original)
+        try Data("attacker".utf8).write(to: attackerFile)
+        let descriptor = Darwin.open(parent.path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
+        XCTAssertGreaterThanOrEqual(descriptor, 0)
+        defer { _ = Darwin.close(descriptor) }
+        try FileManager.default.moveItem(at: parent, to: parked)
+        try FileManager.default.createSymbolicLink(at: parent, withDestinationURL: attacker)
+
+        XCTAssertEqual(try SecureFileIO.readRegularFile(at: original, maxBytes: 8,
+                                                       parentDirectoryDescriptor: descriptor), Data("original".utf8))
+        try SecureFileIO.writeAtomicallyOwnerOnly(Data("new".utf8), to: original,
+                                                 parentDirectoryDescriptor: descriptor)
+        XCTAssertEqual(try Data(contentsOf: parked.appendingPathComponent("state")), Data("new".utf8))
+        XCTAssertEqual(try Data(contentsOf: attackerFile), Data("attacker".utf8))
+        XCTAssertEqual(try permissions(parked.appendingPathComponent("state")), 0o600)
+    }
+
+    func testBorrowedDescriptorRejectsNonDirectoryAndFinalSymlink() throws {
+        let file = root.appendingPathComponent("regular")
+        try Data("original".utf8).write(to: file)
+        let fileDescriptor = Darwin.open(file.path, O_RDONLY | O_CLOEXEC)
+        XCTAssertGreaterThanOrEqual(fileDescriptor, 0)
+        defer { _ = Darwin.close(fileDescriptor) }
+        XCTAssertThrowsError(try SecureFileIO.readRegularFile(at: file, maxBytes: 8,
+                                                             parentDirectoryDescriptor: fileDescriptor))
+        XCTAssertThrowsError(try SecureFileIO.writeAtomicallyOwnerOnly(Data(), to: file,
+                                                                       parentDirectoryDescriptor: fileDescriptor))
+        let directoryDescriptor = Darwin.open(root.path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
+        XCTAssertGreaterThanOrEqual(directoryDescriptor, 0)
+        defer { _ = Darwin.close(directoryDescriptor) }
+        let link = root.appendingPathComponent("link")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: file)
+        XCTAssertThrowsError(try SecureFileIO.readRegularFile(at: link, maxBytes: 8,
+                                                             parentDirectoryDescriptor: directoryDescriptor))
+        XCTAssertEqual(try Data(contentsOf: file), Data("original".utf8))
+    }
+
+    func testBorrowedDescriptorPreservesHeaderPreflightAndGrowthLimit() throws {
+        let file = root.appendingPathComponent("state")
+        try Data("header-body".utf8).write(to: file)
+        let descriptor = Darwin.open(root.path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
+        XCTAssertGreaterThanOrEqual(descriptor, 0)
+        defer { _ = Darwin.close(descriptor) }
+        XCTAssertThrowsError(try SecureFileIO.readRegularFile(
+            at: file, maxBytes: 32, parentDirectoryDescriptor: descriptor,
+            preflightByteCount: 6, limitAfterPreflight: { header in
+                XCTAssertEqual(header, Data("header".utf8))
+                return 6
+            }
+        )) { error in
+            XCTAssertEqual(error as? SecureFileIO.Failure, .tooLarge(maxBytes: 6))
+        }
     }
 
     func testBoundedReadUsesTheOpenedRegularFileAndRejectsSymlinks() throws {

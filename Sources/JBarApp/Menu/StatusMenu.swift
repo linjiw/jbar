@@ -139,6 +139,9 @@ final class StatusMenu: NSObject, NSMenuDelegate {
             let count = status.unsafeEntriesSkipped
             items.append(disabled("⚠ Skipped \(format(count)) unsafe filesystem entr\(count == 1 ? "y" : "ies")"))
         }
+        if !status.unavailableRoots.isEmpty {
+            items.append(disabled("⚠ Some configured roots unavailable — Check Config"))
+        }
         if status.hitItemCap { items.append(disabled("⚠ Index cap reached (\(format(status.itemCount)) items)")) }
         if !status.cappedDirs.isEmpty { items.append(disabled("⚠ Skipped \(status.cappedDirs.count) very large folder\(status.cappedDirs.count == 1 ? "" : "s")")) }
         if let w = hotkeyWarning { items.append(disabled("⚠ Hotkey unavailable — \(w)")) }

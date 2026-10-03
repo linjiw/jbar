@@ -96,14 +96,17 @@ trap 'exit 129' HUP
 archive_name="JBar-${version}-universal.zip"
 archive="$tmp_dir/$archive_name"
 checksum="$archive.sha256"
-installer="$tmp_dir/install-prebuilt.sh"
+installer_name="JBar-install-prebuilt-${version}.sh"
+installer="$tmp_dir/$installer_name"
+installer_checksum="$installer.sha256"
 base_url="https://github.com/$REPOSITORY/releases/download/$tag"
 
 curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
   --retry 3 --retry-delay 1 --max-filesize 104857600 \
   --output "$archive" "$base_url/$archive_name"
 curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
-  --retry 3 --retry-delay 1 --output "$checksum" "$base_url/$archive_name.sha256"
+  --retry 3 --retry-delay 1 --max-filesize 4096 \
+  --output "$checksum" "$base_url/$archive_name.sha256"
 
 expected="$(awk -v name="$archive_name" '$2 == name || $2 == "*" name { print $1 }' "$checksum")"
 [[ "$expected" =~ ^[0-9a-fA-F]{64}$ ]] || {
@@ -117,6 +120,26 @@ actual="$(shasum -a 256 "$archive" | awk '{print $1}')"
   exit 1
 }
 
+curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+  --retry 3 --retry-delay 1 --max-filesize 262144 --output "$installer" \
+  "$base_url/$installer_name"
+curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+  --retry 3 --retry-delay 1 --max-filesize 4096 --output "$installer_checksum" \
+  "$base_url/$installer_name.sha256"
+installer_expected="$(awk -v name="$installer_name" '$2 == name || $2 == "*" name { print $1 }' "$installer_checksum")"
+[[ "$installer_expected" =~ ^[0-9a-fA-F]{64}$ ]] || {
+  echo "error: release installer checksum file is malformed" >&2
+  exit 1
+}
+installer_actual="$(shasum -a 256 "$installer" | awk '{print $1}')"
+[ "$(printf '%s' "$installer_actual" | tr '[:upper:]' '[:lower:]')" = \
+  "$(printf '%s' "$installer_expected" | tr '[:upper:]' '[:lower:]')" ] || {
+  echo "error: downloaded release installer checksum does not match" >&2
+  exit 1
+}
+chmod 700 "$installer"
+
+/bin/bash "$installer" --validate-archive "$archive"
 extract_dir="$tmp_dir/extracted"
 mkdir -m 700 "$extract_dir"
 ditto -x -k --rsrc --extattr --qtn --noacl "$archive" "$extract_dir"
@@ -125,11 +148,6 @@ app="$extract_dir/JBar.app"
   echo "error: release archive does not contain JBar.app at its top level" >&2
   exit 1
 }
-
-curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
-  --retry 3 --retry-delay 1 --output "$installer" \
-  "https://raw.githubusercontent.com/$REPOSITORY/$tag/scripts/install-prebuilt.sh"
-chmod 700 "$installer"
 
 if [ "$NO_LAUNCH" -eq 1 ]; then
   bash "$installer" "$app" --no-launch

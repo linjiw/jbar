@@ -59,9 +59,9 @@ public struct SearchResponse: Sendable {
 ///   continuation, so the actor stays re-entrant: a newer `search` can enter, bump the request counter and make
 ///   the older scan bail out between candidate blocks.
 /// - Ranking is two-stage: stage 1 scores every candidate WITHOUT frecency (no path strings needed) and keeps the
-///   best `rerankWindow` (300) by the ranking key in bounded heaps; stage 2 reconstructs paths for that window
+///   best `max(rerankWindow, limit)` (normally 300) by the ranking key in bounded heaps; stage 2 reconstructs paths for that window
 ///   only, adds frecency/query-pick boosts, then orders and groups. Frecency can therefore not lift an item
-///   from outside the top-300 text matches into the visible rows (documented deviation).
+///   from outside this text window into the visible rows (documented deviation).
 /// - Per-item extension terms use interned ext ids (computed once per query from `store.extensions`), so the
 ///   hot loop never builds strings.
 public actor SearchEngine {
@@ -81,7 +81,8 @@ public actor SearchEngine {
     /// When either budget is reached the retained top rows are returned with an explicitly incomplete total.
     public static let maxPathModeVisitedEntries = 100_000
     public static let pathModeTimeBudget: TimeInterval = 3
-    /// Number of best stage-1 candidates that get frecency/query-pick boosts before final ordering.
+    /// Minimum number of best stage-1 candidates that get history boosts before final ordering.
+    /// Larger validated result limits expand the window so up to 500 requested rows can be returned.
     public static let rerankWindow = 300
     /// Candidate count above which the scan is split into parallel chunks. Measured sweet spot: below this,
     /// thread-dispatch overhead of concurrentPerform exceeds the tiny per-candidate work (mask + rare DP),
@@ -111,6 +112,9 @@ public actor SearchEngine {
     private var extLookup: [String: Int16] = [:]
     /// Candidate set of the previous successful `.search` scan (DESIGN.md §6.4 step 4).
     private var cache: IncrementalCache?
+    /// Bounded stage-1 pool for an identical query. Final ranking/rows are always rebuilt so
+    /// history mutations, result limits, grouping and home-display settings take effect immediately.
+    private var rankedCache: RankedScanCache?
     /// Optional internal-only work counter used by deterministic performance tests. Production leaves this nil,
     /// so the candidate hot loop performs no observation or locking.
     private var scanWorkObserver: SearchScanWorkObserver?
@@ -147,6 +151,7 @@ public actor SearchEngine {
         self.store = store
         storeEpoch &+= 1
         cache = nil
+        rankedCache = nil
         var lookup: [String: Int16] = [:]
         lookup.reserveCapacity(store.extensions.count)
         for (i, e) in store.extensions.prefix(Int(Int16.max) + 1).enumerated() where lookup[e] == nil {
@@ -202,9 +207,16 @@ public actor SearchEngine {
         case .extensionOnly(let ext):
             // No terms: the rows carry no highlight offsets (the extension is implied by the query).
             let ctx = makeContext(parsed: parsed, terms: [], limit: safeLimit, appsFirstCap: safeAppsFirstCap, now: now, rid: rid)
+            if let cached = reusableRankedScan(parsed: parsed, now: now, capacity: ctx.rerankCapacity) {
+                let rows = await Self.onWorker { Self.rankAndBuildRows(pool: cached.pool, ctx: ctx) }
+                if requestCounter.current != rid { return finish([], total: 0, cancelled: true) }
+                return finish(rows, total: cached.totalMatches)
+            }
+            let epoch = storeEpoch
             let ids = extIds(for: ext)
             let outcome = await Self.onWorker { Self.scanExtensionOnly(ids: ids, ctx: ctx) }
-            if outcome.cancelled { return finish([], total: 0, cancelled: true) }
+            if outcome.cancelled || requestCounter.current != rid { return finish([], total: 0, cancelled: true) }
+            if epoch == storeEpoch { saveRankedScan(outcome, parsed: parsed, ctx: ctx, epoch: epoch) }
             return finish(outcome.rows, total: outcome.totalMatches)
         case .search:
             guard !parsed.terms.isEmpty else {
@@ -218,10 +230,16 @@ public actor SearchEngine {
             let ctx = makeContext(parsed: parsed, terms: terms, limit: safeLimit,
                                   appsFirstCap: safeAppsFirstCap, now: now, rid: rid,
                                   candidates: candidates)
+            if let cached = reusableRankedScan(parsed: parsed, now: now, capacity: ctx.rerankCapacity) {
+                let rows = await Self.onWorker { Self.rankAndBuildRows(pool: cached.pool, ctx: ctx) }
+                if requestCounter.current != rid { return finish([], total: 0, cancelled: true) }
+                return finish(rows, total: cached.totalMatches)
+            }
             let outcome = await Self.onWorker { Self.scanSearch(ctx: ctx) }
-            if outcome.cancelled { return finish([], total: 0, cancelled: true) }
+            if outcome.cancelled || requestCounter.current != rid { return finish([], total: 0, cancelled: true) }
             if epoch == storeEpoch {
                 cache = IncrementalCache(storeEpoch: epoch, terms: ctx.terms, lastTermComplete: parsed.lastTermComplete, candidates: outcome.matched)
+                saveRankedScan(outcome, parsed: parsed, ctx: ctx, epoch: epoch)
             }
             return finish(outcome.rows, total: outcome.totalMatches)
         }
@@ -329,6 +347,28 @@ public actor SearchEngine {
         return c.candidates
     }
 
+    private func reusableRankedScan(parsed: ParsedQuery, now: Date, capacity: Int) -> RankedScanCache? {
+        guard let cached = rankedCache, cached.storeEpoch == storeEpoch,
+              cached.parsed == parsed, cached.weights == weights, cached.capacity >= capacity,
+              let bucket = Self.rankingTimeBucket(now), cached.timeBucket == bucket else { return nil }
+        return cached
+    }
+
+    private func saveRankedScan(_ outcome: ScanOutcome, parsed: ParsedQuery, ctx: ScanContext, epoch: UInt64) {
+        guard let bucket = Self.rankingTimeBucket(ctx.now) else { rankedCache = nil; return }
+        rankedCache = RankedScanCache(storeEpoch: epoch, parsed: parsed, weights: ctx.weights,
+                                    timeBucket: bucket, capacity: ctx.rerankCapacity, pool: outcome.pool,
+                                    totalMatches: outcome.totalMatches)
+    }
+
+    /// Item mtimes and all recency cutoffs are integer seconds. Stage-1 scores therefore remain
+    /// identical throughout one reference-date second, including when the clock moves backwards
+    /// within that second. Frecency decay is intentionally excluded and is recomputed in stage 2.
+    private static func rankingTimeBucket(_ now: Date) -> Double? {
+        let seconds = now.timeIntervalSinceReferenceDate
+        return seconds.isFinite ? floor(seconds) : nil
+    }
+
     /// Cold-query candidate set. Terms satisfiable by extension cannot constrain the filename: a
     /// `pdf` item may match even when its name lacks p/d/f. For all other terms, choosing the
     /// least-populated one-character bitset is a safe superset and lets the existing combined-mask check
@@ -385,14 +425,14 @@ public actor SearchEngine {
             pool.append(contentsOf: r.top.items)
         }
         let rows = rankAndBuildRows(pool: pool, ctx: ctx)
-        return ScanOutcome(rows: rows, matched: matched, totalMatches: total, cancelled: false)
+        return ScanOutcome(rows: rows, matched: matched, totalMatches: total, cancelled: false, pool: pool)
     }
 
     /// `.extensionOnly` pipeline: every item whose ext id is in `ids`, ranked by type/recency/frecency.
     private static func scanExtensionOnly(ids: [Int16], ctx: ScanContext) -> ScanOutcome {
         guard !ids.isEmpty else { return ScanOutcome(rows: [], matched: [], totalMatches: 0, cancelled: false) }
         let store = ctx.store
-        var top = TopK(capacity: rerankWindow)
+        var top = TopK(capacity: ctx.rerankCapacity)
         var total = 0
         let facts = MatchFacts(textScore: 0, extMatched: true)
         for i in 0..<store.count {
@@ -408,7 +448,7 @@ public actor SearchEngine {
             top.insert(Scored(item: item, facts: facts, kind: kind))
         }
         let rows = rankAndBuildRows(pool: top.items, ctx: ctx)
-        return ScanOutcome(rows: rows, matched: [], totalMatches: total, cancelled: false)
+        return ScanOutcome(rows: rows, matched: [], totalMatches: total, cancelled: false, pool: top.items)
     }
 
     /// Split `0..<count` into parallel chunks (one chunk when below `parallelThreshold`).
@@ -467,14 +507,15 @@ public actor SearchEngine {
         return ChunkResult(index: index, top: worker.top, matched: worker.matched, total: worker.total, cancelled: worker.cancelled)
     }
 
-    /// Stage 2: take the best `rerankWindow` of `pool`, add frecency/query-pick, order, group, build rows.
+    /// Stage 2: bound the pool to the current window, add history, order, group, and build rows.
     private static func rankAndBuildRows(pool: [Scored], ctx: ScanContext) -> [ResultRow] {
         var window = pool
-        if window.count > rerankWindow {
+        if window.count > ctx.rerankCapacity {
             window.sort { Self.better($0.item, $1.item) }
-            window.removeLast(window.count - rerankWindow)
+            window.removeLast(window.count - ctx.rerankCapacity)
         }
         let store = ctx.store
+        let queryPickPath = ctx.frecency?.queryPickPath(query: ctx.parsed.raw)
         var items: [RankedItem] = []
         items.reserveCapacity(window.count)
         for s in window {
@@ -482,7 +523,7 @@ public actor SearchEngine {
             if let f = ctx.frecency {
                 let path = store.path(of: item.itemIndex)
                 let fb = f.boost(for: path, now: ctx.now, weights: ctx.weights)
-                let qp = f.queryPickBoost(query: ctx.parsed.raw, path: path, weights: ctx.weights)
+                let qp = queryPickPath == path ? ctx.weights.queryPick : 0
                 if fb != 0 || qp != 0 {
                     item.finalScore = Ranking.finalScore(facts: s.facts, kind: s.kind, flags: store.itemFlags(item.itemIndex),
                                                          depth: Int(store.depth[item.itemIndex]), mtime: store.mtime[item.itemIndex],
@@ -725,6 +766,17 @@ struct IncrementalCache: Sendable {
     var candidates: [Int32]
 }
 
+struct RankedScanCache: Sendable {
+    var storeEpoch: UInt64
+    var parsed: ParsedQuery
+    var weights: RankingWeights
+    var timeBucket: Double
+    var capacity: Int
+    /// At most max(rerankWindow, limit) per chunk; no paths or final rows are retained.
+    var pool: [Scored]
+    var totalMatches: Int
+}
+
 /// Which item indices a scan iterates.
 enum CandidateSet: Sendable {
     case all(Int)
@@ -768,6 +820,7 @@ final class ScanContext: Sendable {
     let frecency: FrecencyStore?
     let now: Date
     let limit: Int
+    let rerankCapacity: Int
     let appsFirstCap: Int
     let home: String
     let requestId: UInt64
@@ -788,6 +841,7 @@ final class ScanContext: Sendable {
          candidates: CandidateSet = .all(0), workObserver: SearchScanWorkObserver? = nil) {
         self.store = store; self.parsed = parsed; self.terms = terms; self.weights = weights; self.frecency = frecency; self.now = now
         self.limit = limit; self.appsFirstCap = appsFirstCap; self.home = home; self.requestId = requestId; self.counter = counter
+        rerankCapacity = max(SearchEngine.rerankWindow, min(max(0, limit), SafetyLimits.maxResults.upperBound))
         self.candidates = candidates; self.workObserver = workObserver
         var m: UInt64 = 0
         for t in terms where t.extIds.isEmpty { m |= t.mask }
@@ -842,6 +896,7 @@ struct ScanOutcome: Sendable {
     var matched: [Int32]
     var totalMatches: Int
     var cancelled: Bool
+    var pool: [Scored] = []
 }
 
 /// Result of one parallel chunk.
@@ -1014,12 +1069,15 @@ struct TopK: Sendable {
 struct ChunkWorker {
     let ctx: ScanContext
     let scratch = ScorerScratch()
-    var top = TopK(capacity: SearchEngine.rerankWindow)
+    var top: TopK
     var matched: [Int32] = []
     var total = 0
     var cancelled = false
 
-    init(ctx: ScanContext) { self.ctx = ctx }
+    init(ctx: ScanContext) {
+        self.ctx = ctx
+        top = TopK(capacity: ctx.rerankCapacity)
+    }
 
     /// Scan `range` of `ctx.candidates`, polling for cancellation every 2,048 list/store positions.
     mutating func run(range: Range<Int>) {
@@ -1090,19 +1148,23 @@ struct ChunkWorker {
         for (k, term) in ctx.terms.enumerated() {
             let byExt = extId >= 0 && !term.extIds.isEmpty && term.extIds.contains(extId)
             if byExt { extMatched = true }
+            // These query modes require a literal match even when the fuzzy scorer would accept
+            // the term. Reject before DP rather than scoring scattered bytes only to discard them.
+            // Apps remain eligible through aliases; an extension-satisfied term needs neither check.
+            let requiresLiteralName = !byExt && !term.extIds.isEmpty && app == nil
+            let nameMaskMatches = itemMask & term.mask == term.mask
+            if requiresLiteralName {
+                guard nameMaskMatches, Self.substringStart(query: term.folded, text: nameF) != nil else { return nil }
+            }
+            if k == last && ctx.parsed.lastTermComplete && !byExt && !requiresLiteralName,
+               !Self.hasSubstring(term, nameF, app) { return nil }
             var best: ScoreResult? = nil
-            if itemMask & term.mask == term.mask {
+            if nameMaskMatches {
                 best = term.folded.withUnsafeBufferPointer {
                     Scorer.score(query: $0, text: nameF, bonus: nameB, scratch: scratch)
                 }
-                // An extension-like term ("pdf", "md", "zip" — a term equal to an extension present in the
-                // index) that is NOT this item's extension must occur literally in the name; a scattered
-                // fuzzy hit ("re·p·ort ·d·ra·f·t") does not count. Users type such terms to mean the type.
-                if best != nil, !byExt, !term.extIds.isEmpty, app == nil,
-                   Self.substringStart(query: term.folded, text: nameF) == nil { best = nil }
             }
             if let a = app { best = bestAlias(term, a, best) }
-            if k == last && ctx.parsed.lastTermComplete && !byExt && !Self.hasSubstring(term, nameF, app) { return nil }
             guard best != nil || byExt else { return nil }
             if let r = best { textScore += Int(r.score); firstMatch = min(firstMatch, Int(r.firstMatch)) }
         }

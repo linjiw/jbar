@@ -44,7 +44,7 @@ enum Runtime {
 
     /// Marketing version from the bundle's Info.plist, or a dev marker when run from the SwiftPM binary.
     static var version: String {
-        (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "0.1.0-dev"
+        (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "0.2.0-dev"
     }
 
     static var buildNumber: String {
