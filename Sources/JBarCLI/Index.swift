@@ -72,7 +72,7 @@ public struct CLIIndexSettings: Sendable {
         headerHash = hasher.value
         let defaultCache = URL(fileURLWithPath: home, isDirectory: true).appendingPathComponent("Library/Caches/com.linji.jbar.cli", isDirectory: true)
         let cache = try options.cacheDirectory.map { try Self.pathURL($0, home: home, workingDirectory: workingDirectory) } ?? defaultCache
-        ownsCacheDirectory = cache.standardizedFileURL == defaultCache.standardizedFileURL
+        ownsCacheDirectory = cache.path == defaultCache.path
         snapshotURL = cache.appendingPathComponent("index-\(String(headerHash, radix: 16)).bin")
         maxAge = options.maxAge
         allowStale = options.allowStale
@@ -84,9 +84,39 @@ public struct CLIIndexSettings: Sendable {
               path.utf8.first != 0x7E || path == "~" || SafetyLimits.hasTildeSlashPrefix(path) else {
             throw CLIError("Invalid path; use an absolute path, a relative path, or ~/path.")
         }
-        let expanded = Config.expandTilde(path, home: home)
-        let url = URL(fileURLWithPath: expanded, relativeTo: URL(fileURLWithPath: workingDirectory, isDirectory: true)).standardizedFileURL
-        guard SafetyLimits.isSafeAbsolutePath(url.path) else { throw CLIError("Invalid absolute path.") }
+        // Scope selection is lexical. Foundation standardization may consult the filesystem and
+        // alter overlong nonexistent paths on older systems, silently selecting a different root.
+        // Bound both inputs, expand only the explicit ~/ convention, then normalize POSIX slash
+        // components without resolving symlinks or inferring whether the destination exists.
+        let input = Array(path.utf8)
+        let absolute: [UInt8]
+        if input.first == 0x2F {
+            absolute = input
+        } else if input.first == 0x7E {
+            guard SafetyLimits.isSafeAbsolutePath(home) else { throw CLIError("Invalid home directory.") }
+            absolute = Array(home.utf8) + Array(input.dropFirst())
+        } else {
+            guard SafetyLimits.isSafeAbsolutePath(workingDirectory) else { throw CLIError("Invalid working directory.") }
+            absolute = Array(workingDirectory.utf8) + [0x2F] + input
+        }
+        var components: [ArraySlice<UInt8>] = []
+        for component in absolute.split(separator: 0x2F) {
+            if component.elementsEqual([0x2E]) { continue }
+            if component.elementsEqual([0x2E, 0x2E]) {
+                if !components.isEmpty { components.removeLast() }
+            } else { components.append(component) }
+        }
+        var normalizedBytes: [UInt8] = [0x2F]
+        for component in components {
+            if normalizedBytes.count > 1 { normalizedBytes.append(0x2F) }
+            normalizedBytes.append(contentsOf: component)
+        }
+        let normalized = String(decoding: normalizedBytes, as: UTF8.self)
+        guard SafetyLimits.isSafeAbsolutePath(normalized) else { throw CLIError("Invalid absolute path.") }
+        // An explicit directory hint avoids URL's filesystem-based inference. Verify conversion
+        // retains the exact path bytes instead of accepting a platform-dependent scope change.
+        let url = URL(fileURLWithPath: normalized, isDirectory: false)
+        guard url.path.utf8.elementsEqual(normalizedBytes) else { throw CLIError("File URL changed the selected path.") }
         return url
     }
 

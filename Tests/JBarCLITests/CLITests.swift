@@ -129,18 +129,47 @@ final class CLITests: XCTestCase {
         var options = try fixtureOptions(fixture)
         options.roots = [longRoot]
         let settings = try CLIIndexSettings(options: options)
+        XCTAssertEqual(settings.roots.map(\.path), [longRoot], "Root normalization must preserve the full synthetic prefix.")
         let index = CLIIndex(settings: settings, store: builder.build(generation: 1), complete: true, stats: nil,
                              unavailableRoots: [], persisted: false, startupSeconds: 0)
         let session = CLISearchSession(index: index)
         XCTAssertGreaterThan(longRoot.utf8.count, 3_000, "Retain a long synthetic prefix to expose whole-index path expansion.")
+        XCTAssertTrue((SafetyLimits.posixPathComponents(longRoot) ?? []).allSatisfy { $0.utf8.count <= Int(NAME_MAX) })
+        XCTAssertEqual(index.store.dirPath(root), longRoot)
         for leaf in ["directory-9999", "directory-123", "directory-9999"] {
-            let output = try await session.search(query: longRoot + "/" + leaf + "/", limit: 1)
+            let query = longRoot + "/" + leaf + "/"
+            XCTAssertEqual(QueryParser.parse(query).mode, .path(base: longRoot + "/" + leaf, filter: ""))
+            let output = try await session.search(query: query, limit: 1)
             XCTAssertEqual(output.results.map(\.name), ["target.txt"])
             let metrics = await session.directoryLookupCacheMetrics()
             XCTAssertLessThanOrEqual(metrics.pathUTF8Bytes, SafetyLimits.maxPathUTF8Bytes)
             XCTAssertEqual(metrics.directoryIDs, 1)
         }
         XCTAssertEqual(index.store.dirs.count, count + 1)
+    }
+
+    func testCLIPathsNormalizeLexicallyWithoutChangingScopeThroughSymlinks() throws {
+        let fixture = try makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture) }
+        let home = fixture.path + "/home"
+        let working = fixture.path + "/working"
+        for (input, expected) in [("./files/../notes//", working + "/notes"),
+                                  ("/one/./two/../three//", "/one/three"),
+                                  ("~/../sibling", fixture.path + "/sibling"),
+                                  ("~", home), ("/../../..", "/")] {
+            XCTAssertEqual(try CLIIndexSettings.pathURL(input, home: home, workingDirectory: working).path, expected)
+        }
+        let alias = fixture.appendingPathComponent("alias")
+        try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: fixture.appendingPathComponent("files"))
+        XCTAssertEqual(try CLIIndexSettings.pathURL(alias.path + "/child", home: home, workingDirectory: working).path,
+                       alias.path + "/child", "Scope normalization must not resolve an ancestor symlink.")
+        for invalid in ["~other/files", "bad\0path", String(repeating: "x", count: SafetyLimits.maxPathUTF8Bytes + 1)] {
+            assertCLIError(code: 2) { _ = try CLIIndexSettings.pathURL(invalid, home: home, workingDirectory: working) }
+        }
+        assertCLIError(code: 2) {
+            _ = try CLIIndexSettings.pathURL("relative", home: home,
+                                            workingDirectory: "/" + String(repeating: "r", count: SafetyLimits.maxPathUTF8Bytes - 1))
+        }
     }
 
     func testSnapshotDirectoryBrowsingRejectsTraversalAndRepeatedBaseSeparators() async throws {

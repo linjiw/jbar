@@ -17,7 +17,7 @@ independently on core logic, CLI boundaries, and distribution, followed by regre
 | P2 | Newly discovered default roots were crawled without refreshing watcher coverage | Restart the watcher when resolved roots change; a rebuild regression test observes a file added under a newly discovered root |
 | P2 | Assistant/Organize readiness could accept unsafe or unavailable-root coverage | Gate assisted operations on those diagnostics; UI tests keep private paths out of menu/readiness messages |
 | P2 | Invalid typed/unknown-field stdio requests lost a valid correlation ID | Recover the bounded string ID for error replies; protocol regressions preserve request/error correlation |
-| P2 | Snapshot directory queries depended on OS-specific Foundation path standardization | Validate bounded POSIX path bytes directly; retain the 3 KB / 10,000-directory regression and reject traversal/repeated base separators |
+| P2 | Configured roots and snapshot directory queries depended on OS-specific Foundation path standardization | Normalize scope/config/cache paths lexically without resolving symlinks; validate directory query bytes directly; retain identical 3 KB configured/store/query paths in the 10,000-directory regression and reject traversal/repeated query-base separators |
 | P2 | Version bumps broke a hard-coded npm test; release workflow omitted standalone CLI assets/runtime coverage | Derive the npm test version from package metadata; align 0.2.0 versions and check them against the tag; test CLI archives on Intel/Apple Silicon in the mandatory CI matrix |
 
 The scoring shortcut and caches were checked for score/highlight parity, custom bonus arrays,
@@ -42,7 +42,7 @@ and uses recoverable activation. It does not disable Gatekeeper or remove quaran
 
 ## Verification record
 
-The final source passed 715 tests in Debug and 715 in Release, each with zero failures and three
+The final source passed 716 tests in Debug and 716 in Release, each with zero failures and three
 opt-in skips, using `-Xswiftc -warnings-as-errors -Xswiftc -strict-concurrency=complete`.
 All 24 npm wrapper/archive tests passed. The fresh 0.2.0 app passed the isolated installer fault/race
 suite, including rollback, termination, interrupted recovery, concurrent activation and directory
