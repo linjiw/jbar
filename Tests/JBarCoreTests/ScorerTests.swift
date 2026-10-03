@@ -148,6 +148,19 @@ final class ScorerTests: XCTestCase {
         XCTAssertEqual(Scorer.subsequenceStart(query: cjk.folded[...], text: cjk.folded[...]), 0)
     }
 
+    func testOneByteScoringMatchesIndependentReferenceForEveryByte() {
+        let text = Array(UInt8.min...UInt8.max) + Array(UInt8.min...UInt8.max).reversed()
+        var rng = SplitMix(state: 0xC0FFEE)
+        let bonus = text.map { _ in UInt8.random(in: .min ... .max, using: &rng) }
+        for byte in UInt8.min...UInt8.max {
+            let result = Scorer.score(query: [byte], text: text, bonus: bonus, scratch: scratch)
+            XCTAssertEqual(result.map { Int($0.score) }, referenceScore([byte], text, bonus))
+            XCTAssertEqual(result?.firstMatch, Int16(byte))
+        }
+        let absent = [UInt8](repeating: 0x78, count: 8)
+        XCTAssertNil(Scorer.score(query: [0x61], text: absent, bonus: absent, scratch: scratch))
+    }
+
     // MARK: (2) Exact values and ranking sanity
 
     func testExactScoresFromSpecRecurrence() {
@@ -279,6 +292,57 @@ final class ScorerTests: XCTestCase {
             XCTAssertEqual(Scorer.subsequenceStart(query: q[...], text: t.folded[...]).map { Int16($0) }, r.firstMatch)
         }
         XCTAssertGreaterThan(scored, 500, "random corpus should produce plenty of matches")
+    }
+
+    func testContiguousScoresAgainstReferenceWithArbitraryBonuses() {
+        // Vary every public UInt8 bonus value, including values above the analyzer's constants.
+        // Later high-bonus occurrences must beat an earlier contiguous match when appropriate.
+        let text = bytes("abxab")
+        let laterBonuses: [UInt8] = [0, 4, 6, 16, 127, 255]
+        for leadingBonus in UInt8.min...UInt8.max {
+            for laterBonus in laterBonuses {
+                let bonus: [UInt8] = [leadingBonus, 0, 0, laterBonus, laterBonus]
+                let query = bytes("ab")
+                let got = Scorer.score(query: query, text: text, bonus: bonus, scratch: scratch)
+                XCTAssertEqual(got.map { Int($0.score) }, referenceScore(query, text, bonus),
+                               "leading=\(leadingBonus), later=\(laterBonus)")
+                let positions = Scorer.matchPositions(query: query[...], text: text[...], bonus: bonus[...])
+                XCTAssertEqual(got.map { Int($0.score) }, alignmentScore(positions, bonus: bonus))
+                XCTAssertEqual(got?.firstMatch, 0)
+            }
+        }
+    }
+
+    func testRandomContiguousAndUnicodeScoresRetainReferenceAndHighlights() {
+        var rng = SplitMix(state: 0x4A424152)
+        let names = ["report_report.pdf", "Google Chrome Chrome", "xChrome-chrome", "微信微信", "가나다 가나다", "Café-Cafe", "日本語日本語"]
+        for _ in 0..<2_000 {
+            let analyzed = TextAnalyzer.analyze(names[Int.random(in: names.indices, using: &rng)])
+            let start = Int.random(in: analyzed.folded.indices, using: &rng)
+            let length = Int.random(in: 1...min(8, analyzed.folded.count - start), using: &rng)
+            let query = Array(analyzed.folded[start..<(start + length)])
+            let bonus = Bool.random(using: &rng)
+                ? analyzed.bonus
+                : analyzed.folded.map { _ in UInt8.random(in: .min ... .max, using: &rng) }
+            let got = Scorer.score(query: query, text: analyzed.folded, bonus: bonus, scratch: scratch)
+            XCTAssertEqual(got.map { Int($0.score) }, referenceScore(query, analyzed.folded, bonus))
+            let positions = Scorer.matchPositions(query: query[...], text: analyzed.folded[...], bonus: bonus[...])
+            XCTAssertEqual(positions.count, query.count)
+            XCTAssertEqual(got.map { Int($0.score) }, alignmentScore(positions, bonus: bonus))
+        }
+        // Tied maxima retain the leftmost highlighting alignment and greedy first-match tie-break.
+        XCTAssertEqual(positions("report", "report report"), Array(0..<6))
+    }
+
+    func testCappedContiguousScoreWithMaximumPublicBonus() {
+        let text = [UInt8](repeating: 0x61, count: 80)
+        let query = [UInt8](repeating: 0x61, count: 75)
+        let bonus = [UInt8](repeating: .max, count: text.count)
+        let expected = referenceScore(Array(query.prefix(Scorer.maxQueryBytes)), text, bonus)
+        XCTAssertEqual(Scorer.score(query: query, text: text, bonus: bonus, scratch: scratch).map { Int($0.score) }, expected)
+        var missingTail = query
+        missingTail.append(0x7A)
+        XCTAssertNil(Scorer.score(query: missingTail, text: text, bonus: bonus, scratch: scratch))
     }
 
     func testLongQueryIsTruncatedForScoringButFullyChecked() {

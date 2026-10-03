@@ -57,6 +57,14 @@ enum SecureFileIO {
         try readRegularFile(at: url, maxBytes: maxBytes, preflight: nil)
     }
 
+    /// Read relative to a caller-held, validated parent. The descriptor is borrowed synchronously;
+    /// replacing the directory path after validation cannot redirect this operation.
+    static func readRegularFile(at url: URL, maxBytes: Int,
+                                parentDirectoryDescriptor: Int32) throws -> Data? {
+        try readRegularFile(at: url, maxBytes: maxBytes, preflight: nil,
+                            parentDirectoryDescriptor: parentDirectoryDescriptor)
+    }
+
     /// Variant for self-describing formats. It reads exactly `byteCount` bytes from the same validated
     /// descriptor first; the callback may reject the header or return a tighter whole-file limit.
     /// No capacity proportional to the on-disk size is reserved until this preflight succeeds.
@@ -67,13 +75,31 @@ enum SecureFileIO {
                                    preflight: (preflightByteCount, limitAfterPreflight))
     }
 
+    static func readRegularFile(at url: URL, maxBytes: Int, parentDirectoryDescriptor: Int32,
+                                preflightByteCount: Int,
+                                limitAfterPreflight: @escaping (Data) -> Int?) throws -> Data? {
+        guard preflightByteCount > 0, preflightByteCount <= maxBytes else { throw Failure.invalidLimit }
+        return try readRegularFile(at: url, maxBytes: maxBytes,
+                                   preflight: (preflightByteCount, limitAfterPreflight),
+                                   parentDirectoryDescriptor: parentDirectoryDescriptor)
+    }
+
     private static func readRegularFile(at url: URL, maxBytes: Int,
-                                        preflight: (byteCount: Int, limit: (Data) -> Int?)?) throws -> Data? {
+                                        preflight: (byteCount: Int, limit: (Data) -> Int?)?,
+                                        parentDirectoryDescriptor: Int32? = nil) throws -> Data? {
         guard maxBytes >= 0 else { throw Failure.invalidLimit }
         let validated = try validatedFilePath(url)
         // O_NONBLOCK is inert for regular files, but makes FIFOs/devices fail classification
         // immediately instead of hanging before the descriptor can be checked with fstat.
-        let fd = Darwin.open(validated.path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK)
+        let fd: Int32
+        if let parentDirectoryDescriptor {
+            try validateDirectoryDescriptor(parentDirectoryDescriptor)
+            fd = validated.name.withCString {
+                openat(parentDirectoryDescriptor, $0, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK)
+            }
+        } else {
+            fd = Darwin.open(validated.path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK)
+        }
         if fd < 0 {
             if errno == ENOENT { return nil }
             if errno == ELOOP { throw Failure.notRegularFile }
@@ -174,6 +200,28 @@ enum SecureFileIO {
         let dirFD = try openDirectory(url.deletingLastPathComponent(),
                                       enforcePrivateMode: enforcePrivateDirectory)
         defer { _ = Darwin.close(dirFD) }
+        try writeAtomicallyOwnerOnly(data, fileName: fileName, directoryDescriptor: dirFD)
+    }
+
+    /// Borrow a previously validated parent for the complete atomic write, preserving its identity.
+    static func writeAtomicallyOwnerOnly(_ data: Data, to url: URL,
+                                         parentDirectoryDescriptor: Int32) throws {
+        let validated = try validatedFilePath(url)
+        try writeAtomicallyOwnerOnly(data, fileName: validated.name,
+                                     directoryDescriptor: parentDirectoryDescriptor)
+    }
+
+    private static func validateDirectoryDescriptor(_ descriptor: Int32) throws {
+        var info = stat()
+        guard fstat(descriptor, &info) == 0 else {
+            throw Failure.system(operation: "fstat directory", code: errno)
+        }
+        guard info.st_mode & S_IFMT == S_IFDIR else { throw Failure.unsafeDirectory }
+    }
+
+    private static func writeAtomicallyOwnerOnly(_ data: Data, fileName: String,
+                                                 directoryDescriptor dirFD: Int32) throws {
+        try validateDirectoryDescriptor(dirFD)
 
         let temporaryName = ".jbar-write-\(getpid())-\(UUID().uuidString)"
         let fd = temporaryName.withCString { name in

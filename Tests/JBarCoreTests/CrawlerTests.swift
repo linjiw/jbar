@@ -12,7 +12,8 @@ final class CrawlerTests: XCTestCase {
     override func setUpWithError() throws {
         // Canonicalise (/var → /private/var) so the paths we build match what the OS reports back when
         // enumerating directories; otherwise recorded paths and root prefixes would not compare equal.
-        let raw = fm.temporaryDirectory.appendingPathComponent("jbar-crawler-\(UUID().uuidString)", isDirectory: true)
+        let raw = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+            .deletingLastPathComponent().appendingPathComponent(".build/core-review-tests/jbar-crawler-\(UUID().uuidString)", isDirectory: true)
         try fm.createDirectory(at: raw, withIntermediateDirectories: true)
         let canon = (try raw.resourceValues(forKeys: [.canonicalPathKey])).canonicalPath ?? raw.path
         tempDir = URL(fileURLWithPath: canon, isDirectory: true)
@@ -658,7 +659,100 @@ final class CrawlerTests: XCTestCase {
         XCTAssertEqual(updated.count, store.count)
         XCTAssertEqual(updated.generation, 9)
         XCTAssertEqual(updated.fsEventId, 900)
+        XCTAssertEqual(updated.builtAt, store.builtAt,
+                       "no-op updates must not postpone the next full crawl")
+        XCTAssertEqual(updated.maskBitsets, store.maskBitsets)
+        XCTAssertEqual(updated.maskBitCounts, store.maskBitCounts)
+        store.maskBitsets[0].withUnsafeBufferPointer { original in
+            updated.maskBitsets[0].withUnsafeBufferPointer { copied in
+                XCTAssertEqual(copied.baseAddress, original.baseAddress,
+                               "metadata-only updates must share accelerator storage instead of rebuilding it")
+            }
+        }
         XCTAssertTrue(present("keep.txt", in: updated))
+    }
+
+    func testIncrementalMergePreservesFullCrawlTime() throws {
+        let root = tempDir.appendingPathComponent("incremental-age", isDirectory: true)
+        try write(root.appendingPathComponent("Documents/old.txt"))
+        let (crawler, original) = crawlerAndStore(root)
+        let fullCrawlTime = Date(timeIntervalSince1970: 1_700_000_000)
+        let store = StoreMerge.rebrand(original, generation: 1, fsEventId: 100, builtAt: fullCrawlTime)
+        try write(root.appendingPathComponent("Documents/new.txt"))
+        let updated = try XCTUnwrap(IndexUpdater.apply(
+            changes: [.init(path: root.appendingPathComponent("Documents").path, mustScanSubDirs: false)],
+            to: store, crawler: crawler, generation: 2, fsEventId: 200
+        ))
+        XCTAssertTrue(present("new.txt", in: updated))
+        XCTAssertEqual(updated.builtAt, fullCrawlTime,
+                       "incremental deltas do not prove the complete index was recrawled")
+    }
+
+    func testIncrementalUpdateRejectsCappedDirectoryReplacement() throws {
+        let root = tempDir.appendingPathComponent("incremental-capped", isDirectory: true)
+        let docs = root.appendingPathComponent("Documents", isDirectory: true)
+        for item in 0..<4 { try write(docs.appendingPathComponent("file-\(item).txt")) }
+        let (initial, store) = crawlerAndStore(root)
+        var exclusions = initial.exclusions
+        exclusions.maxDirEntries = 2
+        let limited = Crawler(roots: initial.roots, exclusions: exclusions)
+        XCTAssertNil(IndexUpdater.apply(changes: [.init(path: docs.path, mustScanSubDirs: false)],
+                                         to: store, crawler: limited, generation: 2, fsEventId: 200),
+                     "a truncated delta must trigger full-crawl diagnostics instead of deleting cached files")
+    }
+
+    func testIncrementalUpdateRejectsDeniedDirectoryReplacement() throws {
+        let root = tempDir.appendingPathComponent("incremental-denied", isDirectory: true)
+        let docs = root.appendingPathComponent("Documents", isDirectory: true)
+        try write(docs.appendingPathComponent("file.txt"))
+        let (crawler, store) = crawlerAndStore(root)
+        try fm.setAttributes([.posixPermissions: 0], ofItemAtPath: docs.path)
+        defer { try? fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: docs.path) }
+        XCTAssertNil(IndexUpdater.apply(changes: [.init(path: docs.path, mustScanSubDirs: false)],
+                                         to: store, crawler: crawler, generation: 2, fsEventId: 200),
+                     "a denied replacement is incomplete and must not persist as a complete index")
+    }
+
+    func testIncrementalUpdateRejectsUnsafeDescendantReplacement() throws {
+        let root = tempDir.appendingPathComponent("incremental-unsafe", isDirectory: true)
+        let docs = root.appendingPathComponent("Documents", isDirectory: true)
+        let victim = docs.appendingPathComponent("new-child", isDirectory: true)
+        let outside = tempDir.appendingPathComponent("outside", isDirectory: true)
+        try write(docs.appendingPathComponent("known.txt"))
+        try write(outside.appendingPathComponent("secret.txt"))
+        let (crawler, store) = crawlerAndStore(root)
+        try write(victim.appendingPathComponent("new.txt"))
+        let fixture = LockedBox(RaceOutcome())
+        crawler.beforeOpeningDirectoryForTesting = { path in
+            let shouldSwap = fixture.withValue { outcome in
+                guard path == victim.path, !outcome.fired else { return false }
+                outcome.fired = true
+                return true
+            }
+            guard shouldSwap else { return }
+            do {
+                let manager = FileManager()
+                try manager.removeItem(at: victim)
+                try manager.createSymbolicLink(at: victim, withDestinationURL: outside)
+            } catch { fixture.withValue { $0.error = error } }
+        }
+        XCTAssertNil(IndexUpdater.apply(changes: [.init(path: docs.path, mustScanSubDirs: false)],
+                                         to: store, crawler: crawler, generation: 2, fsEventId: 200),
+                     "unsafe omitted subtree coverage must force a full crawl")
+        XCTAssertTrue(fixture.value.fired)
+        XCTAssertNil(fixture.value.error)
+    }
+
+    func testUnavailableSelectedRootsAreReportedForSerialAndParallelCrawls() throws {
+        let missing = tempDir.appendingPathComponent("missing", isDirectory: true)
+        let available = tempDir.appendingPathComponent("available", isDirectory: true)
+        try write(available.appendingPathComponent("safe.txt"))
+        for roots in [[CrawlRoot(path: missing.path)], [CrawlRoot(path: available.path), CrawlRoot(path: missing.path)]] {
+            let crawler = Crawler(roots: roots, exclusions: .defaults(home: tempHome.path))
+            let stats = crawler.crawl(into: IndexBuilder())
+            XCTAssertEqual(stats.unavailableRoots, [missing.path])
+            XCTAssertFalse(stats.cancelled)
+        }
     }
 
     func testIndexUpdaterInexactResolveToAncestor() throws {
@@ -1176,6 +1270,70 @@ final class CrawlerTests: XCTestCase {
         let roots = Crawler.defaultRoots(home: home.path, exclusions: .defaults(home: home.path))
         let names = roots.map { URL(fileURLWithPath: $0.path).lastPathComponent }
         XCTAssertEqual(names, ["Desktop", "Documents", "Downloads", "projects", "alpha", "Zeta"])
+        let outcome = Crawler.defaultRootsOutcome(home: home.path, exclusions: .defaults(home: home.path))
+        XCTAssertTrue(outcome.isComplete)
+        XCTAssertEqual(outcome.roots, roots)
+    }
+
+    func testDefaultRootDiscoveryFilesAndHiddenNamesDoNotConsumeRootAllowance() throws {
+        let home = tempDir.appendingPathComponent("root-discovery-noise", isDirectory: true)
+        for file in 0..<(SafetyLimits.maxRootEntries + 40) {
+            try write(home.appendingPathComponent("loose-\(file).txt"))
+            try write(home.appendingPathComponent(".hidden-\(file)"))
+        }
+        try mkdir(home.appendingPathComponent("Documents"))
+        try mkdir(home.appendingPathComponent("later-visible-root"))
+        let outcome = Crawler.defaultRootsOutcome(home: home.path, exclusions: .defaults(home: home.path))
+        XCTAssertTrue(outcome.isComplete)
+        XCTAssertFalse(outcome.truncated)
+        XCTAssertGreaterThan(outcome.inspectedNames, SafetyLimits.maxRootEntries)
+        XCTAssertEqual(outcome.roots.map { URL(fileURLWithPath: $0.path).lastPathComponent },
+                       ["Documents", "later-visible-root"])
+    }
+
+    func testDefaultRootDiscoveryReportsExcessQualifiedDirectories() throws {
+        let home = tempDir.appendingPathComponent("root-discovery-overflow", isDirectory: true)
+        for directory in 0...SafetyLimits.maxRootEntries {
+            try mkdir(home.appendingPathComponent("root-\(directory)"))
+        }
+        try mkdir(home.appendingPathComponent("Desktop"))
+        let outcome = Crawler.defaultRootsOutcome(home: home.path, exclusions: .defaults(home: home.path))
+        XCTAssertFalse(outcome.isComplete)
+        XCTAssertTrue(outcome.truncated)
+        XCTAssertEqual(outcome.roots.count, SafetyLimits.maxRootEntries)
+        XCTAssertEqual(URL(fileURLWithPath: outcome.roots[0].path).lastPathComponent, "Desktop",
+                       "discovery retains the same root-priority policy when capped")
+    }
+
+    func testDefaultRootDiscoveryReportsBoundedPhysicalNameInspection() throws {
+        let home = tempDir.appendingPathComponent("root-discovery-list-cap", isDirectory: true)
+        for file in 0..<8 { try write(home.appendingPathComponent("file-\(file)")) }
+        var exclusions = Exclusions.defaults(home: home.path)
+        exclusions.maxDirEntries = 3
+        let outcome = Crawler.defaultRootsOutcome(home: home.path, exclusions: exclusions)
+        XCTAssertFalse(outcome.isComplete)
+        XCTAssertTrue(outcome.truncated)
+        XCTAssertEqual(outcome.inspectedNames, 4,
+                       "inspect only the configured cap plus one overflow probe")
+    }
+
+    func testDefaultRootDiscoveryReportsDeniedAndUnsafeHome() throws {
+        let home = tempDir.appendingPathComponent("root-discovery-denied", isDirectory: true)
+        try mkdir(home)
+        try fm.setAttributes([.posixPermissions: 0], ofItemAtPath: home.path)
+        defer { try? fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: home.path) }
+        let denied = Crawler.defaultRootsOutcome(home: home.path, exclusions: .defaults(home: home.path))
+        XCTAssertFalse(denied.isComplete)
+        XCTAssertEqual(denied.deniedPaths, [home.path])
+        XCTAssertTrue(denied.roots.isEmpty)
+
+        let link = tempDir.appendingPathComponent("root-discovery-link", isDirectory: true)
+        try fm.createSymbolicLink(at: link, withDestinationURL: tempHome)
+        let unsafe = Crawler.defaultRootsOutcome(home: link.path, exclusions: .defaults(home: tempHome.path))
+        XCTAssertFalse(unsafe.isComplete)
+        XCTAssertEqual(unsafe.skippedUnsafe, 1)
+        XCTAssertTrue(unsafe.deniedPaths.isEmpty, "unsafe paths are counted instead of retained")
+        XCTAssertTrue(unsafe.roots.isEmpty)
     }
 
     func testPublicTildeRootIsStoredAbsoluteForIncrementalContainment() {

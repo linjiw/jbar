@@ -10,6 +10,12 @@ enum IndexReadiness {
         if !status.deniedPaths.isEmpty {
             return "The local index could not read one or more configured locations and is incomplete. Restore file access or narrow the indexed roots, rebuild the index, then try again."
         }
+        if !status.unavailableRoots.isEmpty {
+            return "The local index could not find one or more configured roots and is incomplete. Restore those locations or update the indexed roots, rebuild the index, then try again."
+        }
+        if status.unsafeEntriesSkipped > 0 {
+            return "The local index skipped entries that could not be scanned safely and is incomplete. Check the indexed locations, rebuild the index, then try again."
+        }
         switch status.phase {
         case .idle:
             return status.itemCount == 0

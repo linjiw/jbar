@@ -194,7 +194,7 @@ enum CLI {
         print(String(format: "crawl: %.2f s (total %.2f s)", waited, Date().timeIntervalSince(t0)))
         print("items: \(status.itemCount)  apps: \(status.appCount)  dirs: \(store.dirs.count)  generation: \(store.generation)")
         print("arena bytes: folded=\(store.foldedArena.count) display=\(store.displayArena.count) dirs=\(store.dirArena.count)")
-        print("denied: \(status.deniedPaths.count)  unsafeSkipped: \(status.unsafeEntriesSkipped)  cappedDirs: \(status.cappedDirs.count)  hitItemCap: \(status.hitItemCap)  phase: \(phaseName(status.phase))")
+        print("denied: \(status.deniedPaths.count)  unavailableRoots: \(status.unavailableRoots.count)  unsafeSkipped: \(status.unsafeEntriesSkipped)  cappedDirs: \(status.cappedDirs.count)  hitItemCap: \(status.hitItemCap)  phase: \(phaseName(status.phase))")
         if let rss = ProcessMemory.residentBytes() { print(String(format: "rss: %.1f MB", Double(rss) / 1_048_576)) }
         return 0
     }

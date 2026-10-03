@@ -1,5 +1,9 @@
 # Performance program
 
+The [October 3, 2026 review](PERFORMANCE-REVIEW-2026-10-03.md) records the current implementation
+pass, index measurements, agent CLI, reproducible comparisons and remaining bottlenecks. Earlier
+measurements below remain historical evidence.
+
 JBar should remain a small launcher with an exceptionally fast name-search path. Content search is
 a separate workload: it needs document extraction, a durable inverted index, freshness rules, and
 new privacy/storage controls. Mixing body text into `IndexStore` would make every launch query pay

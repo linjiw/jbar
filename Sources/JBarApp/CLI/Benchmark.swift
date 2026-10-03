@@ -1398,7 +1398,7 @@ enum Benchmark {
         print(String(format: "build: %.3f s · items=%d · apps=%d · dirs=%d",
                      corpus.buildSeconds, corpus.store.count, corpus.store.appItems.count, corpus.store.dirs.count))
         if let status = corpus.status {
-            print("crawl status: denied paths=\(status.deniedPaths.count), unsafe entries skipped=\(status.unsafeEntriesSkipped), capped dirs=\(status.cappedDirs.count), hit item cap=\(status.hitItemCap)")
+            print("crawl status: denied paths=\(status.deniedPaths.count), unavailable roots=\(status.unavailableRoots.count), unsafe entries skipped=\(status.unsafeEntriesSkipped), capped dirs=\(status.cappedDirs.count), hit item cap=\(status.hitItemCap)")
         }
         if let scope = corpus.scope {
             print("JBar scope: files=\(scope.fileRoots.count), app roots=\(scope.appRoots.count), extra bundles=\(scope.extraBundles.count); Spotlight reference minimal existing scopes=\(scope.spotlightScopes.count)")

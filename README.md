@@ -37,6 +37,27 @@ Typing alone never starts Codex. `?`, `!`, and `>` require an explicit **Return*
 
 ## Install
 
+### Standalone CLI for local AI agents
+
+The native `jbar-cli` edition shares JBar's local filename matcher and compact index without starting
+the launcher or loading AppKit. Build it with `make cli`, then explicitly index a scope and search:
+
+```bash
+swift run -c release jbar-cli index --root "$HOME/Projects"
+swift run -c release jbar-cli search "report pdf" --root "$HOME/Projects" --format json
+swift run -c release jbar-cli serve --root "$HOME/Projects"
+```
+
+`serve` retains the index for repeated JSONL requests from agents. Search and status use the saved
+snapshot; run `index` again when you need a fresh filesystem scan. Results expose scope, snapshot
+age, completeness and truncation. This edition searches filenames and paths; it does not index file
+contents. See [CLI commands and agent integration](docs/CLI.md).
+
+Create an ad-hoc-signed Universal 2 archive and SHA-256 file with
+`make cli-package OUT=/absolute/path/to/a/new/temporary-directory`. The release workflow publishes
+`JBar-CLI-<version>-universal.tar.gz` and its checksum as separate [GitHub Release assets](https://github.com/linjiw/jbar/releases).
+The npm `jbar` command remains the app installer described below.
+
 ### Build the current source
 
 This is the recommended path for the newest `?`, `!`, and `>` workflows. It requires macOS 13 or
@@ -60,7 +81,7 @@ The release installer needs neither Xcode nor Swift:
 curl -fsSL https://raw.githubusercontent.com/linjiw/jbar/main/scripts/install-from-github.sh | bash
 ```
 
-It downloads the latest versioned Universal 2 archive, verifies its SHA-256, signature, bundle
+It downloads the latest versioned Universal 2 archive and checksummed reviewed installer, verifies the app's SHA-256, signature, bundle
 identity, minimum macOS version, and both architectures before installing. Quarantine metadata is
 preserved so macOS remains in control of first-launch approval.
 

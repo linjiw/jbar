@@ -174,6 +174,19 @@ public enum Scorer {
         let m = min(mFull, maxQueryBytes)
         // Greedy pass: rejects non-subsequences and records each DP row's first reachable column.
         guard let first = greedyStarts(qp: qp, mFull: mFull, m: m, tp: tp, n: n, scratch: scratch) else { return nil }
+        // A contiguous alignment starting at the largest bonus in the text reaches the exact
+        // upper bound: first match gets twice that bonus, and every subsequent match carries it.
+        // No gap or alternative alignment can improve it. Word-start prefixes hit this case often
+        // ("report", "chrome") and avoid both scratch growth and the entire O(m·n) DP. Validate the
+        // bonus bound rather than assuming analyzer constants: this public API accepts arbitrary
+        // UInt8 bonus arrays. The greedy pass has already validated the full query, including any
+        // bytes beyond the scoring cap.
+        let firstBonus = bp[first]
+        if scratch.starts[m - 1] == Int32(first + m - 1), firstBonus >= BonusConstants.consecutive,
+           isMaximumBonus(firstBonus, in: bp, count: n) {
+            let best = Int16(m) &* ScoreConstants.match &+ Int16(m + 1) &* Int16(firstBonus)
+            return ScoreResult(score: best, firstMatch: Int16(clamping: first))
+        }
         scratch.ensure(n)
         let starts = UnsafePointer(scratch.starts)
         let end = lastOccurrence(of: qp[m - 1], in: tp, n: n, notBefore: Int(starts[m - 1])) + 1
@@ -185,6 +198,16 @@ public enum Scorer {
         // Unreachable by construction (greedy succeeded ⇒ the greedy alignment is in the DP), kept as a guard.
         guard best > ScoreConstants.neg else { assertionFailure("Scorer.score: DP lost the greedy alignment"); return nil }
         return ScoreResult(score: best, firstMatch: Int16(clamping: first))
+    }
+
+    @inline(__always)
+    private static func isMaximumBonus(_ bonus: UInt8, in bp: UnsafePointer<UInt8>, count: Int) -> Bool {
+        var j = 0
+        while j < count {
+            if bp[j] > bonus { return false }
+            j &+= 1
+        }
+        return true
     }
 
     /// Greedy subsequence scan that records `scratch.starts[i]` (column of the i-th query byte) for

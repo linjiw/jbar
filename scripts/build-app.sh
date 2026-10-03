@@ -113,7 +113,8 @@ if [ ! -f "$ROOT/Resources/AppIcon.icns" ] && [ -f "$ROOT/scripts/make-icns.sh" 
 fi
 
 echo "Building release binary for: ${ARCHS[*]}…"
-swift build -c release --product JBar "${SWIFT_ARCH_ARGS[@]}" >/dev/null
+swift build -c release --product JBar "${SWIFT_ARCH_ARGS[@]}" \
+  -Xswiftc -warnings-as-errors -Xswiftc -strict-concurrency=complete >/dev/null
 BIN="$(swift build -c release "${SWIFT_ARCH_ARGS[@]}" --show-bin-path)/JBar"
 
 /bin/mkdir -p "$OUT_INPUT"

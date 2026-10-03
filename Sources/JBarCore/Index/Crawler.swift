@@ -284,6 +284,18 @@ public struct CrawlRoot: Sendable, Equatable {
     }
 }
 
+/// Bounded discovery of the curated home roots. Callers that persist an authoritative snapshot
+/// must check `isComplete`: a useful prefix of roots is still returned when a discovery cap is hit.
+public struct DefaultRootDiscoveryOutcome: Sendable, Equatable {
+    public var roots: [CrawlRoot] = []
+    public var truncated = false
+    public var deniedPaths: [String] = []
+    public var skippedUnsafe = 0
+    public var inspectedNames = 0
+    public var isComplete: Bool { !truncated && deniedPaths.isEmpty && skippedUnsafe == 0 }
+    public init() {}
+}
+
 /// What happened during a crawl (shown in the menu bar status).
 public struct CrawlStats: Sendable, Equatable {
     public var items: Int = 0
@@ -293,6 +305,9 @@ public struct CrawlStats: Sendable, Equatable {
     public var inspectedNames: Int = 0
     public var skippedExcluded: Int = 0
     public var deniedPaths: [String] = []      // TCC denial / EACCES on a root or subdir
+    /// Explicitly selected roots that could not be opened safely, including disappeared roots.
+    /// Unlike an entry disappearing during enumeration, losing a root invalidates whole-scope coverage.
+    public var unavailableRoots: [String] = []
     public var cappedDirs: [String] = []       // > maxDirEntries
     /// Entries/directories skipped because descriptor-relative validation detected a symlink,
     /// replacement, or a resolved path outside the configured root. This is deliberately a count:
@@ -408,10 +423,38 @@ public final class Crawler: Sendable {
     /// Build the default file roots for a home directory: every non-hidden top-level dir under `home` except
     /// Library/Applications/Public (and anything in `exclusions`), ordered Desktop, Documents, Downloads, projects, then alphabetical.
     public static func defaultRoots(home: String = NSHomeDirectory(), exclusions: Exclusions) -> [CrawlRoot] {
-        guard SafetyLimits.isSafeAbsolutePath(home) else { return [] }
+        defaultRootsOutcome(home: home, exclusions: exclusions).roots
+    }
+
+    /// Reuse the crawl's descriptor validation for snapshot-scope discovery without enumerating it.
+    static func canOpenRoot(_ path: String) -> Bool { (try? OpenDirectory.root(at: path)) != nil }
+
+    /// Scan a separately bounded number of physical names, then apply the allowance to qualifying
+    /// directory roots. Ordinary files, hidden names and excluded directories do not consume the
+    /// 128-root allowance. Listing overflow and excess qualifying roots remain observable.
+    public static func defaultRootsOutcome(home: String = NSHomeDirectory(),
+                                           exclusions: Exclusions) -> DefaultRootDiscoveryOutcome {
+        var outcome = DefaultRootDiscoveryOutcome()
+        guard SafetyLimits.isSafeAbsolutePath(home) else { outcome.skippedUnsafe = 1; return outcome }
         let homeURL = URL(fileURLWithPath: SafetyLimits.trimmingTrailingPathSlashes(home), isDirectory: true)
-        guard let directory = try? OpenDirectory.root(at: homeURL.path),
-              let listing = try? directory.entries(limit: SafetyLimits.maxRootEntries, includeHidden: false) else { return [] }
+        let listing: PhysicalDirectoryListing
+        do {
+            let directory = try OpenDirectory.root(at: homeURL.path)
+            listing = try directory.entries(
+                limit: min(max(0, exclusions.maxDirEntries), hardMaxDirectoryEntries),
+                includeHidden: false, rootBoundary: directory.resolvedPath,
+                claimCrawlBudget: { outcome.inspectedNames += 1; return true }
+            )
+        } catch {
+            if let safety = error as? DirectorySafetyError,
+               let code = safety.errorCode, code == EACCES || code == EPERM {
+                outcome.deniedPaths = [homeURL.path]
+            } else {
+                outcome.skippedUnsafe = 1
+            }
+            return outcome
+        }
+        outcome.truncated = listing.truncation != nil
         let matcher = ExcludedPathMatcher(patterns: exclusions.excludePaths)
         var names: [String] = []
         for e in listing.entries {
@@ -426,7 +469,11 @@ public final class Crawler: Sendable {
             if pa != pb { return pa < pb }
             return a.localizedCaseInsensitiveCompare(b) == .orderedAscending
         }
-        return names.map { CrawlRoot(path: homeURL.appendingPathComponent($0).path) }
+        if names.count > SafetyLimits.maxRootEntries { outcome.truncated = true }
+        outcome.roots = names.prefix(SafetyLimits.maxRootEntries).map {
+            CrawlRoot(path: homeURL.appendingPathComponent($0).path)
+        }
+        return outcome
     }
 
     // MARK: Crawl state
@@ -532,9 +579,13 @@ public final class Crawler: Sendable {
             merged.inspectedNames = IndexStoreLimits.adding(merged.inspectedNames, stats.inspectedNames)
             merged.skippedExcluded = IndexStoreLimits.adding(merged.skippedExcluded, stats.skippedExcluded)
             merged.deniedPaths.append(contentsOf: stats.deniedPaths)
+            merged.unavailableRoots.append(contentsOf: stats.unavailableRoots)
             merged.cappedDirs.append(contentsOf: stats.cappedDirs)
             if merged.deniedPaths.count > Crawler.maxReportedPaths {
                 merged.deniedPaths.removeLast(merged.deniedPaths.count - Crawler.maxReportedPaths)
+            }
+            if merged.unavailableRoots.count > Crawler.maxReportedPaths {
+                merged.unavailableRoots.removeLast(merged.unavailableRoots.count - Crawler.maxReportedPaths)
             }
             if merged.cappedDirs.count > Crawler.maxReportedPaths {
                 merged.cappedDirs.removeLast(merged.cappedDirs.count - Crawler.maxReportedPaths)
@@ -773,6 +824,9 @@ public final class Crawler: Sendable {
         do {
             directory = try OpenDirectory.root(at: path)
         } catch {
+            if ctx.stats.unavailableRoots.count < Crawler.maxReportedPaths {
+                ctx.stats.unavailableRoots.append(path)
+            }
             handleOpenError(error, path: path, ctx: ctx)
             return
         }
@@ -1169,7 +1223,8 @@ public enum IndexUpdater {
                                                         depth: crawler.depthOf(path: w.path), recursive: w.recursive,
                                                         existingSubdirNames: w.existing, into: temp,
                                                         itemLimit: remaining)
-            if stats.hitItemCap { return nil }
+            if stats.hitItemCap || !stats.deniedPaths.isEmpty || !stats.cappedDirs.isEmpty
+                || !stats.unavailableRoots.isEmpty || stats.skippedUnsafe > 0 { return nil }
         }
         return StoreMerge.merge(base: store, keep: keep, extra: temp.build(generation: 0), rootMap: rootMap,
                                 generation: generation, fsEventId: fsEventId, maxItems: limit,
@@ -1377,11 +1432,8 @@ enum StoreMerge {
     }
 
     /// Same contents, new generation/fsEventId (arrays are shared copy-on-write).
-    static func rebrand(_ s: IndexStore, generation: UInt64, fsEventId: UInt64, builtAt: Date = Date()) -> IndexStore {
-        IndexStore(count: s.count, dirId: s.dirId, nameStart: s.nameStart, nameLen: s.nameLen, displayStart: s.displayStart, displayLen: s.displayLen,
-                   mask: s.mask, initials: s.initials, mtime: s.mtime, kind: s.kind, flags: s.flags, depth: s.depth, extId: s.extId,
-                   foldedArena: s.foldedArena, bonusArena: s.bonusArena, displayArena: s.displayArena, dirs: s.dirs, dirArena: s.dirArena,
-                   extensions: s.extensions, appInfo: s.appInfo, appItems: s.appItems, generation: generation, fsEventId: fsEventId, builtAt: builtAt)
+    static func rebrand(_ s: IndexStore, generation: UInt64, fsEventId: UInt64, builtAt: Date? = nil) -> IndexStore {
+        IndexStore(copying: s, generation: generation, fsEventId: fsEventId, builtAt: builtAt ?? s.builtAt)
     }
 
     /// Scanner-owned catalog apps carry an explicit provenance bit. Topology is not identity: the
@@ -1562,7 +1614,7 @@ enum StoreMerge {
         let result = IndexStore(count: finalCount, dirId: dirId, nameStart: nameStart, nameLen: nameLen, displayStart: displayStart,
                                 displayLen: displayLen, mask: mask, initials: initials, mtime: mtime, kind: kind, flags: flags, depth: depth, extId: extId,
                                 foldedArena: foldedArena, bonusArena: bonusArena, displayArena: displayArena, dirs: dirs, dirArena: dirArena,
-                                extensions: extensions, appInfo: appInfo, appItems: appItems, generation: generation, fsEventId: fsEventId, builtAt: Date())
+                                extensions: extensions, appInfo: appInfo, appItems: appItems, generation: generation, fsEventId: fsEventId, builtAt: base.builtAt)
         pathValidationObserver?(pathValidationWork)
         return result
     }
@@ -1648,7 +1700,7 @@ enum StoreMerge {
             guard directory >= 0, directory < store.dirs.count,
                   start >= 0, start <= store.displayArena.count,
                   length <= store.displayArena.count - start,
-                  completeItemPathFitsBytes(
+                  IndexedPathValidation.completeItemPathFits(
                     directoryPathUTF8Bytes: pathLengths[directory],
                     directoryEndsInSlash: endsInSlash[directory],
                     storedName: store.displayArena[start..<(start + length)],
@@ -1785,91 +1837,6 @@ enum StoreMerge {
             decoded += 1
         }
         return decoded
-    }
-
-    /// Allocation-free equivalent of the path-component and complete-item checks used by
-    /// `IndexStoreLimits.completeItemPathFits`.
-    private static func completeItemPathFitsBytes(
-        directoryPathUTF8Bytes: Int,
-        directoryEndsInSlash: Bool,
-        storedName: ArraySlice<UInt8>,
-        flagsRaw: UInt8
-    ) -> Bool {
-        guard directoryPathUTF8Bytes > 0,
-              directoryPathUTF8Bytes <= SafetyLimits.maxPathUTF8Bytes,
-              isSafePathComponentBytes(storedName,
-                                       maxBytes: SafetyLimits.maxNameUTF8Bytes) else { return false }
-        let needsAppSuffix = flagsRaw & ItemFlags.appBundle.rawValue != 0
-            && !hasASCIICaseInsensitiveAppSuffix(storedName)
-        let fileNameBytes = IndexStoreLimits.adding(storedName.count, needsAppSuffix ? 4 : 0)
-        guard fileNameBytes <= SafetyLimits.maxNameUTF8Bytes else { return false }
-        let completeBytes = IndexStoreLimits.adding(
-            IndexStoreLimits.adding(directoryPathUTF8Bytes, directoryEndsInSlash ? 0 : 1),
-            fileNameBytes
-        )
-        return completeBytes <= SafetyLimits.maxPathUTF8Bytes
-    }
-
-    private static func isSafePathComponentBytes(_ bytes: ArraySlice<UInt8>,
-                                                 maxBytes: Int) -> Bool {
-        guard !bytes.isEmpty, bytes.count <= maxBytes, isWellFormedUTF8(bytes) else { return false }
-        var onlyDots = true
-        for byte in bytes {
-            if byte == 0 || byte == 0x2F { return false }
-            if byte != 0x2E { onlyDots = false }
-        }
-        return !(onlyDots && (bytes.count == 1 || bytes.count == 2))
-    }
-
-    private static func hasASCIICaseInsensitiveAppSuffix(_ bytes: ArraySlice<UInt8>) -> Bool {
-        guard bytes.count >= 4 else { return false }
-        let dot = bytes.index(bytes.endIndex, offsetBy: -4)
-        let a = bytes.index(after: dot)
-        let firstP = bytes.index(after: a)
-        let secondP = bytes.index(after: firstP)
-        func lowerASCII(_ byte: UInt8) -> UInt8 {
-            (0x41...0x5A).contains(byte) ? byte + 0x20 : byte
-        }
-        return bytes[dot] == 0x2E && lowerASCII(bytes[a]) == 0x61
-            && lowerASCII(bytes[firstP]) == 0x70 && lowerASCII(bytes[secondP]) == 0x70
-    }
-
-    /// Strict UTF-8 validation without constructing a `String` or accepting replacement scalars.
-    private static func isWellFormedUTF8(_ bytes: ArraySlice<UInt8>) -> Bool {
-        var iterator = bytes.makeIterator()
-        func isContinuation(_ byte: UInt8) -> Bool { (0x80...0xBF).contains(byte) }
-        while let lead = iterator.next() {
-            switch lead {
-            case 0x00...0x7F:
-                continue
-            case 0xC2...0xDF:
-                guard let second = iterator.next(), isContinuation(second) else { return false }
-            case 0xE0:
-                guard let second = iterator.next(), (0xA0...0xBF).contains(second),
-                      let third = iterator.next(), isContinuation(third) else { return false }
-            case 0xE1...0xEC, 0xEE...0xEF:
-                guard let second = iterator.next(), isContinuation(second),
-                      let third = iterator.next(), isContinuation(third) else { return false }
-            case 0xED:
-                guard let second = iterator.next(), (0x80...0x9F).contains(second),
-                      let third = iterator.next(), isContinuation(third) else { return false }
-            case 0xF0:
-                guard let second = iterator.next(), (0x90...0xBF).contains(second),
-                      let third = iterator.next(), isContinuation(third),
-                      let fourth = iterator.next(), isContinuation(fourth) else { return false }
-            case 0xF1...0xF3:
-                guard let second = iterator.next(), isContinuation(second),
-                      let third = iterator.next(), isContinuation(third),
-                      let fourth = iterator.next(), isContinuation(fourth) else { return false }
-            case 0xF4:
-                guard let second = iterator.next(), (0x80...0x8F).contains(second),
-                      let third = iterator.next(), isContinuation(third),
-                      let fourth = iterator.next(), isContinuation(fourth) else { return false }
-            default:
-                return false
-            }
-        }
-        return true
     }
 
     /// Build the exact final semantic side tables before arena copying. Base extension ids remain

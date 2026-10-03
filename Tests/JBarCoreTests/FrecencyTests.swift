@@ -9,7 +9,9 @@ final class FrecencyTests: XCTestCase {
     private let week: TimeInterval = 7 * 86_400
 
     override func setUpWithError() throws {
-        tempDir = FileManager.default.temporaryDirectory
+        let repository = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        tempDir = repository.appendingPathComponent(".build/search-tests/fixtures", isDirectory: true)
             .appendingPathComponent("jbar-frecency-tests-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
     }
@@ -142,6 +144,7 @@ final class FrecencyTests: XCTestCase {
         XCTAssertEqual(s.count, 1)
         XCTAssertEqual(s.queryPickCount, 1)
         XCTAssertEqual(s.queryPickBoost(query: query, path: "/bounded"), 30)
+        XCTAssertEqual(s.queryPickPath(query: query), "/bounded")
         XCTAssertTrue(s.save())
 
         let data = try Data(contentsOf: s.fileURL)
@@ -230,6 +233,18 @@ final class FrecencyTests: XCTestCase {
         s.record(open: "/cafe", query: "Café", at: t0)
         XCTAssertEqual(s.queryPickBoost(query: "cafe", path: "/cafe"), 30)
         XCTAssertEqual(s.queryPickBoost(query: "CAFÉ", path: "/cafe"), 30)
+    }
+
+    func testQueryPickSnapshotNormalizesAndReflectsCurrentSelection() {
+        let store = makeStore()
+        XCTAssertNil(store.queryPickPath(query: "\t\n"))
+        XCTAssertNil(store.queryPickPath(query: "cafe"))
+        store.record(open: "/first", query: "Café", at: t0)
+        XCTAssertEqual(store.queryPickPath(query: " CAFÉ\n"), "/first")
+        store.record(open: "/second", query: "cafe", at: t0)
+        XCTAssertEqual(store.queryPickPath(query: "cafe"), "/second")
+        store.clear()
+        XCTAssertNil(store.queryPickPath(query: "cafe"))
     }
 
     func testQueryPickNotStoredForShortOrMissingQuery() {

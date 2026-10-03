@@ -1,6 +1,6 @@
 {
   "name": "@linjiw/jbar",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Installer for the native JBar macOS developer preview",
   "license": "MIT",
   "repository": {
@@ -19,7 +19,8 @@
     "jbar": "npm/bin/jbar.js"
   },
   "files": [
-    "npm/bin"
+    "npm/bin",
+    "scripts/install-prebuilt.sh"
   ],
   "engines": {
     "node": ">=18"

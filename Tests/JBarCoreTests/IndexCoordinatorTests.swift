@@ -56,7 +56,8 @@ final class IndexCoordinatorTests: XCTestCase {
     override func setUpWithError() throws {
         // Canonicalise (/var → /private/var) so crawler roots match the paths FSEvents reports; otherwise
         // a watched change would be filtered out as "not under roots".
-        let raw = fm.temporaryDirectory.appendingPathComponent("jbar-coord-\(UUID().uuidString)", isDirectory: true)
+        let raw = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+            .deletingLastPathComponent().appendingPathComponent(".build/core-review-tests/jbar-coord-\(UUID().uuidString)", isDirectory: true)
         try fm.createDirectory(at: raw, withIntermediateDirectories: true)
         let canon = (try raw.resourceValues(forKeys: [.canonicalPathKey])).canonicalPath ?? raw.path
         tempDir = URL(fileURLWithPath: canon, isDirectory: true)
@@ -121,6 +122,118 @@ final class IndexCoordinatorTests: XCTestCase {
 
     // MARK: - Full lifecycle
 
+    func testDefaultRootDiscoveryPassesFileNoiseAndCachesOneScanPerCrawl() throws {
+        for file in 0..<(SafetyLimits.maxRootEntries + 20) {
+            try Data().write(to: tempHome.appendingPathComponent("loose-\(file).txt"))
+        }
+        let docs = try makeFiles(in: tempHome.appendingPathComponent("Documents"), count: 1, prefix: "discovered")
+        let discoveries = LockedValues<Int>()
+        let coord = IndexCoordinator(
+            options: makeOptions(),
+            snapshotRemover: { try IndexCoordinator.removeSnapshotIfPresent($0) },
+            defaultRootDiscoverer: { home, exclusions in
+                discoveries.append(1)
+                return Crawler.defaultRootsOutcome(home: home, exclusions: exclusions)
+            }
+        )
+        startAndWait(coord, minCount: 2)
+        XCTAssertTrue((0..<coord.store.count).contains { coord.store.path(of: $0).hasPrefix(docs.path + "/discovered") })
+        XCTAssertTrue(coord.status.cappedDirs.isEmpty)
+        XCTAssertTrue(coord.status.deniedPaths.isEmpty)
+        XCTAssertTrue(fm.fileExists(atPath: snapshotURL.path))
+        XCTAssertEqual(discoveries.snapshot.count, 1,
+                       "snapshot identity, crawl and persistence share one root-discovery result")
+        coord.rescanApps()
+        coord.flushSnapshot()
+        XCTAssertEqual(discoveries.snapshot.count, 1)
+        coord.rebuild()
+        coord.flushSnapshot()
+        XCTAssertEqual(discoveries.snapshot.count, 2, "explicit rebuild refreshes root discovery once")
+        coord.stop()
+        XCTAssertEqual(discoveries.snapshot.count, 2)
+    }
+
+    func testTruncatedDefaultRootDiscoveryRejectsSnapshotAndDoesNotPersist() throws {
+        for directory in 0...SafetyLimits.maxRootEntries {
+            try makeFiles(in: tempHome.appendingPathComponent("root-\(directory)"), count: 1)
+        }
+        let opts = makeOptions()
+        let discovered = Crawler.defaultRootsOutcome(home: opts.home, exclusions: opts.exclusions)
+        XCTAssertTrue(discovered.truncated)
+        let hash = Snapshot.headerHash(exclusions: opts.exclusions, fileRoots: discovered.roots.map(\.path),
+                                       appRoots: opts.appRoots, maxItems: opts.maxItems)
+        let builder = IndexBuilder()
+        let root = builder.addRoot("/sentinel")
+        builder.addItem(dir: root, name: "cached-sentinel", analyzed: TextAnalyzer.analyze("cached-sentinel"),
+                        kind: .other, flags: [], mtime: nil, depth: 0, ext: nil)
+        try Snapshot.write(builder.build(generation: 99), to: snapshotURL, headerHash: hash)
+        let previous = try Data(contentsOf: snapshotURL)
+        let coord = IndexCoordinator(options: opts)
+        startAndWait(coord, minCount: SafetyLimits.maxRootEntries)
+        XCTAssertFalse((0..<coord.store.count).contains { coord.store.name(of: $0) == "cached-sentinel" },
+                       "an incomplete root set must not accept an otherwise matching snapshot")
+        XCTAssertTrue(coord.status.cappedDirs.contains(tempHome.path))
+        XCTAssertEqual(try Data(contentsOf: snapshotURL), previous,
+                       "partial root discovery cannot replace a previously complete cache")
+        coord.stop()
+        XCTAssertEqual(try Data(contentsOf: snapshotURL), previous)
+    }
+
+    func testDeniedDefaultRootDiscoveryReportsHomeAndDoesNotPersist() throws {
+        try fm.setAttributes([.posixPermissions: 0], ofItemAtPath: tempHome.path)
+        defer { try? fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: tempHome.path) }
+        let coord = IndexCoordinator(options: makeOptions())
+        startAndWait(coord, minCount: 0)
+        XCTAssertTrue(coord.status.deniedPaths.contains(tempHome.path))
+        XCTAssertFalse(fm.fileExists(atPath: snapshotURL.path))
+        coord.stop()
+    }
+
+    func testSlowStoreConsumerCoalescesIntermediateGenerations() throws {
+        let docs = tempHome.appendingPathComponent("Documents")
+        try makeFiles(in: docs, count: 2)
+        let callbackTarget = DispatchQueue(label: "jbar.tests.blocked-callbacks", attributes: .concurrent)
+        callbackTarget.suspend()
+        var suspended = true
+        defer { if suspended { callbackTarget.resume() } }
+        let coord = IndexCoordinator(
+            options: makeOptions(fileRoots: [docs.path]), callbackQueue: callbackTarget,
+            snapshotRemover: { try IndexCoordinator.removeSnapshotIfPresent($0) },
+            appScanner: { _, _, _ in AppScanOutcome(apps: [], truncated: false) }
+        )
+        defer { coord.stop() }
+        let values = LockedValues<UInt64>()
+        let first = expectation(description: "latest blocked generation delivered")
+        coord.onStoreChanged = { store in values.append(store.generation); first.fulfill() }
+        coord.start()
+        coord.flushSnapshot()
+        let initialGeneration = coord.store.generation
+        for item in 0..<6 {
+            try Data("new".utf8).write(to: docs.appendingPathComponent("added-\(item).txt"))
+            coord.rebuild()
+            coord.flushSnapshot()
+        }
+        let latest = coord.store.generation
+        XCTAssertGreaterThan(latest, initialGeneration)
+        XCTAssertTrue(values.snapshot.isEmpty, "the callback target is deliberately suspended")
+        suspended = false
+        callbackTarget.resume()
+        wait(for: [first], timeout: 20)
+        XCTAssertEqual(values.snapshot, [latest],
+                       "queued publications must retain and deliver only the latest immutable store")
+
+        let next = expectation(description: "subsequent generation delivered")
+        coord.onStoreChanged = { store in values.append(store.generation); next.fulfill() }
+        coord.rebuild()
+        coord.flushSnapshot()
+        wait(for: [next], timeout: 20)
+        let delivered = values.snapshot
+        XCTAssertEqual(delivered.count, 2)
+        XCTAssertEqual(delivered.last, coord.store.generation)
+        XCTAssertTrue(zip(delivered, delivered.dropFirst()).allSatisfy { $0 < $1 },
+                      "coalesced callbacks preserve generation order")
+    }
+
     func testStartCrawlPublishSnapshotThenReload() throws {
         try makeFiles(in: tempHome.appendingPathComponent("Documents"), count: 4)
         try makeApp("Solo")
@@ -146,6 +259,9 @@ final class IndexCoordinatorTests: XCTestCase {
         coord2.flushSnapshot()
         wait(for: [loaded], timeout: 20)
         XCTAssertEqual(coord2.store.count, firstCount, "snapshot reload should reproduce the item count")
+        XCTAssertEqual(coord2.store.builtAt.timeIntervalSince1970, coord.store.builtAt.timeIntervalSince1970,
+                       accuracy: 1e-3,
+                       "loading and refreshing apps must preserve the original full-crawl age")
         XCTAssertEqual(coord2.status.phase, .idle)
         coord2.stop()
 
@@ -172,9 +288,14 @@ final class IndexCoordinatorTests: XCTestCase {
 
         var opts = makeOptions(fileRoots: [linkedRoot.path])
         opts.appRoots = []
-        let coord = IndexCoordinator(options: opts)
+        let coord = IndexCoordinator(options: opts,
+                                     snapshotRemover: { try IndexCoordinator.removeSnapshotIfPresent($0) },
+                                     appScanner: { _, _, _ in AppScanOutcome(apps: [], truncated: false) })
         startAndWait(coord, minCount: 0)
         XCTAssertGreaterThanOrEqual(coord.status.unsafeEntriesSkipped, 1)
+        XCTAssertEqual(coord.status.unavailableRoots, [linkedRoot.path])
+        XCTAssertFalse(fm.fileExists(atPath: snapshotURL.path),
+                       "an unsafe selected root must not produce an authoritative empty snapshot")
         XCTAssertTrue(coord.status.deniedPaths.isEmpty,
                       "unsafe identity/boundary failures expose only a count, never their path")
 
@@ -185,7 +306,107 @@ final class IndexCoordinatorTests: XCTestCase {
         XCTAssertEqual(coord.status.phase, .idle)
         XCTAssertEqual(coord.status.unsafeEntriesSkipped, 0,
                        "each full crawl starts a fresh unsafe-entry diagnostic window")
+        XCTAssertTrue(coord.status.unavailableRoots.isEmpty)
         coord.stop()
+    }
+
+    func testMissingSelectedRootRejectsMatchingSnapshotAndCannotPersistEmptyCoverage() throws {
+        let missing = tempHome.appendingPathComponent("missing", isDirectory: true)
+        var opts = makeOptions(fileRoots: [missing.path])
+        opts.appRoots = []
+        let builder = IndexBuilder()
+        let parent = builder.addRoot(tempHome.path)
+        builder.addItem(dir: parent, name: "cached.txt", analyzed: TextAnalyzer.analyze("cached.txt"),
+                        kind: .document, flags: [], mtime: nil, depth: 0, ext: "txt")
+        let hash = Snapshot.headerHash(exclusions: opts.exclusions, fileRoots: opts.fileRoots,
+                                       appRoots: [], maxItems: opts.maxItems)
+        try Snapshot.write(builder.build(generation: 50), to: snapshotURL, headerHash: hash)
+        let previous = try Data(contentsOf: snapshotURL)
+        let coord = IndexCoordinator(options: opts,
+                                     snapshotRemover: { try IndexCoordinator.removeSnapshotIfPresent($0) },
+                                     appScanner: { _, _, _ in AppScanOutcome(apps: [], truncated: false) })
+        startAndWait(coord, minCount: 0)
+        XCTAssertEqual(coord.store.count, 0, "an unavailable scope must reject a matching old cache")
+        XCTAssertEqual(coord.status.unavailableRoots, [missing.path])
+        XCTAssertEqual(try Data(contentsOf: snapshotURL), previous,
+                       "useful incomplete generations must preserve the last complete cache")
+        coord.stop()
+        XCTAssertEqual(try Data(contentsOf: snapshotURL), previous)
+    }
+
+    func testTruncatedUnchangedAppRescanPreservesLastCompleteSnapshot() throws {
+        try makeFiles(in: tempHome.appendingPathComponent("Documents"), count: 2)
+        let outcomes = LockedSequence([
+            AppScanOutcome(apps: [], truncated: false),
+            AppScanOutcome(apps: [], truncated: true),
+            AppScanOutcome(apps: [], truncated: false),
+        ])
+        let coord = IndexCoordinator(options: makeOptions(fileRoots: ["~/Documents"]),
+                                     snapshotRemover: { try IndexCoordinator.removeSnapshotIfPresent($0) },
+                                     appScanner: { _, _, _ in outcomes.next() })
+        startAndWait(coord, minCount: 2)
+        let previous = try Data(contentsOf: snapshotURL)
+        let generation = coord.store.generation
+        coord.rescanApps()
+        coord.flushSnapshot()
+        XCTAssertEqual(coord.store.generation, generation)
+        XCTAssertTrue(coord.status.hitItemCap)
+        coord.rescanApps()
+        coord.flushSnapshot()
+        coord.stop()
+        XCTAssertEqual(try Data(contentsOf: snapshotURL), previous,
+                       "a later app-only untruncated scan cannot prove overall coverage")
+    }
+
+    func testAppRescanThatDropsFilesPreservesLastCompleteSnapshot() throws {
+        try makeFiles(in: tempHome.appendingPathComponent("Documents"), count: 2)
+        let apps = (0..<4).map {
+            ScannedApp(url: appsDir.appendingPathComponent("New\($0).app"), displayName: "New\($0)",
+                       bundleID: nil, aliases: [], mtime: nil)
+        }
+        let outcomes = LockedSequence([
+            AppScanOutcome(apps: [], truncated: false),
+            AppScanOutcome(apps: apps, truncated: false),
+        ])
+        var opts = makeOptions(fileRoots: ["~/Documents"])
+        opts.maxItems = 4
+        let coord = IndexCoordinator(options: opts,
+                                     snapshotRemover: { try IndexCoordinator.removeSnapshotIfPresent($0) },
+                                     appScanner: { _, _, _ in outcomes.next() })
+        startAndWait(coord, minCount: 3)
+        let previous = try Data(contentsOf: snapshotURL)
+        coord.rescanApps()
+        coord.flushSnapshot()
+        XCTAssertEqual(coord.store.appItems.count, 4)
+        XCTAssertTrue(coord.status.hitItemCap)
+        coord.stop()
+        XCTAssertEqual(try Data(contentsOf: snapshotURL), previous,
+                       "catalog priority must not persist a generation that omitted previously indexed files")
+    }
+
+    func testSnapshotCatalogRebuildThatDropsFilesPreservesLastCompleteSnapshot() throws {
+        try makeFiles(in: tempHome.appendingPathComponent("Documents"), count: 2)
+        var opts = makeOptions(fileRoots: ["~/Documents"])
+        opts.maxItems = 4
+        let first = IndexCoordinator(options: opts,
+                                     snapshotRemover: { try IndexCoordinator.removeSnapshotIfPresent($0) },
+                                     appScanner: { _, _, _ in AppScanOutcome(apps: [], truncated: false) })
+        startAndWait(first, minCount: 3)
+        first.stop()
+        let previous = try Data(contentsOf: snapshotURL)
+        let apps = (0..<4).map {
+            ScannedApp(url: appsDir.appendingPathComponent("New\($0).app"), displayName: "New\($0)",
+                       bundleID: nil, aliases: [], mtime: nil)
+        }
+        let second = IndexCoordinator(options: opts,
+                                      snapshotRemover: { try IndexCoordinator.removeSnapshotIfPresent($0) },
+                                      appScanner: { _, _, _ in AppScanOutcome(apps: apps, truncated: false) })
+        startAndWait(second, minCount: 4)
+        XCTAssertTrue(second.status.hitItemCap)
+        XCTAssertEqual(second.store.appItems.count, 4)
+        second.stop()
+        XCTAssertEqual(try Data(contentsOf: snapshotURL), previous,
+                       "loading a complete cache cannot grant complete authority to a capped catalog rebuild")
     }
 
     func testAppScanTruncationStaysVisibleUntilACompleteFullCrawl() throws {
@@ -262,6 +483,23 @@ final class IndexCoordinatorTests: XCTestCase {
     }
 
     // MARK: - rescanApps
+
+    func testUnchangedAppRescanPreservesGenerationAndFullCrawlTime() throws {
+        try makeFiles(in: tempHome.appendingPathComponent("Documents"), count: 3)
+        try makeApp("Unchanged")
+        let coord = IndexCoordinator(options: makeOptions())
+        startAndWait(coord, minCount: 4)
+        let generation = coord.store.generation
+        let builtAt = coord.store.builtAt
+        for _ in 0..<3 {
+            coord.rescanApps()
+            coord.flushSnapshot()
+            XCTAssertEqual(coord.store.generation, generation,
+                           "identical app discovery must not rebuild unrelated file arrays or invalidate search caches")
+            XCTAssertEqual(coord.store.builtAt, builtAt)
+        }
+        coord.stop()
+    }
 
     func testRescanAppsPicksUpNewApp() throws {
         try makeFiles(in: tempHome.appendingPathComponent("Documents"), count: 3)
@@ -646,6 +884,29 @@ final class IndexCoordinatorTests: XCTestCase {
         try touch(docs.appendingPathComponent("watched.txt").path)
         wait(for: [picked], timeout: 20)
         XCTAssertEqual(coord.status.phase, .idle)
+        coord.stop()
+    }
+
+    func testRebuildRefreshesWatcherForNewlyDiscoveredDefaultRoot() throws {
+        try makeFiles(in: tempHome.appendingPathComponent("Documents"), count: 1)
+        var opts = makeOptions()
+        opts.watchFileSystem = true
+        opts.fsLatency = 0.2
+        let coord = IndexCoordinator(options: opts)
+        startAndWait(coord, minCount: 2)
+        let projects = try makeFiles(in: tempHome.appendingPathComponent("projects"), count: 1)
+        coord.rebuild()
+        coord.flushSnapshot()
+        XCTAssertTrue(coord.status.watcherRunning)
+        XCTAssertTrue((0..<coord.store.count).contains { coord.store.path(of: $0).hasPrefix(projects.path + "/") })
+        let picked = expectation(description: "new default root is watched after rebuild")
+        picked.assertForOverFulfill = false
+        coord.onStoreChanged = { store in
+            if (0..<store.count).contains(where: { store.name(of: $0) == "new-root-watched.txt" }) { picked.fulfill() }
+        }
+        Thread.sleep(forTimeInterval: 0.3)
+        try touch(projects.appendingPathComponent("new-root-watched.txt").path)
+        wait(for: [picked], timeout: 20)
         coord.stop()
     }
 

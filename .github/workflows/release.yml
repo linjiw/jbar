@@ -67,6 +67,9 @@ jobs:
             echo "error: checkout does not match the requested release tag" >&2
             exit 2
           }
+          version="${RELEASE_TAG#v}"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Resources/Info.plist)" = "$version"
+          test "$(node -p 'require("./package.json").version')" = "$version"
           {
             echo "commit=$expected_commit"
             echo "tag=$RELEASE_TAG"
@@ -231,7 +234,9 @@ jobs:
           xcodebuild -version
 
       - name: Run optimized tests
-        run: swift test -c release --scratch-path "$RUNNER_TEMP/jbar-release-tests"
+        run: |
+          swift test -c release --scratch-path "$RUNNER_TEMP/jbar-release-tests" \
+            -Xswiftc -warnings-as-errors -Xswiftc -strict-concurrency=complete
 
       - name: Compile all source and test targets with complete concurrency checking
         run: |
@@ -265,12 +270,39 @@ jobs:
             cd "$candidate"
             shasum -a 256 JBar-ad-hoc-candidate.zip > JBar-ad-hoc-candidate.zip.sha256
           )
+          scripts/install-prebuilt.sh --validate-archive "$candidate/JBar-ad-hoc-candidate.zip"
 
       - name: Upload the credential-free candidate
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: JBar-release-candidate
           path: ${{ runner.temp }}/jbar-candidate-artifact
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+      - name: Build and verify the standalone CLI and reviewed installer
+        env:
+          VERSION: ${{ steps.metadata.outputs.version }}
+        run: |
+          set -euo pipefail
+          scripts/build-cli.sh "$RUNNER_TEMP/jbar-cli-candidate"
+          cli="$RUNNER_TEMP/jbar-cli-candidate/JBar-CLI-${VERSION}-universal/bin/jbar-cli"
+          python3 scripts/benchmark-cli.py --binary "$cli" \
+            --output-dir "$RUNNER_TEMP/jbar-cli-release-smoke" --items 2000 --samples 3
+          artifacts="$RUNNER_TEMP/jbar-extra-candidate-artifacts"
+          mkdir -m 0700 "$artifacts"
+          cp "$RUNNER_TEMP/jbar-cli-candidate/JBar-CLI-${VERSION}-universal.tar.gz" "$artifacts/"
+          cp "$RUNNER_TEMP/jbar-cli-candidate/JBar-CLI-${VERSION}-universal.tar.gz.sha256" "$artifacts/"
+          cp scripts/install-prebuilt.sh "$artifacts/JBar-install-prebuilt-${VERSION}.sh"
+          (cd "$artifacts" && shasum -a 256 "JBar-install-prebuilt-${VERSION}.sh" > "JBar-install-prebuilt-${VERSION}.sh.sha256")
+          chmod 0644 "$artifacts"/*
+
+      - name: Upload the reviewed standalone assets
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: JBar-standalone-release-candidate
+          path: ${{ runner.temp }}/jbar-extra-candidate-artifacts
           if-no-files-found: error
           retention-days: 7
           compression-level: 0
@@ -288,6 +320,9 @@ jobs:
           mkdir -m 0700 "$npm_dir"
           npm pack . --pack-destination "$npm_dir" >/dev/null
           test "$(find "$npm_dir" -mindepth 1 -maxdepth 1 -type f -print | wc -l | tr -d ' ')" = "1"
+          package="$npm_dir/linjiw-jbar-${VERSION}.tgz"
+          test "$(tar -tf "$package" | grep -Fxc 'package/scripts/install-prebuilt.sh')" = 1
+          test "$(tar -xOf "$package" package/scripts/install-prebuilt.sh | shasum -a 256 | awk '{print $1}')" = "$(shasum -a 256 scripts/install-prebuilt.sh | awk '{print $1}')"
 
       - name: Upload the npm installer package
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -875,6 +910,12 @@ jobs:
           name: JBar-signed-release
           path: ${{ runner.temp }}/jbar-artifacts
 
+      - name: Download the reviewed standalone assets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: JBar-standalone-release-candidate
+          path: ${{ runner.temp }}/jbar-standalone-assets
+
       - name: Verify asset set and archive checksum without executing it
         run: |
           set -euo pipefail
@@ -908,6 +949,18 @@ jobs:
           expected_sha="$(awk '{print $1}' "$checksum")"
           [[ "$expected_sha" =~ ^[0-9a-f]{64}$ ]]
           test "$(sha256sum "$zip" | awk '{print $1}')" = "$expected_sha"
+          extras="$RUNNER_TEMP/jbar-standalone-assets"
+          test "$(find "$extras" -mindepth 1 -maxdepth 1 -print | wc -l | tr -d ' ')" = 4
+          find_must_be_empty "$extras" ! -type d ! -type f -print -quit
+          for name in "JBar-CLI-${VERSION}-universal.tar.gz" "JBar-install-prebuilt-${VERSION}.sh"; do
+            validate_regular_file "$extras/$name" 104857600
+            validate_regular_file "$extras/$name.sha256" 256
+            test "$(wc -l < "$extras/$name.sha256" | tr -d ' ')" = 1
+            test "$(awk '{print $2}' "$extras/$name.sha256")" = "$name"
+            expected_sha="$(awk '{print $1}' "$extras/$name.sha256")"
+            [[ "$expected_sha" =~ ^[0-9a-f]{64}$ ]]
+            test "$(sha256sum "$extras/$name" | awk '{print $1}')" = "$expected_sha"
+          done
 
       - name: Re-resolve the protected tag and publish the versioned assets
         env:
@@ -930,14 +983,19 @@ jobs:
           gh release create "$RELEASE_TAG" \
             "$RUNNER_TEMP/jbar-artifacts/JBar-${VERSION}-universal.zip" \
             "$RUNNER_TEMP/jbar-artifacts/JBar-${VERSION}-universal.zip.sha256" \
+            "$RUNNER_TEMP/jbar-standalone-assets/JBar-CLI-${VERSION}-universal.tar.gz" \
+            "$RUNNER_TEMP/jbar-standalone-assets/JBar-CLI-${VERSION}-universal.tar.gz.sha256" \
+            "$RUNNER_TEMP/jbar-standalone-assets/JBar-install-prebuilt-${VERSION}.sh" \
+            "$RUNNER_TEMP/jbar-standalone-assets/JBar-install-prebuilt-${VERSION}.sh.sha256" \
             --verify-tag --generate-notes --title "JBar $VERSION"
 
           release_json="$(gh release view "$RELEASE_TAG" --json tagName,isDraft,isImmutable,assets)"
-          jq -e --arg tag "$RELEASE_TAG" --arg zip "JBar-${VERSION}-universal.zip" '
+          jq -e --arg tag "$RELEASE_TAG" --arg zip "JBar-${VERSION}-universal.zip" \
+            --arg cli "JBar-CLI-${VERSION}-universal.tar.gz" --arg installer "JBar-install-prebuilt-${VERSION}.sh" '
             .tagName == $tag and
             .isDraft == false and
             .isImmutable == true and
-            ([.assets[].name] | sort) == ([$zip, ($zip + ".sha256")] | sort)
+            ([.assets[].name] | sort) == ([$zip, ($zip + ".sha256"), $cli, ($cli + ".sha256"), $installer, ($installer + ".sha256")] | sort)
           ' <<< "$release_json" >/dev/null
 
   publish_preview:
@@ -964,6 +1022,12 @@ jobs:
           name: JBar-release-candidate
           path: ${{ runner.temp }}/jbar-preview-download
 
+      - name: Download the reviewed standalone assets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: JBar-standalone-release-candidate
+          path: ${{ runner.temp }}/jbar-standalone-assets
+
       - name: Verify and prepare the developer-preview assets
         run: |
           set -euo pipefail
@@ -986,6 +1050,23 @@ jobs:
             cd "$artifacts"
             shasum -a 256 "JBar-${VERSION}-universal.zip" > "JBar-${VERSION}-universal.zip.sha256"
           )
+          extras="$RUNNER_TEMP/jbar-standalone-assets"
+          test "$(find "$extras" -mindepth 1 -maxdepth 1 -print | wc -l | tr -d ' ')" = 4
+          test -z "$(find "$extras" ! -type d ! -type f -print -quit)"
+          for name in "JBar-CLI-${VERSION}-universal.tar.gz" "JBar-install-prebuilt-${VERSION}.sh"; do
+            test -f "$extras/$name" && test ! -L "$extras/$name"
+            test -f "$extras/$name.sha256" && test ! -L "$extras/$name.sha256"
+            test "$(stat -f '%z' "$extras/$name")" -gt 0
+            test "$(stat -f '%z' "$extras/$name")" -le 104857600
+            test "$(stat -f '%z' "$extras/$name.sha256")" -le 256
+            test "$(wc -l < "$extras/$name.sha256" | tr -d ' ')" = 1
+            test "$(awk '{print $2}' "$extras/$name.sha256")" = "$name"
+            expected="$(awk '{print $1}' "$extras/$name.sha256")"
+            [[ "$expected" =~ ^[0-9a-f]{64}$ ]]
+            test "$(shasum -a 256 "$extras/$name" | awk '{print $1}')" = "$expected"
+            cp "$extras/$name" "$extras/$name.sha256" "$artifacts/"
+          done
+          chmod 0644 "$artifacts"/*
 
       - name: Re-resolve the tag and publish the preview assets
         env:
@@ -1007,15 +1088,20 @@ jobs:
           gh release create "$RELEASE_TAG" \
             "$RUNNER_TEMP/jbar-preview-assets/JBar-${VERSION}-universal.zip" \
             "$RUNNER_TEMP/jbar-preview-assets/JBar-${VERSION}-universal.zip.sha256" \
+            "$RUNNER_TEMP/jbar-preview-assets/JBar-CLI-${VERSION}-universal.tar.gz" \
+            "$RUNNER_TEMP/jbar-preview-assets/JBar-CLI-${VERSION}-universal.tar.gz.sha256" \
+            "$RUNNER_TEMP/jbar-preview-assets/JBar-install-prebuilt-${VERSION}.sh" \
+            "$RUNNER_TEMP/jbar-preview-assets/JBar-install-prebuilt-${VERSION}.sh.sha256" \
             --verify-tag --generate-notes --prerelease \
             --title "JBar ${VERSION} Developer Preview"
 
           release_json="$(gh release view "$RELEASE_TAG" --json tagName,isDraft,isPrerelease,assets)"
-          jq -e --arg tag "$RELEASE_TAG" --arg zip "JBar-${VERSION}-universal.zip" '
+          jq -e --arg tag "$RELEASE_TAG" --arg zip "JBar-${VERSION}-universal.zip" \
+            --arg cli "JBar-CLI-${VERSION}-universal.tar.gz" --arg installer "JBar-install-prebuilt-${VERSION}.sh" '
             .tagName == $tag and
             .isDraft == false and
             .isPrerelease == true and
-            ([.assets[].name] | sort) == ([$zip, ($zip + ".sha256")] | sort)
+            ([.assets[].name] | sort) == ([$zip, ($zip + ".sha256"), $cli, ($cli + ".sha256"), $installer, ($installer + ".sha256")] | sort)
           ' <<< "$release_json" >/dev/null
 
   publish_npm:
@@ -1024,7 +1110,7 @@ jobs:
       - candidate
       - publish
       - publish_preview
-    if: always() && github.repository == 'linjiw/jbar' && (needs.publish.result == 'success' || needs.publish_preview.result == 'success')
+    if: always() && github.repository == 'linjiw/jbar' && vars.JBAR_PUBLISH_NPM == 'true' && (needs.publish.result == 'success' || needs.publish_preview.result == 'success')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     environment: release

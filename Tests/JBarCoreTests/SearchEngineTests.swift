@@ -162,7 +162,9 @@ final class SearchEngineTests: XCTestCase {
     func names(_ r: SearchResponse) -> [String] { r.rows.map(\.name) }
 
     func tempDir(_ tag: String) throws -> URL {
-        let base = URL(fileURLWithPath: "/private/tmp/claude-501/-Users-linji-jbar/c9779c4f-4730-44ee-9746-98893fd6dedc/scratchpad/engine", isDirectory: true)
+        let repository = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let base = repository.appendingPathComponent(".build/search-tests/fixtures", isDirectory: true)
         let dir = base.appendingPathComponent("\(tag)-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         addTeardownBlock { try? FileManager.default.removeItem(at: dir) }

@@ -816,29 +816,31 @@ module JBarBenchmarkReportGate
   end
 end
 
-if ARGV == ["--self-test"]
+if $PROGRAM_NAME == __FILE__
+  if ARGV == ["--self-test"]
+    begin
+      JBarBenchmarkReportGate.self_test!
+      exit 0
+    rescue KeyError, IndexError, JSON::ParserError, ArgumentError, TypeError, RuntimeError,
+           SystemCallError => error
+      abort "benchmark report gate self-test error: #{error.message}"
+    end
+  end
+
   begin
-    JBarBenchmarkReportGate.self_test!
-    exit 0
+    options, report_path = JBarBenchmarkReportGate.parse_options(ARGV)
+    report = JBarBenchmarkReportGate.parse_json(JBarBenchmarkReportGate.read_secure_report(report_path))
+    summary = JBarBenchmarkReportGate.evaluate(report, options)
+    puts "PASS: benchmark schema v1/workload v2 correctness; " \
+         "corpus=#{summary.fetch(:corpus_kind)}, items=#{summary.fetch(:item_count)}, " \
+         "requested-samples=#{summary.fetch(:samples)}"
+    puts "IDENTITY schemaVersion=1 workloadVersion=2 samples=#{summary.fetch(:samples)} " \
+         "corpusKind=#{summary.fetch(:corpus_kind)} itemCount=#{summary.fetch(:item_count)} " \
+         "corpusFingerprint=#{summary.fetch(:corpus_fingerprint)} " \
+         "historyProfileFingerprint=#{summary.fetch(:history_fingerprint)} " \
+         "identitySha256=#{summary.fetch(:repeat_identity_sha256)}"
   rescue KeyError, IndexError, JSON::ParserError, ArgumentError, TypeError, RuntimeError,
          SystemCallError => error
-    abort "benchmark report gate self-test error: #{error.message}"
+    abort "benchmark report gate error: #{error.message}"
   end
-end
-
-begin
-  options, report_path = JBarBenchmarkReportGate.parse_options(ARGV)
-  report = JBarBenchmarkReportGate.parse_json(JBarBenchmarkReportGate.read_secure_report(report_path))
-  summary = JBarBenchmarkReportGate.evaluate(report, options)
-  puts "PASS: benchmark schema v1/workload v2 correctness; " \
-       "corpus=#{summary.fetch(:corpus_kind)}, items=#{summary.fetch(:item_count)}, " \
-       "requested-samples=#{summary.fetch(:samples)}"
-  puts "IDENTITY schemaVersion=1 workloadVersion=2 samples=#{summary.fetch(:samples)} " \
-       "corpusKind=#{summary.fetch(:corpus_kind)} itemCount=#{summary.fetch(:item_count)} " \
-       "corpusFingerprint=#{summary.fetch(:corpus_fingerprint)} " \
-       "historyProfileFingerprint=#{summary.fetch(:history_fingerprint)} " \
-       "identitySha256=#{summary.fetch(:repeat_identity_sha256)}"
-rescue KeyError, IndexError, JSON::ParserError, ArgumentError, TypeError, RuntimeError,
-       SystemCallError => error
-  abort "benchmark report gate error: #{error.message}"
 end

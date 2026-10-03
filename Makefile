@@ -1,5 +1,5 @@
 # JBar — build/install/run helpers. See docs/DESIGN.md for the architecture.
-.PHONY: build app install uninstall run test test-release cli bench clean icon fmt
+.PHONY: build app install uninstall run test test-release cli cli-package bench clean icon fmt
 
 build:            ## Debug build of the SwiftPM package
 	swift build
@@ -22,8 +22,11 @@ test:             ## Run the unit tests (debug)
 test-release:     ## Run the unit tests with optimisation (enforces perf budgets)
 	swift test -c release
 
-cli: app          ## Headless search: make cli Q="visual studio"
-	build/JBar.app/Contents/MacOS/JBar --cli "$(Q)"
+cli:              ## Build the standalone agent-friendly CLI (no app bundle)
+	swift build -c release --product jbar-cli -Xswiftc -warnings-as-errors -Xswiftc -strict-concurrency=complete
+
+cli-package:      ## Stage a Universal 2 CLI archive: make cli-package OUT=/absolute/new/temp-dir
+	scripts/build-cli.sh "$(OUT)"
 
 bench: app        ## Headless index benchmark (items, time, RSS)
 	build/JBar.app/Contents/MacOS/JBar --bench-index

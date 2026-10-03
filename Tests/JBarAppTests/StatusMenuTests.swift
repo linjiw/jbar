@@ -26,15 +26,18 @@ final class StatusMenuTests: XCTestCase {
         let menu = StatusMenu(hotkeyDisplay: "⌥Space")
         var status = IndexStatus()
         status.deniedPaths = ["/Users/person/客户/Acquisition-Secret"]
+        status.unavailableRoots = ["/Users/person/Missing-Secret"]
         status.unsafeEntriesSkipped = 2
 
         menu.update(status: status)
 
         XCTAssertTrue(menu.itemTitles.contains("⚠ Some folders not accessible — Fix…"))
         XCTAssertTrue(menu.itemTitles.contains("⚠ Skipped 2 unsafe filesystem entries"))
+        XCTAssertTrue(menu.itemTitles.contains("⚠ Some configured roots unavailable — Check Config"))
         let renderedMetadata = (menu.itemTitles + menu.itemToolTips).joined(separator: "\n")
         XCTAssertFalse(renderedMetadata.contains("Acquisition-Secret"))
         XCTAssertFalse(renderedMetadata.contains("/Users/person"))
+        XCTAssertFalse(renderedMetadata.contains("Missing-Secret"))
     }
 
     func testUnsafeEntryWarningUsesSingularGrammar() {

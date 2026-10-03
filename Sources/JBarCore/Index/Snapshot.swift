@@ -70,6 +70,16 @@ public enum Snapshot {
                                                   enforcePrivateDirectory: isDefaultDirectory)
     }
 
+    /// Persist relative to a caller-held parent directory descriptor, using only the URL's validated
+    /// final component. The caller keeps the descriptor open throughout this synchronous operation.
+    /// Ownership/mode policy belongs to the caller; this overload never reopens or chmods the parent.
+    public static func write(_ store: IndexStore, to url: URL, parentDirectoryDescriptor: Int32,
+                             headerHash: UInt64) throws {
+        let data = try encode(store, headerHash: headerHash)
+        try SecureFileIO.writeAtomicallyOwnerOnly(data, to: url,
+                                                 parentDirectoryDescriptor: parentDirectoryDescriptor)
+    }
+
     /// Serialise `store` into the snapshot format.
     public static func encode(_ store: IndexStore, headerHash: UInt64) throws -> Data {
         let rootAllowance = store.dirs.reduce(into: 0) { if $1.parent < 0 { $0 += 1 } }
@@ -115,6 +125,26 @@ public enum Snapshot {
         let fileLimit = maximumFileBytes(maxItems: maxItems, rootAllowance: rootAllowance)
         guard let data = try? SecureFileIO.readRegularFile(
             at: url, maxBytes: fileLimit, preflightByteCount: headerByteCount,
+            limitAfterPreflight: {
+                preflightFileLimit($0, expectedHeaderHash: expectedHeaderHash,
+                                   maxItems: maxItems, rootAllowance: rootAllowance)
+            }
+        ) else { return nil }
+        return decode(data, expectedHeaderHash: expectedHeaderHash, maxItems: maxItems,
+                      rootAllowance: rootAllowance)
+    }
+
+    /// Read from a caller-held parent descriptor. Header preflight, file bounds and no-follow final
+    /// entry classification are identical to the path overload, while parent replacement cannot
+    /// redirect the read. The descriptor is borrowed and must remain open until this call returns.
+    public static func read(from url: URL, parentDirectoryDescriptor: Int32,
+                            expectedHeaderHash: UInt64,
+                            maxItems: Int = SafetyLimits.maxIndexedItems.upperBound,
+                            rootAllowance: Int = 0) -> IndexStore? {
+        let fileLimit = maximumFileBytes(maxItems: maxItems, rootAllowance: rootAllowance)
+        guard let data = try? SecureFileIO.readRegularFile(
+            at: url, maxBytes: fileLimit, parentDirectoryDescriptor: parentDirectoryDescriptor,
+            preflightByteCount: headerByteCount,
             limitAfterPreflight: {
                 preflightFileLimit($0, expectedHeaderHash: expectedHeaderHash,
                                    maxItems: maxItems, rootAllowance: rootAllowance)
@@ -176,7 +206,6 @@ public enum Snapshot {
             let foldedStart = Int(nameStart[i]), foldedLength = Int(nameLen[i])
             let shownStart = Int(displayStart[i]), shownLength = Int(displayLen[i])
             let shownBytes: ArraySlice<UInt8>
-            let shownName: String
             guard dirId[i] >= 0, Int(dirId[i]) < dirCount,
                   foldedStart >= 0, foldedLength <= maximumAnalyzedNameBytes,
                   foldedStart <= foldedArena.count, foldedLength <= foldedArena.count - foldedStart,
@@ -184,18 +213,13 @@ public enum Snapshot {
                   shownStart <= displayArena.count,
                   shownLength <= displayArena.count - shownStart else { return nil }
             shownBytes = displayArena[shownStart..<(shownStart + shownLength)]
-            guard let decodedName = String(bytes: shownBytes, encoding: .utf8) else { return nil }
-            shownName = decodedName
             let directoryIndex = Int(dirId[i])
-            guard SafetyLimits.isSafePathComponent(
-                    shownName, maxUTF8Bytes: SafetyLimits.maxNameUTF8Bytes
-                  ),
-                  IndexStoreLimits.completeItemPathFits(
+            guard IndexedPathValidation.completeItemPathFits(
                     directoryPathUTF8Bytes: directoryPathLengths[directoryIndex],
                     directoryEndsInSlash: IndexStoreLimits.directoryEntryEndsInSlash(
                         dirs[directoryIndex], arena: dirArena
                     ),
-                    storedName: shownName, flagsRaw: flags[i]
+                    storedName: shownBytes, flagsRaw: flags[i]
                   ),
                   ItemKind(rawValue: kind[i]) != nil,
                   depth[i] <= UInt8(SafetyLimits.maxDepth.upperBound),
@@ -310,7 +334,6 @@ public enum Snapshot {
             let foldedStart = Int(store.nameStart[i]), foldedLength = Int(store.nameLen[i])
             let shownStart = Int(store.displayStart[i]), shownLength = Int(store.displayLen[i])
             let shownBytes: ArraySlice<UInt8>
-            let shownName: String
             guard store.dirId[i] >= 0, Int(store.dirId[i]) < store.dirs.count,
                   foldedStart >= 0, foldedLength <= maximumAnalyzedNameBytes,
                   foldedStart <= store.foldedArena.count, foldedLength <= store.foldedArena.count - foldedStart,
@@ -318,18 +341,13 @@ public enum Snapshot {
                   shownStart <= store.displayArena.count,
                   shownLength <= store.displayArena.count - shownStart else { return false }
             shownBytes = store.displayArena[shownStart..<(shownStart + shownLength)]
-            guard let decodedName = String(bytes: shownBytes, encoding: .utf8) else { return false }
-            shownName = decodedName
             let directoryIndex = Int(store.dirId[i])
-            guard SafetyLimits.isSafePathComponent(
-                    shownName, maxUTF8Bytes: SafetyLimits.maxNameUTF8Bytes
-                  ),
-                  IndexStoreLimits.completeItemPathFits(
+            guard IndexedPathValidation.completeItemPathFits(
                     directoryPathUTF8Bytes: directoryPathLengths[directoryIndex],
                     directoryEndsInSlash: IndexStoreLimits.directoryEntryEndsInSlash(
                         store.dirs[directoryIndex], arena: store.dirArena
                     ),
-                    storedName: shownName, flagsRaw: store.flags[i]
+                    storedName: shownBytes, flagsRaw: store.flags[i]
                   ),
                   ItemKind(rawValue: store.kind[i]) != nil,
                   store.depth[i] <= UInt8(SafetyLimits.maxDepth.upperBound),
@@ -526,10 +544,10 @@ public enum Snapshot {
         for r in appRoots.sorted() { h.update(r); h.update("\u{1}") }
         h.update("jbar.snapshot.max-items.v1")
         h.update(UInt64(IndexStoreLimits.normalizedMaxItems(maxItems)))
-        // v2 requires a crawl with no denied paths, capped directories, or global item cap before
-        // it may be persisted as complete. Invalidate older snapshots because they did not encode
-        // those completeness conditions and could otherwise make a global operation omit files.
-        h.update("jbar.snapshot.completeness-policy.v2")
+        // v3 additionally requires available selected roots, no unsafe omitted descendants and no
+        // capped/truncated catalog replacement. Older caches do not retain those diagnostics, so
+        // their header cannot prove complete coverage; require a fresh crawl before using them.
+        h.update("jbar.snapshot.completeness-policy.v3")
         h.update(BonusConstants.hash)
         h.update(UInt64(schemaVersion))
         return h.value

@@ -762,6 +762,15 @@ extension PanelGeometryTests {
         XCTAssertFalse(denied?.contains("private path") == true)
         status.deniedPaths = []
 
+        status.unavailableRoots = ["private root not shown in UI"]
+        let unavailable = IndexReadiness.waitMessage(for: status)
+        XCTAssertTrue(unavailable?.contains("configured roots") == true)
+        XCTAssertFalse(unavailable?.contains("private root") == true)
+        status.unavailableRoots = []
+        status.unsafeEntriesSkipped = 1
+        XCTAssertTrue(IndexReadiness.waitMessage(for: status)?.contains("incomplete") == true)
+        status.unsafeEntriesSkipped = 0
+
         status.phase = .failed("private diagnostic")
         let failed = IndexReadiness.waitMessage(for: status)
         XCTAssertTrue(failed?.contains("rebuild") == true)

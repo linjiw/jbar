@@ -125,6 +125,26 @@ function run(command, args, options = {}) {
   return result;
 }
 
+function reviewedInstallerPath(root = packageRoot) {
+  const installerPath = path.join(root, "scripts/install-prebuilt.sh");
+  const installerStat = fs.lstatSync(installerPath);
+  if (!installerStat.isFile() || installerStat.isSymbolicLink() || (installerStat.mode & 0o022) !== 0) {
+    throw new Error("npm package does not contain a safe reviewed installer");
+  }
+  return installerPath;
+}
+
+function parseChecksum(checksumText, archiveName) {
+  const lines = checksumText.trimEnd().split(/\r?\n/);
+  if (lines.length !== 1) throw new Error("release checksum file is malformed");
+  const fields = lines[0].trim().split(/\s+/);
+  if (fields.length !== 2 || !/^[0-9a-f]{64}$/i.test(fields[0]) ||
+      (fields[1] !== archiveName && fields[1] !== `*${archiveName}`)) {
+    throw new Error("release checksum file is malformed");
+  }
+  return fields[0].toLowerCase();
+}
+
 async function resolveTag(requestedTag) {
   if (requestedTag !== "latest") return requestedTag;
   const releases = JSON.parse((await request(`https://api.github.com/repos/${repository}/releases?per_page=1`, {
@@ -138,7 +158,9 @@ function latestPublishedReleaseTag(releases) {
   if (!release || release.draft === true || typeof release.tag_name !== "string") {
     throw new Error("GitHub returned no published release tag");
   }
-  return normalizeTag(release.tag_name);
+  const resolved = normalizeTag(release.tag_name);
+  if (resolved === "latest") throw new Error("GitHub returned no versioned release tag");
+  return resolved;
 }
 
 async function install(options) {
@@ -156,15 +178,14 @@ async function install(options) {
     writeFile(checksumPath, await request(`${baseUrl}/${archiveName}.sha256`, { maxBytes: 4096 }));
 
     const checksumText = fs.readFileSync(checksumPath, "utf8");
-    const checksumLine = checksumText.split(/\r?\n/).find((line) => {
-      const fields = line.trim().split(/\s+/);
-      return fields.length === 2 && (fields[1] === archiveName || fields[1] === `*${archiveName}`);
-    });
-    const expected = checksumLine && checksumLine.trim().split(/\s+/)[0];
-    if (!expected || !/^[0-9a-f]{64}$/i.test(expected)) throw new Error("release checksum file is malformed");
+    const expected = parseChecksum(checksumText, archiveName);
     const actual = crypto.createHash("sha256").update(fs.readFileSync(archivePath)).digest("hex");
     if (actual.toLowerCase() !== expected.toLowerCase()) throw new Error("downloaded release checksum does not match");
 
+    // The executable installer is part of the reviewed npm tarball/provenance.
+    // Never fetch additional shell code from a separately mutable Git tag.
+    const installerPath = reviewedInstallerPath();
+    run("/bin/bash", [installerPath, "--validate-archive", archivePath]);
     const extractedPath = path.join(temporaryRoot, "extracted");
     fs.mkdirSync(extractedPath, { mode: 0o700 });
     run("/usr/bin/ditto", ["-x", "-k", "--rsrc", "--extattr", "--qtn", "--noacl", archivePath, extractedPath]);
@@ -173,9 +194,6 @@ async function install(options) {
       throw new Error("release archive does not contain a regular top-level JBar.app");
     }
 
-    const installerPath = path.join(temporaryRoot, "install-prebuilt.sh");
-    writeFile(installerPath, await request(`https://raw.githubusercontent.com/${repository}/${tag}/scripts/install-prebuilt.sh`, { maxBytes: 256 * 1024 }));
-    fs.chmodSync(installerPath, 0o700);
     const installerArgs = [installerPath, appPath];
     if (options.noLaunch) installerArgs.push("--no-launch");
     run("/bin/bash", installerArgs);
@@ -198,4 +216,4 @@ if (require.main === module) {
   main().catch((error) => fail(error instanceof Error ? error.message : String(error)));
 }
 
-module.exports = { latestPublishedReleaseTag };
+module.exports = { latestPublishedReleaseTag, parseChecksum, reviewedInstallerPath };

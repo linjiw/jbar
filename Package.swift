@@ -6,12 +6,16 @@ let package = Package(
     platforms: [.macOS(.v13)],
     products: [
         .executable(name: "JBar", targets: ["JBar"]),
+        .executable(name: "jbar-cli", targets: ["JBarCLIExecutable"]),
         .library(name: "JBarCore", targets: ["JBarCore"]),
         .library(name: "JBarActions", targets: ["JBarActions"]),
     ],
     targets: [
         // Pure-logic core: indexer, fuzzy matcher, ranking, config. No AppKit UI, fully unit-testable.
         .target(name: "JBarCore", path: "Sources/JBarCore"),
+        // Standalone agent-facing CLI: deliberately has no AppKit, actions, or Codex dependency.
+        .target(name: "JBarCLI", dependencies: ["JBarCore"], path: "Sources/JBarCLI"),
+        .executableTarget(name: "JBarCLIExecutable", dependencies: ["JBarCLI"], path: "Sources/JBarCLIExecutable"),
         // Intent parsing plus the narrow Codex app-server client. It has no third-party dependencies;
         // process launch, protocol validation, and network/tool denial stay auditable in one target.
         .target(name: "JBarActions", path: "Sources/JBarActions"),
@@ -21,6 +25,7 @@ let package = Package(
         // Thin executable shim: `main.swift` only calls `runJBar()`.
         .executableTarget(name: "JBar", dependencies: ["JBarApp"], path: "Sources/JBar"),
         .testTarget(name: "JBarCoreTests", dependencies: ["JBarCore"], path: "Tests/JBarCoreTests"),
+        .testTarget(name: "JBarCLITests", dependencies: ["JBarCLI", "JBarCore"], path: "Tests/JBarCLITests"),
         .testTarget(name: "JBarActionsTests", dependencies: ["JBarActions"], path: "Tests/JBarActionsTests"),
         .testTarget(name: "JBarAppTests", dependencies: ["JBarApp", "JBarActions"], path: "Tests/JBarAppTests"),
     ]
