@@ -47,15 +47,19 @@ public actor CLISearchSession {
         let parsed = QueryParser.parse(query, home: index.settings.home)
         if case .path(let base, let filter) = parsed.mode {
             let start = DispatchTime.now().uptimeNanoseconds
-            let normalized = URL(fileURLWithPath: base).standardizedFileURL.path
-            guard index.settings.roots.contains(where: { CLIIndexSettings.contains(normalized, under: $0.path) }) else {
+            // Snapshot paths use POSIX lexical components. Foundation URL standardization can
+            // change long, nonexistent paths differently across OS versions and may inspect the
+            // filesystem. Validate the bounded base directly without resolving an on-disk tree.
+            guard Self.isCanonicalSnapshotDirectory(base) else {
+                throw CLIError("Use a canonical absolute directory path.")
+            }
+            guard index.settings.roots.contains(where: { CLIIndexSettings.contains(base, under: $0.path) }) else {
                 throw CLIError("Path browsing must stay within an indexed root.")
             }
             // Read the immutable snapshot only; directory replacement cannot expose another tree.
             // Resolve the requested directory through component slices, then stream its item IDs
             // from the existing dirId column. No whole-index path strings or item buckets are built.
-            guard normalized == base else { throw CLIError("Use a canonical absolute directory path.") }
-            let ids = resolveDirectory(normalized)
+            let ids = resolveDirectory(base)
             guard !ids.isEmpty else {
                 throw CLIError("Directory was not descended in the index (excluded, hidden, package, depth-limited, or absent).")
             }
@@ -91,6 +95,19 @@ public actor CLISearchSession {
             ? Double(index.store.mtime[item]) + Date.timeIntervalBetween1970AndReferenceDate : nil
         return CLIResult(name: name, path: index.store.path(of: item), kind: String(describing: index.store.itemKind(item)),
                          score: score, tier: tier, modifiedAt: time, flags: index.store.flags[item])
+    }
+
+    private static func isCanonicalSnapshotDirectory(_ path: String) -> Bool {
+        guard SafetyLimits.isSafeAbsolutePath(path) else { return false }
+        let bytes = path.utf8
+        if bytes.count > 1 && bytes.last == 0x2F { return false }
+        var previousWasSlash = false
+        for byte in bytes {
+            let isSlash = byte == 0x2F
+            if isSlash && previousWasSlash { return false }
+            previousWasSlash = isSlash
+        }
+        return true
     }
 
     private func resolveDirectory(_ path: String) -> Set<Int32> {

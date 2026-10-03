@@ -132,6 +132,7 @@ final class CLITests: XCTestCase {
         let index = CLIIndex(settings: settings, store: builder.build(generation: 1), complete: true, stats: nil,
                              unavailableRoots: [], persisted: false, startupSeconds: 0)
         let session = CLISearchSession(index: index)
+        XCTAssertGreaterThan(longRoot.utf8.count, 3_000, "Retain a long synthetic prefix to expose whole-index path expansion.")
         for leaf in ["directory-9999", "directory-123", "directory-9999"] {
             let output = try await session.search(query: longRoot + "/" + leaf + "/", limit: 1)
             XCTAssertEqual(output.results.map(\.name), ["target.txt"])
@@ -140,6 +141,24 @@ final class CLITests: XCTestCase {
             XCTAssertEqual(metrics.directoryIDs, 1)
         }
         XCTAssertEqual(index.store.dirs.count, count + 1)
+    }
+
+    func testSnapshotDirectoryBrowsingRejectsTraversalAndRepeatedBaseSeparators() async throws {
+        let fixture = try makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture) }
+        let settings = try CLIIndexSettings(options: fixtureOptions(fixture))
+        let session = CLISearchSession(index: try CLIIndex.build(settings: settings))
+        let valid = try await session.search(query: fixture.path + "/files/child/", limit: 40)
+        XCTAssertEqual(valid.results.map(\.name), ["notes.txt"])
+        for suffix in ["/files/./child/", "/files//child/", "/files/child/../child/"] {
+            do {
+                _ = try await session.search(query: fixture.path + suffix, limit: 40)
+                XCTFail("Accepted noncanonical snapshot base \(suffix)")
+            } catch {
+                XCTAssertEqual((error as? CLIError)?.code, 2)
+                XCTAssertEqual((error as? CLIError)?.message, "Use a canonical absolute directory path.")
+            }
+        }
     }
 
     func testTruncatedDefaultRootDiscoveryIsRejectedBeforeIndexing() throws {

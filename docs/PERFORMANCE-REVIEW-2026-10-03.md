@@ -221,16 +221,17 @@ Raw report and gated comparison: `.build/release-review/production-{after,compar
 App binary SHA-256: `f01a18da7fbff43348b3f9ea020c1949e95fcb45cec61f23172f44201ca3a099`.
 
 The fresh production Universal 2 candidate passed the same 10,000-file, 100-sample CLI workload
-after the scope and cache-safety fixes. Indexing took 84.70 ms wall time, with 10,101 indexed items
-and a 974,117-byte snapshot. One-shot p50/p95/p99 was 6.738 / 7.527 / 8.199 ms; persistent filename
-round trips were 0.370 / 0.431 / 0.492 ms; directory round trips were 0.239 / 0.269 / 0.305 ms.
-The process was ready in 5.683 ms and its first filename query took 1.094 ms. Ordered rows, exact
+after the scope, cache-safety and snapshot-path portability fixes. Indexing took 75.00 ms wall time,
+with 10,101 indexed items and a 974,122-byte snapshot. One-shot p50/p95/p99 was
+6.738 / 7.341 / 8.205 ms; persistent filename round trips were 0.364 / 0.413 / 0.454 ms;
+directory round trips were 0.226 / 0.240 / 0.246 ms.
+The process was ready in 5.114 ms and its first filename query took 1.014 ms. Ordered rows, exact
 totals, directory coverage and the actual 500-row response all passed. These are separate observations
 with warm generated fixtures, not a controlled claim that the safety changes improved performance.
 
-Evidence: `.build/release-review/cli-benchmark-0-2-0/report.json`.
-CLI binary SHA-256: `25630b877080487f5cb2dee2c182466cf0e8d9fcd2d8b3a586e9c05b08e74984`.
-The safety-reviewed source passed 714 tests in each strict Debug/Release suite, with three skips,
+Evidence: `.build/release-review/cli-benchmark-path-final/report.json`.
+CLI binary SHA-256: `caeddf90daeceb318517ca61471836785a243c47119401a625967e011996397e`.
+The safety-reviewed source passed 715 tests in each strict Debug/Release suite, with three skips,
 plus all 24 npm tests and the isolated prebuilt installer fault/race suite.
 
 ## Remaining work, in priority order
