@@ -321,7 +321,7 @@ jobs:
           npm pack . --pack-destination "$npm_dir" >/dev/null
           test "$(find "$npm_dir" -mindepth 1 -maxdepth 1 -type f -print | wc -l | tr -d ' ')" = "1"
           package="$npm_dir/linjiw-jbar-${VERSION}.tgz"
-          test "$(tar -tf "$package" | grep -Fx 'package/scripts/install-prebuilt.sh' | wc -l | tr -d ' ')" = 1
+          test "$(tar -tf "$package" | grep -Fxc 'package/scripts/install-prebuilt.sh')" = 1
           test "$(tar -xOf "$package" package/scripts/install-prebuilt.sh | shasum -a 256 | awk '{print $1}')" = "$(shasum -a 256 scripts/install-prebuilt.sh | awk '{print $1}')"
 
       - name: Upload the npm installer package
